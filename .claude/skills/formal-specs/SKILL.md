@@ -1,13 +1,16 @@
 ---
 name: formal-specs
-description: Run, iterate on, and extend the P model-checker specs under formal/ (leader election, agent ownership). Use when compiling or checking a .p spec, adding a new spec or test case, debugging a counterexample, running the mutant ledger, or when a change touches NodeAgentController / the assignment plane and the model should move with it.
+description: Run, iterate on, and extend the P model-checker specs under formal/ (leader election, agent ownership, rolling-deploy assignment). Use when compiling or checking a .p spec, adding a new spec or test case, debugging a counterexample, running the mutant ledger, or when a change touches NodeAgentController / the assignment plane and the model should move with it.
 ---
 
 # Running the P specs under `formal/`
 
-The specs live in `formal/<topic>/` (`leader-election/`, `agent-assignment/`). Each is a
-`*Model.p` / `*Spec.p` / `*Test.p` triple plus a README with a results table and a **mutant
-ledger**. See `formal/README.md` for the why; this skill is the how.
+The specs live in `formal/<topic>/` (`leader-election/`, `agent-assignment/`,
+`rolling-deploy/`). Each is a `*Model.p` / `*Spec.p` / `*Test.p` triple plus a README with
+a results table and a **mutant ledger**. See `formal/README.md` for the why; this skill is
+the how. Note `rolling-deploy/` models the GH-3987 *proposal* (stability-gated rebalance +
+assigned-vs-running reconcile), not shipped code — implementing that issue should follow
+the model, and divergence belongs in its README's honesty notes.
 
 ## Toolchain: always use the nix shell
 

@@ -20,6 +20,7 @@ of why each guard in the code is load-bearing.
 | --- | --- |
 | [`leader-election/`](leader-election/) | `NodeAgentController`'s advisory-lock leader election — crashes, graceful stops, dropped lock sessions, heartbeat blips, and network partitions — converging to exactly one leader |
 | [`agent-assignment/`](agent-assignment/) | single-agent ownership across a partition heal — the assignment plane: a cut-off node keeps running its agent while the leader places a copy elsewhere, and the GH-2602 duplicate healer must reconverge to exactly one runner |
+| [`rolling-deploy/`](rolling-deploy/) | the joint GH-3987 + GH-3959 **proposal** as an executable model: multi-agent assignment under a rolling deploy, on nodes with finite capacity — a stability-gated rebalance (one rollout, one rebalance), a node-side assigned-vs-running reconcile sweep (an agent left "assigned in `node_assignments` but not running" is healed instead of settling), and a per-node capacity ceiling with a shed pass (a dead node's share is redistributed within the survivors' ceilings or waits visibly — the overload cascade has a floor) |
 
 ## Toolchain
 

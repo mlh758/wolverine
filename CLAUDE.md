@@ -191,9 +191,13 @@ WolverineOptions uses partial classes to organize concerns:
 
 P model-checker specs for distributed protocols — `formal/leader-election/`
 (`NodeAgentController`'s advisory-lock election: crashes, stops, dropped lock sessions,
-heartbeat blips, partitions) and `formal/agent-assignment/` (single-agent ownership across
-a partition heal: the GH-2602 duplicate healer). Both check a converge-at-quiescence
-monitor. Outside both solutions and CI. `nix develop` at the repo root provides `p` plus
+heartbeat blips, partitions), `formal/agent-assignment/` (single-agent ownership across
+a partition heal: the GH-2602 duplicate healer), and `formal/rolling-deploy/` (the
+**joint GH-3987 + GH-3959 proposal as an executable model**: multi-agent assignment under
+a rolling deploy on capacity-bounded nodes — stability-gated rebalance, node-side
+assigned-vs-running reconcile, and a per-node capacity ceiling + shed so overload cannot
+cascade; an implementation of either issue should follow that model). All check a
+converge-at-quiescence monitor. Outside both solutions and CI. `nix develop` at the repo root provides `p` plus
 the .NET 8/9/10 SDKs (`flake.nix`, `nix/p.nix`); each spec's README has the compile/check
 commands and a mutant ledger. The **`formal-specs` skill** (`.claude/skills/formal-specs/`)
 covers the workflow and the P gotchas — notably: use `-s N` (`--schedules`), never `-i N`
