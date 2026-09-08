@@ -255,3 +255,9 @@ JasperSamples
 
 # git worktrees created inside the repo
 .claude/worktrees/
+
+# P model checker build/run outputs under formal/ — the .p sources are the only thing worth keeping
+formal/**/PChecker/
+formal/**/PEx/
+formal/**/PGenerated/
+formal/**/PCheckerOutput/
