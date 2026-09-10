@@ -1,9 +1,15 @@
 /*
-Single-agent ownership across a partition heal. See formal/agent-assignment/README.md for
-the model, its scope, and the mutant ledger.
+Single-agent ownership on the REAL store schema. See formal/agent-assignment/README.md for
+the model, its scope, the bug ledger (committed counterexamples), and the mutant ledger.
 
-Store = node_assignments rows + live set + the leader's placement, serialized.
-Node  = one process: its health-check tick and the local fact of running the agent.
+Store = the ONE node_assignments row for the agent (PK = agent uri, last-writer-wins
+upsert), the live set, and the leader identity, serialized. Because the row names a single
+owner, the store can never show two owners at once, and the GH-2602 "two rows -> stop one"
+healer is structurally unreachable here — exactly as it is against the RDBMS stores. What
+keeps ownership single is the leader's in-memory pending ledger (GH-3698), which dies with
+the leader, plus (when enabled) the node-side reconcile sweep proposed in GH-4297.
+
+Node = one process: its health-check tick and the local fact of running the agent.
 Leadership correctness is assumed (proved by the leader-election spec); here it can move.
 */
 
@@ -11,16 +17,18 @@ event eJoin: (node: machine, id: int);   // id assigned at construction, self-re
 event eJoined;
 event eGo;
 
-/* A health-check tick's round trip. */
+/* A health-check tick's round trip. owner = the row's node_id, 0 = no row. */
 event eSync: (node: machine, id: int);
-event eSyncReply: (rows: map[int, bool], live: map[int, bool], amLeader: bool);
+event eSyncReply: (owner: int, live: map[int, bool], amLeader: bool);
 
-/* A node writes its OWN row after it starts the agent and removes it after it stops. */
-event eAddRow: (id: int);                 // AddAssignmentAsync (start / resurrection restore)
-event eRemoveRow: (id: int);              // RemoveAssignmentAsync (stop)
-/* Leader -> store placement decisions. */
-event eAssignReq: (id: int);              // AssignAgent
-event eStopReq: (id: int);                // StopRemoteAgent
+/* A node writes its OWN row after it starts the agent and removes it after it stops.
+   eAddRow is AddAssignmentAsync: an unconditional upsert, last writer wins.
+   eRemoveRow is RemoveAssignmentAsync: DELETE ... WHERE node_id = :me — conditional, so a
+   stale stop can never delete the new owner's row. */
+event eAddRow: (id: int);
+event eRemoveRow: (id: int);
+/* Leader -> store placement decision (AssignAgent), forwarded over a courier. */
+event eAssignReq: (id: int);
 event eRun: (run: bool);                  // store -> node, over a courier so it interleaves
 
 /* Faults. */
@@ -30,26 +38,34 @@ event eReconnect;                         // partition heals
 event eCrash;                             // permanent, dirty departure
 event eRefill;                            // stand-in for "the health-check loop runs forever"
 
-/* An arsonist ARMS the store; the store fires the strike on the next node to become owner,
-   so the fault lands on a running node. See the README on why a fixed up-front target
-   cannot reach the interesting case. */
-event eArm: (kind: int);                  // 0 = partition/heal, 1 = crash
+/* An arsonist ARMS the store; the store fires the strike when the condition occurs, so the
+   fault lands where it is interesting (see the README on why a fixed up-front target
+   cannot reach the interesting case).
+     kind 0: partition the next node to become owner, then heal it
+     kind 1: crash the next node to become owner
+     kind 2: crash the LEADER at the moment it dispatches a start — the rolling deploy
+             terminating the leader pod with a placement in flight (the GH-3987 deploy-sim
+             duplicate-agent shape) */
+event eArm: (kind: int);
 event ePartitionNode: (id: int);
 event eCrashNode: (id: int);
 
-/* rows[id] = holds a durable assignment row; live[id] = store considers id reachable. */
+/* owner = node_id in the agent's single assignment row (0 = row absent);
+   live[id] = store considers id reachable. */
 machine Store {
-  var rows: map[int, bool];
+  var owner: int;
   var live: map[int, bool];
   var members: map[int, machine];
   var leader: int;
   var armedPartitions: int;
   var armedCrashes: int;
+  var armedLeaderKills: int;
 
   start state Serving {
     on eArm do (m: (kind: int)) {
       if (m.kind == 0) { armedPartitions = armedPartitions + 1; }
-      else { armedCrashes = armedCrashes + 1; }
+      else if (m.kind == 1) { armedCrashes = armedCrashes + 1; }
+      else { armedLeaderKills = armedLeaderKills + 1; }
     }
 
     on eJoin do (m: (node: machine, id: int)) {
@@ -72,18 +88,20 @@ machine Store {
       if (leader == 0 || !(leader in live) || !live[leader]) {
         leader = m.id;
       }
-      send m.node, eSyncReply, (rows = rows, live = live, amLeader = leader == m.id);
+      send m.node, eSyncReply, (owner = owner, live = live, amLeader = leader == m.id);
       announceStore(0, refills);
     }
 
-    /* ensureLocalNodeRegisteredAsync + AssignAgentsAsync (GH-3604/D2). Only a live node's
-       row is honored. A durable change refills the fleet so the leader re-evaluates. */
+    /* AddAssignmentAsync: upsert keyed by the agent, so this OVERWRITES whatever node the
+       row named before. Only a live node's write is honored (a partitioned node cannot
+       reach the database at all). A durable change refills the fleet so the leader (and
+       any sweeping node) re-evaluates. */
     on eAddRow do (m: (id: int)) {
       var refills: int;
-      if ((m.id in live) && live[m.id] && !(m.id in rows && rows[m.id])) {
-        rows[m.id] = true;
+      if ((m.id in live) && live[m.id] && owner != m.id) {
+        owner = m.id;
         refills = refillAll();
-        /* Fire one armed fault on the new owner (partition before crash). */
+        /* Fire one armed owner-fault on the new owner (partition before crash). */
         if (armedPartitions > 0) {
           armedPartitions = armedPartitions - 1;
           new StrikeCourier((store = this, id = m.id, kind = 0));
@@ -95,10 +113,11 @@ machine Store {
       announceRowDone(refills);
     }
 
+    /* RemoveAssignmentAsync: conditional on the caller still being the named owner. */
     on eRemoveRow do (m: (id: int)) {
       var refills: int;
-      if (m.id in rows && rows[m.id]) {
-        rows[m.id] = false;
+      if (owner == m.id) {
+        owner = 0;
         refills = refillAll();
       }
       announceRowDone(refills);
@@ -106,22 +125,31 @@ machine Store {
 
     on eAssignReq do (m: (id: int)) {
       new RunCourier((target = members[m.id], run = true));
+      /* kind 2: the deploy terminates the leader pod with this start still in flight.
+         The dead leader takes its pending ledger with it. */
+      if (armedLeaderKills > 0 && leader != 0 && (leader in live) && live[leader]) {
+        armedLeaderKills = armedLeaderKills - 1;
+        new StrikeCourier((store = this, id = leader, kind = 1));
+      }
       announceStore(1, 0);
     }
 
-    on eStopReq do (m: (id: int)) {
-      new RunCourier((target = members[m.id], run = false));
-      announceStore(1, 0);
-    }
-
-    /* Partition: cut the owner off (it keeps running) and eject it store-side. The fault
-       opened here is closed when the node heals or dies. */
+    /* Partition: cut the owner off (it keeps running) and eject it store-side. Ejection
+       deletes the node row, and the assignment row goes with it (FK ON DELETE CASCADE).
+       The fault opened here is closed when the node heals or dies. */
     on ePartitionNode do (m: (id: int)) {
       var refills: int;
+      /* The strike rides a courier, so its target can be gone (crashed, or already cut
+         off) by the time it lands. Partitioning a node that has already left is a no-op —
+         and must not open a fault, because a Dead node ignores eCutoff and the fault
+         could never close. */
+      if (!(m.id in live) || !live[m.id]) {
+        return;
+      }
       announce eMFault, (delta = 1,);
       send members[m.id], eCutoff;
       live[m.id] = false;
-      rows[m.id] = false;
+      if (owner == m.id) { owner = 0; }
       refills = refillAll();
       announceStore(0, refills);
     }
@@ -134,7 +162,7 @@ machine Store {
     on eEjectMember do (m: (id: int, counted: bool)) {
       var refills: int;
       live[m.id] = false;
-      rows[m.id] = false;
+      if (owner == m.id) { owner = 0; }
       refills = refillAll();
       announceStore(0, refills);
       if (m.counted) {
@@ -156,11 +184,11 @@ machine Store {
   }
 
   fun announceStore(newRuns: int, newRefills: int) {
-    announce eMStore, (leader = leader, rows = rows, live = live, newRuns = newRuns, newRefills = newRefills);
+    announce eMStore, (leader = leader, owner = owner, live = live, newRuns = newRuns, newRefills = newRefills);
   }
 
   fun announceRowDone(newRefills: int) {
-    announce eMStore, (leader = leader, rows = rows, live = live, newRuns = 0, newRefills = newRefills);
+    announce eMStore, (leader = leader, owner = owner, live = live, newRuns = 0, newRefills = newRefills);
     announce eMRowDone;
   }
 }
@@ -203,22 +231,35 @@ machine StrikeCourier {
 }
 
 /* localRun is the local fact of running the agent; it survives a partition, because a
-   cut-off node cannot be told to stop. The leader's placement logic runs in the tick. */
+   cut-off node cannot be told to stop. The leader's placement logic runs in the tick.
+
+   pendingTarget is the GH-3698 pending-assignment ledger for the one agent: leader-local
+   and in-memory, exactly like the real one — so it retires when the row lands, is dropped
+   on demotion, and above all DIES WITH THE LEADER. A brand-new leader holding no ledger
+   and re-placing an in-flight agent is the committed handover counterexample.
+
+   sweep is the GH-4297 node-side reconcile: on every tick, stop my copy if the row names
+   another live node, and start my copy if the row names me and nothing is running. */
 machine Node {
   var store: machine;
   var id: int;
   var k: int;
+  var sweep: bool;
   var budget: int;
   var localRun: bool;
+  var pendingTarget: int;
+  /* GH-3604/D2: a healed node re-registers and restores its assignment rows, once. */
+  var owesReassert: bool;
   /* Owes the monitor a fault-close (paired with the +1 the partition opened); closed on
      heal or death so a partitioned-then-crashed node cannot leak an open fault. */
   var owesFaultClose: bool;
 
   start state Booting {
-    entry (cfg: (store: machine, id: int, k: int)) {
+    entry (cfg: (store: machine, id: int, k: int, sweep: bool)) {
       store = cfg.store;
       id = cfg.id;
       k = cfg.k;
+      sweep = cfg.sweep;
       budget = cfg.k;
       send store, eJoin, (node = this, id = id);
     }
@@ -258,58 +299,69 @@ machine Node {
   }
 
   state AwaitSync {
-    on eSyncReply do (r: (rows: map[int, bool], live: map[int, bool], amLeader: bool)) {
-      var owners: seq[int];
-      var i: int;
-      var keep: int;
+    on eSyncReply do (r: (owner: int, live: map[int, bool], amLeader: bool)) {
       var target: int;
       var work: bool;
 
-      /* Resurrection (GH-3604/D2): restore my row if it went missing while I'm running.
-         This is what surfaces a post-heal duplicate for the healer to see. */
-      if (localRun && (!(id in r.rows) || !r.rows[id])) {
-        announce eMRowPending;
-        send store, eAddRow, (id = id,);
+      /* GH-3604/D2 re-register after a heal: restore my assignment row for the agent I am
+         still running. Faithful detail: this is an unconditional UPSERT, so it tramples
+         whatever a peer wrote while I was away — bug ledger entry (b), the partition-heal
+         duplicate that the one-row schema can never surface to the leader. */
+      if (owesReassert) {
+        owesReassert = false;
+        if (localRun) {
+          announce eMRowPending;
+          send store, eAddRow, (id = id,);
+        }
+      }
+
+      /* GH-4297 node-side reconcile sweep. Stop side: my copy is an orphan the moment the
+         row names another live node (never on owner == 0 — my own row write may still be
+         in flight, and stopping then reintroduces the lag the sweep exists to avoid
+         trading for duplicates). Start side: the row names me but nothing runs here —
+         which also heals the row-without-runner state the stop side can leave behind when
+         it races this node's own start. */
+      if (sweep) {
+        if (localRun && r.owner != id && r.owner != 0 && (r.owner in r.live) && r.live[r.owner]) {
+          localRun = false;
+          announceMe(true);
+        } else if (!localRun && r.owner == id) {
+          localRun = true;
+          announce eMRowPending;
+          send store, eAddRow, (id = id,);
+          announceMe(true);
+        }
       }
 
       if (r.amLeader) {
-        /* Live row-holders: the copies the leader can see. */
-        foreach (i in keys(r.rows)) {
-          if (r.rows[i] && (i in r.live) && r.live[i]) {
-            owners += (sizeof(owners), i);
+        if (r.owner == 0) {
+          /* The pending ledger holds an in-flight start on its chosen node: re-drive the
+             SAME node rather than spawning a rival copy (GH-3698). Without a live entry
+             the distribution is free to pick anyone — modelled as a nondeterministic
+             choice, which is what the real even-spread looks like from one agent's seat. */
+          if (pendingTarget != 0 && (pendingTarget in r.live) && r.live[pendingTarget]) {
+            target = pendingTarget;
+          } else {
+            target = chooseLive(r.live);
           }
-        }
-
-        if (sizeof(owners) == 0) {
-          /* Place it on the lowest live id — deterministic, so a start in flight is
-             re-dispatched to the same node rather than spawning a rival copy. */
-          target = lowestLive(r.live);
           if (target != 0) {
             send store, eAssignReq, (id = target,);
+            pendingTarget = target;
             work = true;
           }
-        } else if (sizeof(owners) >= 2) {
-          /* GH-2602 healer: keep one copy (highest id, arbitrary), stop the rest. */
-          keep = owners[0];
-          i = 1;
-          while (i < sizeof(owners)) {
-            if (owners[i] > keep) { keep = owners[i]; }
-            i = i + 1;
-          }
-          i = 0;
-          while (i < sizeof(owners)) {
-            if (owners[i] != keep) {
-              send store, eStopReq, (id = owners[i],);
-            }
-            i = i + 1;
-          }
-          work = true;
+        } else {
+          /* The row landed: the ledger entry is retired (reconcilePendingAssignments). */
+          pendingTarget = 0;
         }
 
         /* Keep ticking while there is placement work outstanding. */
         if (work && budget < k) {
           budget = k;
         }
+      } else {
+        /* The ledger is leader-local. A follower holds none — and a NEW leader therefore
+           starts empty, which is the handover hole this model exists to exhibit. */
+        pendingTarget = 0;
       }
 
       goto Ticking;
@@ -324,12 +376,15 @@ machine Node {
   state Partitioned {
     entry {
       owesFaultClose = true;
+      /* Whatever this node was leading or waiting on is gone with its reachability. */
+      pendingTarget = 0;
       announcePartitioned();
       new HealCourier(this);
     }
-    /* Heal: close the fault and take a fresh budget so the node syncs and restores its row. */
+    /* Heal: close the fault, owe the D2 re-register, and take a fresh budget to sync. */
     on eReconnect do {
       closeFaultIfOwed();
+      owesReassert = true;
       budget = k;
       goto Ticking;
     }
@@ -355,16 +410,21 @@ machine Node {
     }
     on eRun do (m: (run: bool)) { announce eMRunDone; }
     on eRefill do { announce eMRefillDone; }
+    /* A cutoff can race a crash: the store fired the strike while this node's eject was
+       still in flight, so its +1 was already announced. Retire it — a dead node cannot
+       be partitioned. */
+    on eCutoff do { announce eMFault, (delta = -1,); }
     ignore eGo;
     ignore eSyncReply;
-    ignore eCutoff;
     ignore eReconnect;
     ignore eCrash;
   }
 
   fun applyRun(run: bool) {
     localRun = run;
-    /* Write my own durable row to match, so a row never outlives its runner. */
+    /* Write my own durable row to match: StartAgentAsync -> upsertAssignmentAsync after
+       the start (a re-dispatch to an already-running node is the D4 re-upsert), and
+       StopAgentAsync -> RemoveAssignmentAsync (conditional store-side). */
     announce eMRowPending;
     if (run) {
       send store, eAddRow, (id = id,);
@@ -389,16 +449,18 @@ machine Node {
     announce eMRefillDone;
   }
 
-  fun lowestLive(live: map[int, bool]): int {
+  fun chooseLive(live: map[int, bool]): int {
     var i: int;
-    var best: int;
-    best = 0;
+    var candidates: seq[int];
     foreach (i in keys(live)) {
-      if (live[i] && (best == 0 || i < best)) {
-        best = i;
+      if (live[i]) {
+        candidates += (sizeof(candidates), i);
       }
     }
-    return best;
+    if (sizeof(candidates) == 0) {
+      return 0;
+    }
+    return choose(candidates);
   }
 
   fun announceMe(busy: bool) {

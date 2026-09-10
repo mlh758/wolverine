@@ -1,71 +1,108 @@
 # Single-agent ownership, model checked
 
-Does a leader-assigned singular agent end up running on exactly one live node after a
-network partition heals? This is the assignment plane the [leader-election
-spec](../leader-election/) deliberately leaves out, and the contention it asks about is the
-GH-2602 one: a node cut off from the database keeps running its agent while the leader,
-seeing it gone, places a copy elsewhere — so for the duration of the partition there are
-genuinely two runners, and when the cut-off node returns the cluster has to notice and
-heal the duplicate. See [`../README.md`](../README.md) for why these specs exist and how to
-run them.
+Does a leader-assigned singular agent end up running on exactly one live node? This is the
+assignment plane the [leader-election spec](../leader-election/) deliberately leaves out.
+See [`../README.md`](../README.md) for why these specs exist and how to run them.
 
 Two facts have to agree in the end: the **durable assignment row** in the store
 (`AddAssignmentAsync` / `RemoveAssignmentAsync`) and the **node-local fact** of actually
-running the agent (`Agents[uri]`). A partition splits them, and the interesting question is
+running the agent (`Agents[uri]`). Faults split them, and the interesting question is
 whether they reconverge.
 
-- **Convergence.** When the cluster goes quiet — no partition still in effect, no placement
-  command or row write in flight — exactly one live node runs the agent, that node holds
-  the one durable row, and no other row survives.
-- **Quiescence.** It does go quiet: a duplicate is always healed, an unowned agent is
-  always placed, and the leader doesn't churn forever.
+**They don't.** This model is faithful to the shipped RDBMS schema, and on that schema the
+shipped system settles into permanent duplicates in two fault scenarios — both committed
+below as **expected violations** (a bug ledger, the mirror image of the mutant ledger).
+The model also carries the proposed fix, the GH-4297 node-side reconcile sweep, as a
+per-test toggle; with it on, every case converges. The point of keeping the bad states
+checkable is that a *structural* fix can later be dropped into the model and validated
+against exactly the schedules that break stock.
 
-Both are one monitor (`AgentOwnershipSpec.p`), asserted at every quiescent moment — never
-mid-partition, when two runners are unavoidable and correct.
+## The schema is the story
+
+An earlier revision of this model kept per-node assignment rows (`rows: map[node, bool]`),
+which let the leader observe two owners at once and heal the extra copy (GH-2602). That
+gave the model a convergence proof the real system does not deserve. The real table is:
+
+```
+id (agent uri)  PRIMARY KEY     -- one row per agent, ever
+node_id         FK -> nodes ON DELETE CASCADE
+```
+
+with `AddAssignmentAsync` an unconditional last-writer-wins upsert and
+`RemoveAssignmentAsync` conditional (`WHERE node_id = :me`). Consequences, all modelled:
+
+- The store can **never represent two owners**, so `grid.DuplicateAgentReports` — the
+  GH-2602 healer's only input on an RDBMS store — is structurally unreachable. The healer
+  is *absent from this model* because it is dead code against this schema. A duplicate's
+  losing row isn't deleted; it is silently overwritten, and the table reads immaculate.
+- What actually keeps ownership single on the happy path is the **pending-assignment
+  ledger** (GH-3698): leader-local, in-memory, retired when the row lands. Modelled as
+  `pendingTarget`: while an entry is live the leader re-drives the *same* node instead of
+  re-choosing. Crucially, **the ledger dies with the leader** — a new leader starts empty.
+- A node ejection cascades away its assignment rows; a healed node's GH-3604/D2
+  re-register **re-upserts** its rows, trampling whatever a peer wrote in the meantime.
+
+## The bug ledger — committed counterexamples
+
+Run these expecting red; the violation *is* the result. Both reproduce shapes measured on
+live clusters by the wolverine-deploy-sim rig (RESULTS.md 2026-09-09: duplicates on ~24%
+of rolling deploys at defaults, never self-healing, table always immaculate).
+
+**(a) `tcLeaderHandoverStock` — the deploy-sim duplicate.** The leader dispatches a start
+and is killed at that instant (the rolling deploy terminating the leader pod, arsonist
+kind 2). The started node's row write is still in flight when the new leader — whose
+ledger is empty by construction — evaluates: the agent looks unplaced, so it places it
+again, free to pick a different node. Both copies run; the single row names whichever
+wrote last; nothing ever notices. Checker: `settled with 2 nodes running the single agent`.
+The found trace is the observed mechanism exactly — in one schedule the new leader is
+itself the node that just started the agent (the sim's `48ww4` trace), re-placing its own
+unrecorded copy onto a peer.
+
+**(b) `tcPartitionHealStock` — GH-2602 residue, unhealable on this schema.** The owner is
+cut off; the leader places a replacement; the healed original's D2 re-register re-upserts
+its row over the replacement's. Two copies run, one row. On the per-node-rows schema the
+healer would now see both and stop one; on the real schema it cannot exist. Checker:
+`settled with 2 nodes running the single agent`.
 
 ## What is modelled
 
 | Model | Real thing |
 | --- | --- |
-| `Store` | the `node_assignments` rows, the live-node set, and the leader's placement, serialized the way the database serializes them |
-| `Node` | one process: its health-check tick (restore my own row; if I'm the leader, evaluate placement) and the local fact of running the agent |
-| `RunCourier` | an `AssignAgent` / `StopRemoteAgent` command in flight to a node |
-| `Arsonist` / `StrikeCourier` | inject a fault on whoever is *currently* running the agent: the arsonist arms the store, which fires the strike (cutoff or crash) on the next node to become owner |
+| `Store` | the agent's ONE `node_assignments` row (PK = agent uri, upsert), the live-node set, and the leader identity, serialized the way the database serializes them |
+| `Node` | one process: its health-check tick (leader: evaluate placement; any node: the GH-4297 sweep when enabled) and the local fact of running the agent |
+| `pendingTarget` | the GH-3698 pending-assignment ledger for one agent: leader-local, in-memory, retired when the row lands, dropped on demotion, **lost at leader death** |
+| `sweep` (toggle) | the GH-4297 node-side reconcile: stop my copy if the row names another live node; start my copy if the row names me and nothing runs here |
+| `RunCourier` | an `AssignAgent` start command in flight to a node |
+| `Arsonist` / `StrikeCourier` | kind 0/1: partition/crash whoever is *currently* running the agent; kind 2: crash the LEADER at the moment it dispatches a start |
 | `HealCourier` | the partition ending |
-| `eRefill` | the health-check loop running forever: faults and durable changes refund tick budgets so the leader keeps polling until the cluster is clean |
+| `eRefill` | the health-check loop running forever: faults and durable changes refund tick budgets so nodes keep polling until the cluster is clean |
 
-Faults hit the current owner, not a fixed node up front, because that is the interesting
-case: a fault delivered before the agent is placed just hits an idle node, and a FIFO mailbox
-would order a pre-injected cutoff ahead of the start that would make the node run.
+Faults hit the current owner (or the acting leader), not a fixed node up front, because
+that is the interesting case: a fault delivered before the agent is placed just hits an
+idle node, and a FIFO mailbox would order a pre-injected cutoff ahead of the start that
+would make the node run.
 
 Kept faithfully, because the properties turn on them:
 
 - A node writes its **own** durable row after it actually starts the agent
-  (`StartAgentAsync → upsertAssignmentAsync`) and removes it after it stops. A start command
-  lost to an unreachable node therefore writes no row — the row can never outlive its
-  runner, which a leader-writes-the-row shortcut would allow.
-- The **GH-3604/D2 resurrection**: a node re-adds its durable row on its next tick if the row
-  is missing while it is still running the agent. This is what makes split-brain residue
-  *visible* — without it a healed node runs the agent with no row and the leader never sees
-  the duplicate to heal it.
-- The **GH-2602 duplicate healer**: when two live nodes hold a row for the agent, the leader
-  stops all but one. Modelled as keeping one deterministic survivor; correctness only needs
-  the survivor to be a single live node.
-- Placement of an unowned agent onto a live node, and reassignment after the owner leaves —
-  the same `EvaluateAssignmentsAsync` decisions, for one agent.
-- Leadership can move (the store grants it to a live node when the current leader is gone),
-  so a *new* leader heals residue left around a partition — but the single-leader invariant
-  itself is **assumed**, not re-derived: it is what the leader-election spec proves. This
-  spec builds on that and studies what the leader does with the agent.
+  (`StartAgentAsync → upsertAssignmentAsync`) and removes it after it stops — with the
+  remove conditional on still being the named owner, as the real SQL is. The
+  start-then-persist order is the window the handover bug lives in.
+- Placement is a **nondeterministic choice** among live nodes when no ledger entry holds —
+  which is what the real even-spread distribution looks like from one agent's seat, and is
+  what lets a new leader re-place an in-flight agent somewhere else.
+- The **D2 re-register** fires once, on heal — not every tick. (The earlier model's
+  every-tick "resurrection" was the unfaithful detail that made per-node rows look
+  healable.)
+- The sweep's stop side deliberately does **not** fire on `owner == 0` — my own row write
+  may be the thing in flight — and the start side is what heals the row-without-runner
+  state the stop side can leave when it races this node's own start. Both halves are
+  load-bearing (see the mutants).
 
-Left out, deliberately: multiple agents and even distribution (`DistributeEvenly`, the full
-`AssignmentGrid`) — this is one singular agent; the pending-assignment ledger and command
-batching (GH-3698/GH-3604/D3) — real optimisations that reduce transient duplicates, but the
-healer is what makes the *property* hold, so the model lets the transient happen and heals
-it; blue/green capability matching; and the advisory-lock election mechanics themselves
-(the sibling spec's job). A partition here is a node excluded from the live set while it
-keeps running — ejection hysteresis is folded into that, since the leader-election spec
-already checks the eject path.
+Left out, deliberately: multiple agents and even distribution (this is one singular
+agent); command batching and reply windows (GH-3604/D3); blue/green capability matching;
+the advisory-lock election mechanics (the sibling spec's job — leadership moving safely is
+*assumed* here). A partition is a node excluded from the live set while it keeps running.
 
 ## Running it
 
@@ -74,62 +111,62 @@ From the repo root, `nix develop` provides `dotnet` and `p`. Then:
 ```
 cd formal/agent-assignment
 p compile --pfiles AgentOwnershipModel.p AgentOwnershipSpec.p AgentOwnershipTest.p --projname AgentOwnership --outdir .
-p check --mode pex -tc tcChaos -s 1000000
+p check -tc tcLeaderHandoverStock -s 5000     # expect the committed violation
+p check -tc tcLeaderHandoverSweep -s 20000    # expect clean
 ```
 
-The cases: `tcSteadyState` (no fault), `tcPartitionHeal` (owner cut off, then heals — the
-partition-heal duplicate), `tcCrash` (owner dies permanently, forcing reassignment — which
-makes the placement path load-bearing, since a heal alone lets a node resurrect its own
-ownership), and `tcChaos` (both). Run both PEx and the random bugfinder — they catch
-different bugs (see [`../README.md`](../README.md)) — and use `-s`, not `-i`.
+Run both PEx and the random bugfinder — they catch different bugs (see
+[`../README.md`](../README.md)) — and use `-s`, not `-i`.
 
 ## Results
 
-PEx, 1M schedules per case (no bugs; deep bounded searches — the space did not close):
+Default-mode random bugfinder, 20k schedules per case:
 
-| Case | Result |
-| --- | --- |
-| `tcSteadyState` | no violation, 1M schedules |
-| `tcPartitionHeal` | no violation, 1M schedules |
-| `tcCrash` | no violation, 1M schedules |
-| `tcChaos` | no violation, 1M schedules |
+| Case | Sweep | Result |
+| --- | --- | --- |
+| `tcSteadyState` | off | no violation |
+| `tcCrash` | off | no violation |
+| `tcPartitionHealStock` | off | **VIOLATED (expected)** — `settled with 2 nodes running`, 100% of schedules |
+| `tcPartitionHealSweep` | on | no violation |
+| `tcLeaderHandoverStock` | off | **VIOLATED (expected)** — `settled with 2 nodes running`, 0.16% of schedules |
+| `tcLeaderHandoverSweep` | on | no violation |
+| `tcChaosSweep` (partition+crash+leader kill) | on | no violation |
 
-Coverage confirms the interesting paths are actually exercised rather than passing
-vacuously: in `tcPartitionHeal` a running owner receives the cutoff, enters the partitioned
-state, heals, its restored row makes the duplicate visible, and the leader emits a
-`StopRemoteAgent` (the duplicate healer) — and even `tcSteadyState` exercises the healer,
-because the startup assignment race can briefly place the agent on two nodes before one row
-becomes visible.
+The two stock violations differ tellingly in rate: the partition-heal duplicate is forced
+(every schedule loses), while the handover duplicate needs the racy interleaving — the row
+write still in flight when the new leader's first evaluation reads its snapshot — which is
+exactly why the real bug shows up on *some* rolling deploys (~1 in 4 at defaults on the
+deploy-sim rig) rather than all of them.
 
-The mutants below are caught as **safety** violations (an assertion at quiescence): a
-persistent bad state is made to settle so the monitor sees it, rather than relying on
-hot-state liveness.
+PEx (systematic), 100k schedules on the five passing cases: no violations
+(`partially correct` — deep bounded searches; the space did not close).
+
+All violations are **safety** counterexamples at quiescence — the bad state settles and
+the monitor's convergence assertion names it — not hot-state liveness, so they reproduce
+under PEx too.
 
 ## What the mutants say
 
-Each is the committed model with one thing removed:
+Each is the committed model with one mechanism removed; each must produce its predicted
+counterexample, or the passing cases above are vacuous:
 
-- **The duplicate healer** (the `owners >= 2` branch) — the leader no longer stops the extra
-  copies — **violated** on `tcPartitionHeal`: `settled with 2 nodes running the single agent`.
-  A partitioned owner keeps running; the leader places a copy on a peer; the original heals
-  and, with nothing to heal the split, both run for good. This is the GH-2602 residue the
-  `StopRemoteAgent` exists to clean up.
-- **The GH-3604/D2 resurrection** — a healed node never re-adds its durable row — **violated**
-  on `tcPartitionHeal`: `settled with 2 nodes running`. The subtle one: the healed node is
-  still running the agent, but with no row the leader cannot *see* the duplicate, so the
-  healer never fires and the two copies run on forever. The resurrection isn't only about not
-  losing a node — it is what surfaces the split-brain so it can be healed.
-- **Placement of an unowned agent** — the leader never assigns — **violated** on `tcCrash`:
-  `settled with 0 nodes running`. When the sole owner crashes for good, nothing re-places the
-  agent and it stops running anywhere. (A partition heal alone would not catch this — the
-  returning node resurrects its own ownership — which is why the crash case is what makes the
-  placement path load-bearing.)
+- **The pending ledger** (`pendingTarget` re-drive; the leader re-chooses every tick) —
+  **violated on `tcSteadyState`**, no faults needed: while the first start is in flight
+  the leader re-places the agent on another node, and with the sweep off the two copies
+  settle. `settled with 2 nodes running`. This is GH-3698's job, and why the ledger dying
+  with the leader (bug ledger a) matters.
+- **The sweep's stop side** — **violated on `tcLeaderHandoverSweep`**: the handover
+  duplicate forms and nothing stops the orphan. `settled with 2 nodes running`.
+- **The sweep's start side** — **violated on `tcPartitionHealSweep`**: the healed node's
+  re-upsert lands after it swept its own copy away, leaving a row that names a non-runner;
+  with no start side nothing re-drives it. `settled with 0 nodes running`. This is the
+  model's argument that GH-4297 must ship both halves.
+- **Placement of an unowned agent** (the leader never assigns) — **violated on `tcCrash`**:
+  the sole owner dies and the agent never runs again. `settled with 0 nodes running`.
 
-Not mutated but worth stating: the model itself was wrong twice in ways the checker caught,
-both fixed in the committed version. First, having the *store* write the assignment row at
-dispatch (instead of the node writing its own after it starts) let a row outlive its runner
-when a start was lost — PEx surfaced it as an orphan row at quiescence. Second, a node's
-`Dead` entry announced the death before opening its crash fault, so the monitor saw a
-momentary zero-runner "quiescence" before recovery began and fired a false alarm; opening the
-fault first fixed it. Both are the same lesson the leader-election spec records: tell the
-monitor about the work still owed before you announce the step that looks like rest.
+Model-authoring lessons kept from earlier revisions, all found by the checker: the store
+writing the row at dispatch let a row outlive its runner; announcing a death before opening
+its fault let the monitor read a false quiescence; and two fault-accounting races in this
+revision (a partition strike landing on an already-dead node, whose cutoff a Dead node must
+retire like any other stray command). Same lesson every time: tell the monitor about the
+work still owed before you announce the step that looks like rest.
