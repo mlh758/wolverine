@@ -442,7 +442,17 @@ public abstract class Chain<TChain, TModifyAttribute> : IChain
                 var outgoings = call.Creates.Where(x => x.VariableType == typeof(OutgoingMessages)).ToArray();
                 foreach (var outgoing in outgoings)
                 {
-                    frames.Add(new CaptureCascadingMessages(outgoing));
+                    // GH-4416. This has to be the catch-SAFE frame, the same one
+                    // MiddlewarePolicy.ApplyExceptionHandling already uses for this job on a middleware
+                    // class. CaptureCascadingMessages is a MethodCall, so its FindVariables exposes the
+                    // dependency on this OnException call's return variable; the codegen arranger then
+                    // pre-links the two catch frames' Next pointers, and TryCatchFinallyFrame chains its
+                    // catch frames manually -- so that second assignment throws "Frame chain is being
+                    // re-arranged" and code generation fails outright rather than degrading.
+                    //
+                    // The emitted code is the same either way: EnqueueCascadingAsync unwraps
+                    // OutgoingMessages (and IEnumerable) internally.
+                    frames.Add(new CaptureCascadingMessagesInCatch(outgoing));
                 }
 
                 if (generationRules.TryFindContinuationHandler(this, call, out var continuation))
@@ -583,11 +593,11 @@ public abstract class Chain<TChain, TModifyAttribute> : IChain
                 {
                     if (report.ServiceDescriptor.IsKeyedService)
                     {
-                        logger.LogWarning("Utilizing service location for {Chain} for Service {ServiceType} ({Key}): {Reason}. This will throw in Wolverine 6.0 when ServiceLocationPolicy.NotAllowed becomes the default. See https://wolverinefx.net/guide/codegen.html", Description, report.ServiceDescriptor.ServiceType, report.ServiceDescriptor.ServiceKey, report.Reason);
+                        logger.LogWarning("Utilizing service location for {Chain} for Service {ServiceType} ({Key}): {Reason}. Under the default ServiceLocationPolicy.NotAllowed this is an error. See https://wolverinefx.net/guide/codegen.html", Description, report.ServiceDescriptor.ServiceType, report.ServiceDescriptor.ServiceKey, report.Reason);
                     }
                     else
                     {
-                        logger.LogWarning("Utilizing service location for {Chain} for Service {ServiceType}: {Reason}. This will throw in Wolverine 6.0 when ServiceLocationPolicy.NotAllowed becomes the default. See https://wolverinefx.net/guide/codegen.html", Description, report.ServiceDescriptor.ServiceType, report.Reason);
+                        logger.LogWarning("Utilizing service location for {Chain} for Service {ServiceType}: {Reason}. Under the default ServiceLocationPolicy.NotAllowed this is an error. See https://wolverinefx.net/guide/codegen.html", Description, report.ServiceDescriptor.ServiceType, report.Reason);
                     }
                 }
                 break;
@@ -612,7 +622,7 @@ public class InvalidServiceLocationException : Exception
     public static string ToMessage(IChain chain, ServiceLocationReport[] reports)
     {
         var writer = new StringWriter();
-        writer.WriteLine($"Found service locations while generating code for {chain.Description}, but {nameof(ServiceLocationPolicy)}.{nameof(ServiceLocationPolicy.NotAllowed)} is in effect (this will become the default in Wolverine 6.0).");
+        writer.WriteLine($"Found service locations while generating code for {chain.Description}, but {nameof(ServiceLocationPolicy)}.{nameof(ServiceLocationPolicy.NotAllowed)} is in effect (it is the default).");
         writer.WriteLine("See https://wolverinefx.net/guide/codegen.html for more information");
         writer.WriteLine("Service location(s):");
         foreach (var report in reports)

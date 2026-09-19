@@ -32,6 +32,14 @@ public abstract class RecurringMessageCompliance : IAsyncLifetime
     private readonly List<RecurringMessageAgent> _agents = [];
     private readonly System.Collections.Concurrent.ConcurrentQueue<string> _logProblems = new();
 
+    /// <summary>
+    /// A deliberately HALF-hour-offset zone (+05:30). Any non-UTC zone reproduces GH-4436, but this
+    /// one also proves the zone was really honoured: a top-of-the-hour cron in +05:30 can only land
+    /// on minute 30 of a UTC hour, which a zone-ignoring implementation cannot produce by accident.
+    /// </summary>
+    private static readonly TimeZoneInfo Kolkata = TimeZoneInfo.FindSystemTimeZoneById(
+        OperatingSystem.IsWindows() ? "India Standard Time" : "Asia/Kolkata");
+
     /// <summary>Wire this provider's message persistence into the options.</summary>
     protected abstract void configurePersistence(WolverineOptions opts);
 
@@ -200,6 +208,44 @@ public abstract class RecurringMessageCompliance : IAsyncLifetime
     }
 
     [Fact]
+    public async Task publishing_records_the_tracking_row_for_a_non_utc_schedule()
+    {
+        // GH-4436. Cronos returns each occurrence carrying the SCHEDULE's offset, not UTC, and
+        // PostgreSQL's timestamptz binder rejects any DateTimeOffset whose offset isn't zero — so
+        // every tick of every zoned schedule threw on the write and the row was never recorded.
+        var host = await buildHost(opts =>
+        {
+            opts.Schedules.ScheduleRecurring<RecurringComplianceMessage>("zoned-compliance", "0 * * * *",
+                _ => new RecurringComplianceMessage(), Kolkata);
+        });
+
+        var store = host.Services.GetRequiredService<IMessageStore>();
+
+        var row = await waitForTrackedPublishAsync(store, "zoned-compliance");
+
+        row.NextOccurrence.ShouldNotBeNull();
+        row.NextOccurrence.Value.ShouldBeGreaterThan(DateTimeOffset.UtcNow);
+
+        // The stored instant is the +05:30 top-of-the-hour, which is minute 30 of a UTC hour.
+        // Asserted on the INSTANT rather than on .Offset because the providers disagree about the
+        // offset a round-tripped column reports (MySQL has no offset-carrying column type at all)
+        // while every one of them must agree about the moment.
+        row.NextOccurrence.Value.UtcDateTime.Minute.ShouldBe(30);
+
+        // The agent and the row agree on that instant — the dedup id is computed from the
+        // occurrence the agent published, so a normalization that shifted the moment (rather than
+        // just its offset) would break this even though the write itself succeeded.
+        row.DeduplicationId.ShouldBe($"zoned-compliance:{row.NextOccurrence.Value.ToUniversalTime():O}");
+
+        (await store.RecurringMessages.CountStillScheduledAsync(row.EnvelopeIds,
+            TestContext.Current.CancellationToken)).ShouldBe(row.EnvelopeIds.Length);
+
+        // The bug's actual signature: the publish succeeded and only the bookkeeping write threw,
+        // which the agent swallows into this log line rather than surfacing.
+        _logProblems.ShouldNotContain(x => x.Contains("Failed to record the tracking row"));
+    }
+
+    [Fact]
     public async Task verification_detects_a_cancelled_envelope_and_republishes_it()
     {
         var host = await buildHost(opts =>
@@ -283,6 +329,59 @@ public abstract class RecurringMessageCompliance : IAsyncLifetime
             TestContext.Current.CancellationToken);
         again!.Paused.ShouldBeTrue();
         again.PausedAt.ShouldBe(firstPausedAt);
+    }
+
+    [Fact]
+    public async Task a_manual_trigger_runs_once_leaves_the_cadence_alone_and_is_refused_while_paused()
+    {
+        RecurringComplianceMessageHandler.Reset();
+
+        var host = await buildHost(opts =>
+        {
+            opts.Schedules.ScheduleRecurring<RecurringComplianceMessage>("triggered-compliance", "0 * * * *",
+                _ => new RecurringComplianceMessage());
+        });
+
+        var store = host.Services.GetRequiredService<IMessageStore>();
+        var control = host.Services.GetRequiredService<IRecurringScheduleControl>();
+
+        var before = await waitForTrackedPublishAsync(store, "triggered-compliance");
+
+        // Hourly cron, so nothing fires on its own for the length of this test: anything the
+        // handler receives can ONLY be the manual run. Without that, this would pass vacuously on
+        // a scheduled occurrence that happened to land.
+        RecurringComplianceMessageHandler.Received.ShouldBeEmpty();
+
+        await control.TriggerAsync("triggered-compliance", TestContext.Current.CancellationToken);
+
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(30);
+        while (RecurringComplianceMessageHandler.Received.Count == 0 && DateTimeOffset.UtcNow < deadline)
+        {
+            await Task.Delay(100, TestContext.Current.CancellationToken);
+        }
+
+        var envelope = RecurringComplianceMessageHandler.Received.FirstOrDefault();
+        envelope.ShouldNotBeNull("the manual trigger never fired");
+
+        // It carries its OWN deduplication id, which is what keeps a "run now" from being
+        // collapsed into a scheduled firing of the same schedule.
+        envelope.DeduplicationId.ShouldNotBeNull();
+        envelope.DeduplicationId.ShouldStartWith("triggered-compliance:manual:");
+
+        // The agent cleared the request, so it runs exactly once rather than every tick...
+        var after = await store.RecurringMessages.LoadAsync("triggered-compliance",
+            TestContext.Current.CancellationToken);
+        after.ShouldNotBeNull();
+        after.TriggerRequestedAt.ShouldBeNull();
+
+        // ...and the pending scheduled occurrence was left completely alone — a manual run is
+        // extra, never a replacement for the cron cadence.
+        after.NextOccurrence.ShouldBe(before.NextOccurrence);
+
+        // Pausing says the schedule must not fire, and a trigger may not override that.
+        await control.PauseAsync("triggered-compliance", TestContext.Current.CancellationToken);
+        await Should.ThrowAsync<RecurringSchedulePausedException>(
+            () => control.TriggerAsync("triggered-compliance", TestContext.Current.CancellationToken));
     }
 
     [Fact]

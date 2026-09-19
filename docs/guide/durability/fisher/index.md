@@ -92,6 +92,9 @@ public static class ShipOrderHandler
 See [Event Sourced Models](/guide/handlers/persistence.html#event-sourced-models) for the full
 vocabulary — `[WriteModel]`, `[ReadModel]`, `[DeciderFunction]` and `[DcbModel]`.
 
+That handler is also unit testable without a database -- see
+[Unit Testing Aggregate Handlers](/guide/durability/unit-testing-aggregate-handlers).
+
 ## Ancillary stores
 
 A second Fisher store registered with `AddFisherStore<T>()` integrates the same way, and the
@@ -113,6 +116,19 @@ public static void Handle(RecordPlayerScore command, IDocumentSession session)
     session.Store(new Player { Id = command.Name, Score = command.Score });
 }
 ```
+
+In a modular monolith, where one module's assembly maps to one store, you can declare that once instead of
+marking every handler <Badge type="tip" text="6.39" />:
+
+```cs
+// Every message handler, HTTP endpoint and gRPC service in this assembly commits
+// through the IPlayerStore ancillary store.
+opts.Policies.UseAncillaryStorageFromAssemblyContaining<SomeModuleType>(typeof(IPlayerStore));
+```
+
+An explicit `[Storage]` or `[FisherStore]` still wins for a single handler that needs to opt out. Note that for
+gRPC services this is the *only* mechanism that works -- the gRPC chains never apply chain-modifying attributes, so
+`[Storage]` is silently ignored there.
 
 Each store is **its own file**, which is what gets two concurrent writers out of SQLite rather than
 having them contend on one. Wolverine's durability tables for an ancillary store live in that

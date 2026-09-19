@@ -41,21 +41,21 @@
          (build/SupervisedTests.cs): class-partitioned parallel workers, per-lane environments,
          and honest retry reporting. Referenced ONLY by the build project. -->
     <PackageVersion Include="Bobcat.Supervisor" Version="0.8.0" />
-    <PackageVersion Include="JasperFx" Version="2.66.1" />
-    <PackageVersion Include="JasperFx.Events" Version="2.66.1" />
-    <PackageVersion Include="JasperFx.Events.SourceGenerator" Version="2.66.1" />
+    <PackageVersion Include="JasperFx" Version="2.73.2" />
+    <PackageVersion Include="JasperFx.Events" Version="2.73.2" />
+    <PackageVersion Include="JasperFx.Events.SourceGenerator" Version="2.73.2" />
     <!-- RuntimeCompiler is on its own 5.x line (the Roslyn compiler package) — not the 2.1.x
          family; it stays at 5.0.0. -->
     <PackageVersion Include="JasperFx.RuntimeCompiler" Version="5.0.0" />
-    <PackageVersion Include="JasperFx.SourceGenerator" Version="2.66.1" />
+    <PackageVersion Include="JasperFx.SourceGenerator" Version="2.73.2" />
     <PackageVersion Include="Lamar.Microsoft.DependencyInjection" Version="16.0.0" />
-    <PackageVersion Include="Marten" Version="9.32.1" />
+    <PackageVersion Include="Marten" Version="9.35.0" />
     <PackageVersion Include="Microsoft.Data.SqlClient" Version="6.1.3" />
-    <PackageVersion Include="Polecat" Version="5.24.0" />
-    <PackageVersion Include="Fisher" Version="1.2.0" />
+    <PackageVersion Include="Polecat" Version="5.29.0" />
+    <PackageVersion Include="Fisher" Version="1.10.0" />
     <PackageVersion Include="Microsoft.Azure.Cosmos" Version="3.46.1" />
-    <PackageVersion Include="Marten.AspNetCore" Version="9.32.1" />
-    <PackageVersion Include="Marten.Newtonsoft" Version="9.32.1" />
+    <PackageVersion Include="Marten.AspNetCore" Version="9.35.0" />
+    <PackageVersion Include="Marten.Newtonsoft" Version="9.35.0" />
     <PackageVersion Include="MemoryPack" Version="1.21.3" />
     <PackageVersion Include="MessagePack" Version="3.1.7" />
     <PackageVersion Include="Meziantou.Extensions.Logging.Xunit" Version="1.0.15" />
@@ -76,7 +76,12 @@
     <PackageVersion Include="Microsoft.Extensions.ApiDescription.Server" Version="9.0.5" />
     <PackageVersion Include="Microsoft.FeatureManagement" Version="3.2.0" />
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
-    <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="8.0.0" />
+    <!-- SourceLink 8.0.0 pulls Microsoft.Build.Tasks.Git 8.0.0 exactly, which carries
+         GHSA-23fw-v26w-5fgq. It arrives with PrivateAssets="All" from Directory.Build.props, so the
+         transitive cannot be pinned around; the SourceLink version is the only lever. 10.0.401
+         resolves it to Microsoft.Build.Tasks.Git 10.0.401; the lowest stable clear of the advisory
+         is 10.0.204, so there is no smaller step. Build-time only, nothing ships from it. -->
+    <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.401" />
     <PackageVersion Include="Microsoft.VisualStudio.Threading.Analyzers" Version="17.0.64" />
     <PackageVersion Include="MQTTnet.Extensions.ManagedClient" Version="4.3.7.1207" />
     <PackageVersion Include="MQTTnet" Version="5.2.0.1603" />
@@ -98,6 +103,7 @@
     <PackageVersion Include="OpenTelemetry" Version="1.15.3" />
     <PackageVersion Include="OpenTelemetry.Api" Version="1.15.3" />
     <PackageVersion Include="OpenTelemetry.Exporter.Console" Version="1.15.3" />
+    <PackageVersion Include="OpenTelemetry.Exporter.InMemory" Version="1.15.3" />
     <PackageVersion Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.15.3" />
     <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.15.3" />
     <PackageVersion Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.15.2" />
@@ -126,7 +132,8 @@
     <PackageVersion Include="Swashbuckle.AspNetCore.SwaggerGen" Version="9.0.1" />
     <PackageVersion Include="Swashbuckle.AspNetCore.SwaggerUI" Version="9.0.1" />
     <PackageVersion Include="System.ComponentModel" Version="4.3.0" />
-    <PackageVersion Include="System.Security.Cryptography.Xml" Version="10.0.7" />
+    <!-- 10.0.7 carries a known HIGH severity advisory (NU1903). -->
+    <PackageVersion Include="System.Security.Cryptography.Xml" Version="10.0.12" />
     <!-- Testcontainers pulls SSH.NET [2025.1.0, ); everything through 2025.1.0 carries
          GHSA-q939-rpr3-3284. The test projects that use Testcontainers reference this directly so
          the patched version wins. -->
@@ -143,13 +150,13 @@
     <PackageVersion Include="System.Diagnostics.DiagnosticSource" Version="9.0.5" />
     <PackageVersion Include="System.Net.NameResolution" Version="4.3.0" />
     <PackageVersion Include="System.Threading.Tasks.Dataflow" Version="9.0.5" />
-    <PackageVersion Include="Weasel.Core" Version="9.30.0" />
-    <PackageVersion Include="Weasel.EntityFrameworkCore" Version="9.30.0" />
-    <PackageVersion Include="Weasel.MySql" Version="9.30.0" />
-    <PackageVersion Include="Weasel.Oracle" Version="9.30.0" />
-    <PackageVersion Include="Weasel.Postgresql" Version="9.30.0" />
-    <PackageVersion Include="Weasel.SqlServer" Version="9.30.0" />
-    <PackageVersion Include="Weasel.Sqlite" Version="9.30.0" />
+    <PackageVersion Include="Weasel.Core" Version="9.32.0" />
+    <PackageVersion Include="Weasel.EntityFrameworkCore" Version="9.32.0" />
+    <PackageVersion Include="Weasel.MySql" Version="9.32.0" />
+    <PackageVersion Include="Weasel.Oracle" Version="9.32.0" />
+    <PackageVersion Include="Weasel.Postgresql" Version="9.32.0" />
+    <PackageVersion Include="Weasel.SqlServer" Version="9.32.0" />
+    <PackageVersion Include="Weasel.Sqlite" Version="9.32.0" />
     <PackageVersion Include="xunit" Version="2.9.3" />
     <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
     <!-- xUnit v3. Test projects use xunit.v3 and must set <OutputType>Exe</OutputType>.

@@ -549,6 +549,30 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
         return _scheduleExecution.PostAsync(envelope);
     }
 
+    /// <summary>
+    /// GH-4435. Test seam: has this receiver asked its listening agent to pause for inbox recovery?
+    /// </summary>
+    internal bool InboxUnavailableSignaled => _inboxUnavailableSignaled == 1;
+
+    /// <summary>
+    /// GH-4435. Pause the listener only when the failure reached the MAIN message store. A single tenant
+    /// database being unreachable must not stop a listener that serves every other tenant: those
+    /// envelopes are deferred back to the broker on the per-envelope path while everyone else keeps
+    /// flowing.
+    /// </summary>
+    private void signalInboxUnavailableUnlessTenantScoped(Exception e)
+    {
+        if (e is TenantedInboxWriteException { IncludesMainStore: false } tenanted)
+        {
+            _logger.LogWarning(e,
+                "Inbox write failed for {Count} envelope(s) against one or more tenant databases at {Uri}. The listener keeps running; those envelopes are deferred back to the broker",
+                tenanted.Unpersisted.Count, Uri);
+            return;
+        }
+
+        SignalInboxUnavailable();
+    }
+
     internal void SignalInboxUnavailable()
     {
         if (Interlocked.CompareExchange(ref _inboxUnavailableSignaled, 1, 0) != 0) return;
@@ -679,9 +703,11 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
 
                 return;
             }
-            catch (Exception)
+            catch (Exception outer)
             {
-                SignalInboxUnavailable();
+                // GH-4435. A tenant-scoped failure defers this envelope back to the broker below without
+                // pausing the listener for every other tenant.
+                signalInboxUnavailableUnlessTenantScoped(outer);
 
                 if (envelope.Listener == null)
                 {
@@ -747,6 +773,23 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
             try
             {
                 await deadLetters.MoveToErrorsAsync(envelope, e).ConfigureAwait(false);
+
+                // GH-4488: MoveToErrorsAsync is not uniformly terminal. On most transports it settles the
+                // delivery -- RabbitMQ nacks to the DLX, Azure Service Bus dead letters it -- and there is
+                // nothing left to do. But SQS and GCP Pub/Sub implement it as a COPY to another queue/topic
+                // and leave the original delivery completely untouched, so returning here would strand it:
+                // the visibility timeout lapses, the broker delivers it again, the inbox deduplicates it
+                // again, and because BrokerDeliveryCount only ever grows it is dead lettered again. The loop
+                // this whole branch exists to break would instead emit one dead letter copy per turn.
+                //
+                // HasBeenAcked is how a transport reports that it settled -- the same flag
+                // MessageContext.CompleteAsync short-circuits on, which RabbitMQ sets next to its nack and
+                // Azure Service Bus next to its dead letter move (GH-4481). Still clear means nothing
+                // settled this delivery, so settle it here.
+                if (!envelope.HasBeenAcked)
+                {
+                    await envelope.Listener.CompleteAsync(envelope).ConfigureAwait(false);
+                }
 
                 _logger.LogWarning(
                     "Moved envelope {Id} from {Uri} to the dead letter queue after the broker delivered it {DeliveryCount} times; it is a duplicate that cannot be settled",
@@ -985,7 +1028,11 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
             catch (Exception e)
             {
                 _logger.LogError(e, "Error trying to persist incoming envelopes at {Uri}", Uri);
-                SignalInboxUnavailable();
+
+                // GH-4435. Envelopes whose own store committed are already stamped WasPersistedInInbox by
+                // MultiTenantedMessageStore, so the per-envelope path below acks and enqueues those and
+                // only re-attempts the ones that never landed.
+                signalInboxUnavailableUnlessTenantScoped(e);
 
                 // Use finer grained retries on one envelope at a time, and this will also deal with
                 // duplicate detection

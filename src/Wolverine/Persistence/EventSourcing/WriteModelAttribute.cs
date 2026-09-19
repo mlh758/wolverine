@@ -126,7 +126,11 @@ public class WriteModelAttribute : WolverineParameterAttribute, IDataRequirement
         // Both stores had this inlined, spelled differently, and both spellings were byte-for-byte their
         // own IPersistenceFrameProvider.DetermineSagaIdType. Marten resolved the document type's IdType;
         // Polecat reflected over the Id property. It's the same seam, which already existed.
-        var idType = ((IPersistenceFrameProvider)provider).DetermineSagaIdType(aggregateType, container);
+        //
+        // GH-4441: the chain goes over that seam too, for the same reason the natural-key lookup below does.
+        // Marten's answer is a fact about the store, so a chain routed to an ancillary store has to ask that
+        // store rather than the default one.
+        var idType = ((IPersistenceFrameProvider)provider).DetermineSagaIdType(aggregateType, chain, container);
 
         // If a specific ValueSource has been set (e.g. via FromMethod, FromRoute, FromHeader, FromClaim),
         // use the base class identity resolution which respects that ValueSource
@@ -143,7 +147,10 @@ public class WriteModelAttribute : WolverineParameterAttribute, IDataRequirement
         // If standard identity resolution failed, check for natural key support
         if (identity == null)
         {
-            var naturalKeyType = provider.TryDetermineNaturalKeyType(aggregateType, container);
+            // GH-4439: the chain goes over the seam because natural keys are registered per store. Without it
+            // the store side can only ask the default store, and an aggregate registered on an ancillary store
+            // never takes this branch.
+            var naturalKeyType = provider.TryDetermineNaturalKeyType(aggregateType, chain, container);
             if (naturalKeyType != null)
             {
                 identity = FindIdentity(aggregateType, naturalKeyType, chain);

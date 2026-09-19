@@ -152,7 +152,16 @@ public partial class Envelope
     /// drive the pending count negative.
     /// </summary>
     internal bool BatchPendingSettled { get; set; }
-    
+
+    /// <summary>
+    /// GH-4397 — true on a grouped batch envelope whose members were counted into their batching
+    /// pipeline's total in <see cref="Runtime.Batching.BatchingPendingCounts"/>, so its terminal releases
+    /// them. Set by whoever built the batch and counted it: <c>BatchingProcessor</c> for assembled batches
+    /// and expired-member carriers, <c>BatchReplay</c> for a reduced batch. A batch nobody counted must
+    /// not subtract members it never added.
+    /// </summary>
+    internal bool BatchPipelineCounted { get; set; }
+
     [JsonIgnore]
     internal bool HasBeenAcked { get; set; }
 
@@ -238,6 +247,17 @@ public partial class Envelope
         if (TenantId != null)
         {
             tagList.Add(MetricsConstants.TenantIdKey, TenantId);
+        }
+
+        // GH-4445. Read off the header rather than the SetMetricsTag seam: the metric tag list is a
+        // private field that is never serialized, so an occurrence published on one node and handled
+        // on another would reach the success / failure / effective-time counters with no attribution
+        // at all. The header round-trips every transport, so the counters can be sliced per schedule
+        // on whichever node actually handled the occurrence. Costs one lookup on a lazily-allocated
+        // dictionary, which short-circuits to false for every message that has no headers.
+        if (TryGetHeader(RecurringMessage.HeaderKey, out var scheduleName))
+        {
+            tagList.Add(MetricsConstants.ScheduleNameKey, scheduleName);
         }
 
         return tagList;
@@ -468,6 +488,14 @@ public partial class Envelope
         {
             activity.MaybeSetTag(WolverineTracing.ScheduleName, scheduleName);
         }
+
+        // ...and which firing of that schedule this span belongs to. Trace-only by design: the
+        // instant takes a distinct value every occurrence, so it is fine on a span and would be
+        // unbounded cardinality on a metric.
+        if (TryGetHeader(RecurringMessage.OccurrenceHeaderKey, out var occurrence))
+        {
+            activity.MaybeSetTag(WolverineTracing.ScheduleOccurrence, occurrence);
+        }
     }
 
     internal ValueTask PersistAsync(IEnvelopeTransaction transaction)
@@ -608,6 +636,7 @@ public partial class Envelope
         Failure = null;
         Batch = null;
         BatchPendingSettled = false;
+        BatchPipelineCounted = false;
         HasBeenAcked = false;
         AckAttempts = 0;
         WireTap = null;

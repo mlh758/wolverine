@@ -9,8 +9,8 @@ explicit configuration.
 
 ## Publishing Messages Locally
 
-The queueing is all based around the [TPL Dataflow library](https://docs.microsoft.com/en-us/dotnet/standard/parallel-programming/how-to-perform-action-when-a-dataflow-block-receives-data) objects from the [TPL Dataflow](https://docs.microsoft.com/en-us/dotnet/standard/parallel-programming/dataflow-task-parallel-library) library.
-As such, you have a fair amount of control over parallelization and even some back pressure. These local queues can be used directly, or as a transport to accept messages sent through
+The queueing is all built on the [System.Threading.Channels](https://learn.microsoft.com/en-us/dotnet/core/extensions/channels) library
+(Wolverine used TPL Dataflow for this before 5.0). You have a fair amount of control over parallelization and even some back pressure. These local queues can be used directly, or as a transport to accept messages sent through
 `IMessageBus.SendAsync()` or `IMessageBus.PublishAsync()`. using the application's [message routing rules](/guide/messaging/subscriptions.html#routing-rules).
 
 
@@ -302,10 +302,33 @@ using var host = await Host.CreateDefaultBuilder()
 
 See [Durable Inbox and Outbox Messaging](/guide/durability/) for more information.
 
+## Circuit Breakers on Local Queues
+
+You can put a [circuit breaker](/guide/handlers/error-handling#circuit-breaker) on a local queue, but only on a
+durable one:
+
+```cs
+opts.LocalQueueFor<ProcessPayment>()
+    .UseDurableInbox()
+    .CircuitBreaker(cb =>
+    {
+        cb.MinimumThreshold = 10;
+        cb.FailurePercentageThreshold = 20;
+        cb.PauseTime = 5.Minutes();
+    });
+```
+
+::: warning
+A buffered local queue can't pause. As of Wolverine 6.36, `CircuitBreaker()` on a local queue that isn't
+durable stops the host from starting with an `InvalidListenerConfigurationException`. Earlier versions accepted
+the configuration and then ignored it, so the queue just kept processing -- and failing -- every message. Add
+`UseDurableInbox()` to the queue, or `opts.Policies.UseDurableLocalQueues()` for all of them.
+:::
+
 
 ## Configuring Parallelization and Execution Properties
 
-The queues are built on top of the TPL Dataflow library, so it's pretty easy to configure parallelization (how many concurrent messages could be handled by a queue). Here's an example of how to establish this:
+The queues are built on top of [System.Threading.Channels](https://learn.microsoft.com/en-us/dotnet/core/extensions/channels), and it's pretty easy to configure parallelization (how many concurrent messages could be handled by a queue). Here's an example of how to establish this:
 
 <!-- snippet: sample_localqueuesapp -->
 <a id='snippet-sample_localqueuesapp'></a>

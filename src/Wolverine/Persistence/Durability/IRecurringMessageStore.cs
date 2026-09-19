@@ -7,8 +7,22 @@ namespace Wolverine.Persistence.Durability;
 /// that makes the "next occurrence is up" guarantee verifiable and gives management tooling a
 /// stable handle on what is pending for which schedule.
 /// </summary>
+/// <remarks>
+/// GH-4436: every instant on this record normalizes to UTC on the way in, exactly as
+/// <see cref="Envelope.ScheduledTime" /> does. A zoned schedule's occurrence arrives from Cronos
+/// carrying the SCHEDULE's offset rather than UTC, and PostgreSQL's <c>timestamptz</c> binder
+/// refuses any <see cref="DateTimeOffset" /> whose offset is not zero — so normalizing here, at the
+/// durable model, fixes every provider at once instead of each parameter bind. It changes the
+/// offset and never the moment, and <see cref="DateTimeOffset" /> equality compares moments, so the
+/// agent's occurrence-matching (verification and failover adoption) is unaffected.
+/// </remarks>
 public class RecurringMessageRecord
 {
+    private readonly DateTimeOffset? _nextOccurrence;
+    private readonly DateTimeOffset? _pausedAt;
+    private readonly DateTimeOffset? _triggerRequestedAt;
+    private readonly DateTimeOffset _lastUpdated;
+
     /// <summary>The schedule's registered name — the primary key.</summary>
     public required string Name { get; init; }
 
@@ -29,16 +43,45 @@ public class RecurringMessageRecord
     public string? DeduplicationId { get; init; }
 
     /// <summary>When the pending occurrence fires. Null while paused or never published.</summary>
-    public DateTimeOffset? NextOccurrence { get; init; }
+    public DateTimeOffset? NextOccurrence
+    {
+        get => _nextOccurrence;
+        init => _nextOccurrence = value?.ToUniversalTime();
+    }
 
     /// <summary>Is this schedule administratively paused?</summary>
     public bool Paused { get; init; }
 
     /// <summary>When the schedule was paused. Null while running.</summary>
-    public DateTimeOffset? PausedAt { get; init; }
+    public DateTimeOffset? PausedAt
+    {
+        get => _pausedAt;
+        init => _pausedAt = value?.ToUniversalTime();
+    }
+
+    /// <summary>
+    /// GH-4446. When an operator asked for an out-of-band "run now" through
+    /// <c>IRecurringScheduleControl.TriggerAsync</c>; null when no trigger is outstanding. The
+    /// agent publishes one manual occurrence for it on its next tick and clears the slot.
+    /// <para>
+    /// This is ONE slot per schedule, which is deliberate: two triggers landing between two ticks
+    /// coalesce into a single run. The instant is also what the manual occurrence's deduplication
+    /// id is derived from, so an agent failover that re-publishes the same outstanding trigger
+    /// produces the same id and cannot double-handle it.
+    /// </para>
+    /// </summary>
+    public DateTimeOffset? TriggerRequestedAt
+    {
+        get => _triggerRequestedAt;
+        init => _triggerRequestedAt = value?.ToUniversalTime();
+    }
 
     /// <summary>Last time the recurring agent (or a pause/resume) touched this row.</summary>
-    public DateTimeOffset LastUpdated { get; init; }
+    public DateTimeOffset LastUpdated
+    {
+        get => _lastUpdated;
+        init => _lastUpdated = value.ToUniversalTime();
+    }
 }
 
 /// <summary>
@@ -114,6 +157,31 @@ public interface IRecurringMessageStore
     /// Idempotent — resuming a running or unknown schedule is a no-op.
     /// </summary>
     Task ResumeAsync(string name, CancellationToken token = default);
+
+    /// <summary>
+    /// GH-4446. Record an out-of-band "run now" request on the schedule's row, for the agent to act
+    /// on at its next tick. Durable rather than a local mark for the same reason pause is: the
+    /// caller is usually not on the node running the agent.
+    /// <para>
+    /// Returns <see langword="false" /> when the request was NOT recorded — either the schedule is
+    /// <b>paused</b> (pause means the schedule must not fire, and a manual trigger may not override
+    /// that) or this is the no-op store. Callers that distinguish the two check
+    /// <see cref="Enabled" /> first, as <c>IRecurringScheduleControl</c> does.
+    /// </para>
+    /// A schedule with no row yet gets one, so triggering before the first publish works.
+    /// <para>
+    /// Defaulted for the same reason the rest of this interface is: an out-of-tree store that
+    /// predates the verb keeps compiling and simply records nothing.
+    /// </para>
+    /// </summary>
+    Task<bool> RequestTriggerAsync(string name, DateTimeOffset requestedAt, CancellationToken token = default)
+        => Task.FromResult(false);
+
+    /// <summary>
+    /// GH-4446. Clear an outstanding trigger request once the agent has published its manual
+    /// occurrence. Idempotent; clearing a schedule with no outstanding trigger is a no-op.
+    /// </summary>
+    Task ClearTriggerAsync(string name, CancellationToken token = default) => Task.CompletedTask;
 }
 
 /// <summary>
@@ -146,5 +214,14 @@ public sealed class NullRecurringMessageStore : IRecurringMessageStore
         => Task.CompletedTask;
 
     public Task ResumeAsync(string name, CancellationToken token = default)
+        => Task.CompletedTask;
+
+    // Nothing was recorded, and there is nowhere to record it. Never reached through
+    // IRecurringScheduleControl, which checks Enabled and uses the agent's in-memory channel here.
+    public Task<bool> RequestTriggerAsync(string name, DateTimeOffset requestedAt,
+        CancellationToken token = default)
+        => Task.FromResult(false);
+
+    public Task ClearTriggerAsync(string name, CancellationToken token = default)
         => Task.CompletedTask;
 }

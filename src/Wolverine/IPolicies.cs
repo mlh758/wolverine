@@ -50,12 +50,16 @@ public interface IPolicies : IEnumerable<IWolverinePolicy>, IWithFailurePolicies
     ///     <c>IScheduledJobProcessor</c>, so they survive process restarts. The remaining
     ///     scheduling paths already provide durability without this policy:
     ///     <list type="bullet">
-    ///       <item>Native broker scheduling (Azure Service Bus, Pulsar, Redis, Pub/Sub):
-    ///         persisted server-side by the broker.</item>
-    ///       <item>Non-native broker senders (RabbitMQ, SQS, Kafka): the routing layer
-    ///         (<c>MessageRoute.WriteEnvelope</c>) automatically swaps scheduled envelopes
-    ///         onto the <c>local://durable</c> system queue, which writes to the message
-    ///         store inbox.</item>
+    ///       <item>Native scheduling, persisted by the broker or the queue table: Azure
+    ///         Service Bus, Pulsar and NATS JetStream (both when native scheduled send is
+    ///         enabled), Redis streams, SQS standard queues for delays up to 15 minutes,
+    ///         and the database queue transports (PostgreSQL, SQL Server, MySQL, Oracle,
+    ///         SQLite).</item>
+    ///       <item>Senders with no native scheduling for the envelope (RabbitMQ, Kafka,
+    ///         Pub/Sub, SNS, MQTT, SignalR, and SQS on a FIFO queue or past the 15 minute
+    ///         cap): the routing layer (<c>MessageRoute.WriteEnvelope</c>) automatically
+    ///         swaps scheduled envelopes onto the <c>local://durable</c> system queue,
+    ///         which writes to the message store inbox.</item>
     ///       <item>Local queues configured with <c>UseDurableInbox()</c>: already write
     ///         to the message store via <c>DurableLocalQueue</c>.</item>
     ///     </list>
@@ -161,6 +165,34 @@ public interface IPolicies : IEnumerable<IWolverinePolicy>, IWithFailurePolicies
     /// </summary>
     /// <param name="assembly"></param>
     void RegisterInteropMessageAssembly(Assembly assembly);
+
+    /// <summary>
+    ///     Route every message handler, HTTP endpoint and gRPC service in <paramref name="assembly" /> to
+    ///     the ancillary (secondary) store identified by <paramref name="storeType" />, instead of marking
+    ///     each type with <c>[Storage(typeof(IMyStore))]</c>. Intended for modular monoliths, where one
+    ///     module's assembly maps to one store.
+    /// </summary>
+    /// <remarks>
+    ///     An explicit <c>[Storage]</c>, <c>[MartenStore]</c>, <c>[PolecatStore]</c> or
+    ///     <c>[FisherStore]</c> on a type or method still wins, so a single handler can opt out of its
+    ///     module's default. Note this is also the only way to reach an ancillary store from a gRPC
+    ///     service: the gRPC chains never apply chain attributes, so <c>[Storage]</c> is silently
+    ///     ignored there.
+    /// </remarks>
+    /// <param name="storeType">The store marker type, e.g. <c>typeof(IPlayerStore)</c></param>
+    /// <param name="assembly">Every handler, endpoint and gRPC service in this assembly is routed</param>
+    void UseAncillaryStorageFromAssembly(Type storeType, Assembly assembly);
+
+    /// <summary>
+    ///     Route every message handler, HTTP endpoint and gRPC service in the assembly that contains
+    ///     <typeparamref name="T" /> to the ancillary (secondary) store identified by
+    ///     <paramref name="storeType" />. Sugar over
+    ///     <see cref="UseAncillaryStorageFromAssembly" /> for the common case of naming a module by one
+    ///     of its types.
+    /// </summary>
+    /// <param name="storeType">The store marker type, e.g. <c>typeof(IPlayerStore)</c></param>
+    /// <typeparam name="T">Any type in the module's assembly</typeparam>
+    void UseAncillaryStorageFromAssemblyContaining<T>(Type storeType);
 
     /// <summary>
     ///     Write a log message with the given log level when message execution starts.

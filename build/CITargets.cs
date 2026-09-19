@@ -1252,6 +1252,160 @@ partial class Build
             process.AssertZeroExitCode();
         });
 
+    // ─── Codegen drift gate ────────────────────────────────────────────
+    //
+    // GH-4421. Wolverine commits the output of `codegen write` for a handful of projects, and until
+    // JasperFx 2.69.2 nothing could tell a real change in that output from noise: jasperfx#832 walked
+    // an ImHashMap keyed by Frame, and Frame does not override GetHashCode, so that walk followed
+    // per-process IDENTITY hash codes and two arrangements of the same logical method emitted the same
+    // statements in a different order. A byte comparison over the committed files was therefore
+    // worthless as a gate. That order is stable now, which is the whole reason this target can exist.
+    //
+    // Two mechanics it exists to get right, both of which cost real time to find:
+    //
+    //   1. `codegen write` writes relative to the PROCESS WORKING DIRECTORY for a plain console host,
+    //      not to the project folder. Run as `dotnet run --project X` from the repo root it silently
+    //      produces an `Internal/Generated` tree at the ROOT and leaves X's committed output
+    //      untouched -- a gate written that way passes while comparing nothing. Each project is
+    //      therefore run with its own directory as the working directory. Web hosts resolve their
+    //      content root to the project directory and are unaffected, which is what makes this easy
+    //      to miss: four of the six projects here would have looked fine either way.
+    //
+    //   2. The verdict is `git status --porcelain`, which reports ADDED and DELETED as well as
+    //      modified. Both of those matter, because a generated type name carries a hash of the
+    //      message type's full name: a renamed or moved message type emits a NEW file and orphans the
+    //      old one instead of modifying anything in place. That is exactly how ConsoleApp's committed
+    //      pre-gen had gone stale by six files before this gate existed.
+    //
+    // Deliberately NOT covered, so the reach of this gate is honest:
+    //   - The six projects whose committed output has no reachable `codegen write` CLI at all
+    //     (CoreTests, Wolverine.Http.Tests, RavenDbTests, CosmosDbTests, EfCoreTests and
+    //     OptimizedArtifactWorkflowSample). They are test libraries, or hosts that never hand off to
+    //     RunJasperFxCommands, so there is no command to run and nothing to compare against.
+    //   - StartupStyleTarget. Regenerating it today DELETES both of its committed endpoint files and
+    //     emits an empty registry, because its Startup-class host hands off to RunJasperFxCommands on
+    //     the Host builder and the web pipeline that MapWolverineEndpoints runs inside is never built
+    //     during the command, so no HTTP chains are discovered. That is a bug to fix, not drift to
+    //     gate on, and gating it would only pin the broken output in place.
+    //
+    // This target REWRITES the working tree. On a red run the regenerated files are left in place on
+    // purpose so the diff can be read; `git checkout -- .` puts them back.
+    Target CICodegenDrift => _ => _
+        .Executes(() =>
+        {
+            // ConsoleApp configures RabbitMQ, and DeepMiddlewareUsage configures Marten against
+            // Postgres. `codegen write` compiles the handler graph without ever starting the host, so
+            // neither is strictly contacted -- but both containers are cheap, and their absence would
+            // make this gate flaky instead of red if that ever stops being true.
+            StartDockerServices("postgresql", "rabbitmq");
+
+            var projects = new[]
+            {
+                RootDirectory / "src" / "Testing" / "ConsoleApp",
+                RootDirectory / "src" / "Testing" / "Wolverine.AotSmoke.Static",
+                RootDirectory / "src" / "Testing" / "Wolverine.AotSmoke.Publish",
+                RootDirectory / "src" / "Http" / "CodeGenTarget",
+                RootDirectory / "src" / "Http" / "StaticCodeGenDemonstrator",
+                RootDirectory / "src" / "Http" / "DeepMiddlewareUsage"
+            };
+
+            foreach (var project in projects)
+            {
+                DotNet($"build {project} --configuration {Configuration} --framework net9.0");
+            }
+
+            foreach (var project in projects)
+            {
+                // Wipe first. `codegen write` overwrites and adds but never deletes, so an orphan left
+                // behind by a renamed message type would survive the regeneration and hide from the
+                // comparison below -- the exact failure this gate is meant to catch.
+                var generated = Path.Combine(project, "Internal", "Generated");
+                if (Directory.Exists(generated))
+                {
+                    Directory.Delete(generated, true);
+                }
+
+                ProcessTasks
+                    .StartProcess("dotnet",
+                        $"run --configuration {Configuration} --framework net9.0 --no-build -- codegen write",
+                        workingDirectory: project)
+                    .AssertZeroExitCode();
+            }
+
+            var status = ProcessTasks.StartProcess("git", "status --porcelain",
+                workingDirectory: RootDirectory, logOutput: false);
+            status.AssertZeroExitCode();
+
+            var drift = status.Output
+                .Select(x => x.Text)
+                .Where(line => !string.IsNullOrWhiteSpace(line) && line.Contains("Internal/Generated"))
+                .OrderBy(x => x)
+                .ToArray();
+
+            if (drift.Length > 0)
+            {
+                throw new Exception(
+                    $"The committed code generation output is {drift.Length} file(s) out of date with what `codegen write` emits:{Environment.NewLine}" +
+                    string.Join(Environment.NewLine, drift.Select(x => "  " + x.Trim())) +
+                    $"{Environment.NewLine}{Environment.NewLine}Regenerate by running `dotnet run -- codegen write` FROM EACH PROJECT'S OWN DIRECTORY (a plain console host writes relative to the working directory, not the project folder) and commit the result. A status letter of A or D is as real as M: a renamed message type changes the hash in the generated type name, which adds a file and orphans another.");
+            }
+
+            Log.Information("The committed code generation output for all {Count} projects matches `codegen write`",
+                projects.Length);
+        });
+
+    // GH-4486. `codegen test` (JasperFx's TryBuildAndCompileAll) is what applications use as the PR gate
+    // on their pre-generated code, and nothing in this repo ran it against a project with message
+    // handlers. The drift gate above runs `codegen write`; the AotSmoke projects run `publish`. So when
+    // GH-4426 taught HandlerRegistryCodeFile to root every generated handler by NAME through AotRoots, and
+    // jasperfx#227 had already made `codegen test` compile each file into its own assembly, the two
+    // collided into a CS0234 for every handler -- and it shipped in 6.37.0 and survived two more releases
+    // with a fully green CI.
+    //
+    // The ordering below is the whole gate, and getting it wrong makes this prove nothing:
+    //
+    //   Wipe Internal/Generated, THEN build, THEN run `codegen test`.
+    //
+    // Build before the wipe (which is what the drift gate does, deliberately, for its own purposes) and
+    // the application assembly still carries the previously generated types. The in-memory compile then
+    // resolves every AotRoots name against them and passes no matter what -- the exact reason the
+    // reporter's own `codegen test` went green whenever `codegen write` + build had run first.
+    //
+    // ConsoleApp alone, because it is the shape that broke: a plain console host with message handlers
+    // that hands off to RunJasperFxCommands. The HTTP projects were never affected -- an HTTP-only app's
+    // AotRoots root only the registry itself, which is in the same file.
+    //
+    // Like the drift gate, this REWRITES the working tree by design. CI checkouts are disposable;
+    // locally, `git checkout -- .` puts the generated tree back.
+    Target CICodegenTest => _ => _
+        .Executes(() =>
+        {
+            // ConsoleApp configures RabbitMQ. `codegen test` compiles the handler graph without starting
+            // the host, so it is not strictly contacted -- same reasoning as the drift gate.
+            StartDockerServices("rabbitmq");
+
+            var project = RootDirectory / "src" / "Testing" / "ConsoleApp";
+
+            var generated = Path.Combine(project, "Internal", "Generated");
+            if (Directory.Exists(generated))
+            {
+                Directory.Delete(generated, true);
+            }
+
+            // AFTER the wipe, so the assembly under test genuinely has no generated types in it.
+            DotNet($"build {project} --configuration {Configuration} --framework net9.0");
+
+            // From the project's own directory, for the same working-directory reason the drift gate
+            // documents above.
+            ProcessTasks
+                .StartProcess("dotnet",
+                    $"run --configuration {Configuration} --framework net9.0 --no-build -- codegen test",
+                    workingDirectory: project)
+                .AssertZeroExitCode();
+
+            Log.Information("`codegen test` compiles cleanly for a handler-bearing project with no pre-generated code");
+        });
+
     // ─── Azure Service Bus CI Targets ──────────────────────────────────
     //
     // GH-3790. Wolverine.AzureServiceBus.Tests was the tests.yml wall-clock pole and sat at 84% of the
