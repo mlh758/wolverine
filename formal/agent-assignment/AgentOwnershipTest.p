@@ -11,44 +11,44 @@ placement in flight.
 */
 
 machine SteadyDriver {
-  start state Init { entry { begin(3, 0, 0, 0, false); } }
+  start state Init { entry { begin(3, 0, 0, 0, false, false); } }
 }
 
 machine CrashDriver {
-  start state Init { entry { begin(3, 0, 1, 0, false); } }
+  start state Init { entry { begin(3, 0, 1, 0, false, false); } }
 }
 
 machine PartitionStockDriver {
-  start state Init { entry { begin(3, 1, 0, 0, false); } }
+  start state Init { entry { begin(3, 1, 0, 0, false, false); } }
 }
 
 machine PartitionSweepDriver {
-  start state Init { entry { begin(3, 1, 0, 0, true); } }
+  start state Init { entry { begin(3, 1, 0, 0, true, false); } }
 }
 
 machine HandoverStockDriver {
-  start state Init { entry { begin(3, 0, 0, 1, false); } }
+  start state Init { entry { begin(3, 0, 0, 1, false, false); } }
 }
 
 machine HandoverSweepDriver {
-  start state Init { entry { begin(3, 0, 0, 1, true); } }
+  start state Init { entry { begin(3, 0, 0, 1, true, false); } }
 }
 
 machine ChaosSweepDriver {
-  start state Init { entry { begin(3, 1, 1, 1, true); } }
+  start state Init { entry { begin(3, 1, 1, 1, true, false); } }
 }
 
-fun begin(n: int, partitions: int, crashes: int, leaderKills: int, sweep: bool) {
+fun begin(n: int, partitions: int, crashes: int, leaderKills: int, sweep: bool, epochMode: bool) {
   var store: machine;
   var nodes: seq[machine];
   var i: int;
 
   announce eMRoster, (count = n,);
 
-  store = new Store();
+  store = new Store((epochMode = epochMode,));
   i = 0;
   while (i < n) {
-    nodes += (i, new Node((store = store, id = i + 1, k = 3, sweep = sweep)));
+    nodes += (i, new Node((store = store, id = i + 1, k = 3, sweep = sweep, epochMode = epochMode)));
     i = i + 1;
   }
   i = 0;
@@ -76,33 +76,61 @@ fun begin(n: int, partitions: int, crashes: int, leaderKills: int, sweep: bool) 
 
 test tcSteadyState [main=SteadyDriver]:
   assert OwnershipConverges in
-    { SteadyDriver, Store, Node, RunCourier, HealCourier, Arsonist, StrikeCourier };
+    { SteadyDriver, Store, ConfirmCourier, Node, RunCourier, HealCourier, Arsonist, StrikeCourier };
 
 test tcCrash [main=CrashDriver]:
   assert OwnershipConverges in
-    { CrashDriver, Store, Node, RunCourier, HealCourier, Arsonist, StrikeCourier };
+    { CrashDriver, Store, ConfirmCourier, Node, RunCourier, HealCourier, Arsonist, StrikeCourier };
 
 /* EXPECTED VIOLATION — bug ledger (b): the healed owner's D2 re-register tramples the
    peer's row; both run; the one-row table names one owner and nothing ever heals it. */
 test tcPartitionHealStock [main=PartitionStockDriver]:
   assert OwnershipConverges in
-    { PartitionStockDriver, Store, Node, RunCourier, HealCourier, Arsonist, StrikeCourier };
+    { PartitionStockDriver, Store, ConfirmCourier, Node, RunCourier, HealCourier, Arsonist, StrikeCourier };
 
 test tcPartitionHealSweep [main=PartitionSweepDriver]:
   assert OwnershipConverges in
-    { PartitionSweepDriver, Store, Node, RunCourier, HealCourier, Arsonist, StrikeCourier };
+    { PartitionSweepDriver, Store, ConfirmCourier, Node, RunCourier, HealCourier, Arsonist, StrikeCourier };
 
 /* EXPECTED VIOLATION — bug ledger (a): the leader dies with a start in flight; the new
    leader's empty pending ledger re-places the agent on a different node; both copies run;
    the table reads immaculate. This is the deploy-sim duplicate-agent shape. */
 test tcLeaderHandoverStock [main=HandoverStockDriver]:
   assert OwnershipConverges in
-    { HandoverStockDriver, Store, Node, RunCourier, HealCourier, Arsonist, StrikeCourier };
+    { HandoverStockDriver, Store, ConfirmCourier, Node, RunCourier, HealCourier, Arsonist, StrikeCourier };
 
 test tcLeaderHandoverSweep [main=HandoverSweepDriver]:
   assert OwnershipConverges in
-    { HandoverSweepDriver, Store, Node, RunCourier, HealCourier, Arsonist, StrikeCourier };
+    { HandoverSweepDriver, Store, ConfirmCourier, Node, RunCourier, HealCourier, Arsonist, StrikeCourier };
 
 test tcChaosSweep [main=ChaosSweepDriver]:
   assert OwnershipConverges in
-    { ChaosSweepDriver, Store, Node, RunCourier, HealCourier, Arsonist, StrikeCourier };
+    { ChaosSweepDriver, Store, ConfirmCourier, Node, RunCourier, HealCourier, Arsonist, StrikeCourier };
+
+/* ---- the proposed design: leader-written rows stamped with a leadership epoch, and a
+   node that must win a confirmation on the row before it starts anything. Run against the
+   two schedules that are committed counterexamples on stock. ---- */
+
+machine PartitionEpochDriver {
+  start state Init { entry { begin(3, 1, 0, 0, true, true); } }
+}
+
+machine HandoverEpochDriver {
+  start state Init { entry { begin(3, 0, 0, 1, true, true); } }
+}
+
+machine ChaosEpochDriver {
+  start state Init { entry { begin(3, 1, 1, 1, true, true); } }
+}
+
+test tcPartitionHealEpoch [main=PartitionEpochDriver]:
+  assert OwnershipConverges in
+    { PartitionEpochDriver, Store, Node, RunCourier, ConfirmCourier, HealCourier, Arsonist, StrikeCourier };
+
+test tcLeaderHandoverEpoch [main=HandoverEpochDriver]:
+  assert OwnershipConverges in
+    { HandoverEpochDriver, Store, Node, RunCourier, ConfirmCourier, HealCourier, Arsonist, StrikeCourier };
+
+test tcChaosEpoch [main=ChaosEpochDriver]:
+  assert OwnershipConverges in
+    { ChaosEpochDriver, Store, Node, RunCourier, ConfirmCourier, HealCourier, Arsonist, StrikeCourier };

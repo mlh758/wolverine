@@ -19,7 +19,7 @@ event eGo;
 
 /* A health-check tick's round trip. owner = the row's node_id, 0 = no row. */
 event eSync: (node: machine, id: int);
-event eSyncReply: (owner: int, live: map[int, bool], amLeader: bool);
+event eSyncReply: (owner: int, live: map[int, bool], amLeader: bool, confirmed: bool);
 
 /* A node writes its OWN row after it starts the agent and removes it after it stops.
    eAddRow is AddAssignmentAsync: an unconditional upsert, last writer wins.
@@ -29,7 +29,15 @@ event eAddRow: (id: int);
 event eRemoveRow: (id: int);
 /* Leader -> store placement decision (AssignAgent), forwarded over a courier. */
 event eAssignReq: (id: int);
-event eRun: (run: bool);                  // store -> node, over a courier so it interleaves
+event eRun: (run: bool, epoch: int, version: int);  // store -> node, over a courier so it interleaves
+
+/* The proposed design. The leader writes the assignment row itself, stamped with the
+   leadership epoch, and the node may not start until it WINS a confirmation on that row:
+   "mark me confirmed where this agent's row still names me at the epoch I was told". A
+   command that outlived its assignment -- an unreachable node waking late, a former leader's
+   dispatch after a handover -- loses the compare and never starts. */
+event eConfirmRow: (id: int, epoch: int, version: int, node: machine);
+event eConfirmReply: (ok: bool, epoch: int, version: int);
 
 /* Faults. */
 event eCutoff;                            // partition, node side: unreachable, keeps running
@@ -54,6 +62,19 @@ event eCrashNode: (id: int);
    live[id] = store considers id reachable. */
 machine Store {
   var owner: int;
+  var epochMode: bool;
+  /* The leadership epoch: a virtual clock bumped on every handover. */
+  var epoch: int;
+  /* The epoch the current assignment row was written under, and whether its node has
+     checked in. Only meaningful when epochMode is on. */
+  var rowEpoch: int;
+  /* Bumped on every row write. The epoch identifies a leadership term and cannot separate
+     two assignments made inside one -- which is what the checker caught: a node re-asserting
+     and then being re-assigned by the same leader produced two check-ins carrying the same
+     epoch, and the loser's late answer stopped the winner's agent. Fencing the round trip
+     needs identity per assignment, not per term. */
+  var rowVersion: int;
+  var confirmed: bool;
   var live: map[int, bool];
   var members: map[int, machine];
   var leader: int;
@@ -62,6 +83,11 @@ machine Store {
   var armedLeaderKills: int;
 
   start state Serving {
+    entry (cfg: (epochMode: bool)) {
+      epochMode = cfg.epochMode;
+      epoch = 1;
+    }
+
     on eArm do (m: (kind: int)) {
       if (m.kind == 0) { armedPartitions = armedPartitions + 1; }
       else if (m.kind == 1) { armedCrashes = armedCrashes + 1; }
@@ -87,8 +113,11 @@ machine Store {
       /* Leadership handover (assumed correct): if no live leader, the syncer takes it. */
       if (leader == 0 || !(leader in live) || !live[leader]) {
         leader = m.id;
+        /* A new leader is a new epoch. Everything the old one dispatched is now stale, and
+           a former leader that rejoins writes under an epoch the row has moved past. */
+        epoch = epoch + 1;
       }
-      send m.node, eSyncReply, (owner = owner, live = live, amLeader = leader == m.id);
+      send m.node, eSyncReply, (owner = owner, live = live, amLeader = leader == m.id, confirmed = confirmed);
       announceStore(0, refills);
     }
 
@@ -98,17 +127,17 @@ machine Store {
        any sweeping node) re-evaluates. */
     on eAddRow do (m: (id: int)) {
       var refills: int;
+      /* Under epochs there is no unconditional upsert: the row belongs to the leader that
+         wrote it, and a node cannot take it by writing over the top. This is what stops a
+         healed node's re-register trampling the peer that owns the agent now. */
+      if (epochMode) {
+        announceRowDone(0);
+        return;
+      }
       if ((m.id in live) && live[m.id] && owner != m.id) {
         owner = m.id;
         refills = refillAll();
-        /* Fire one armed owner-fault on the new owner (partition before crash). */
-        if (armedPartitions > 0) {
-          armedPartitions = armedPartitions - 1;
-          new StrikeCourier((store = this, id = m.id, kind = 0));
-        } else if (armedCrashes > 0) {
-          armedCrashes = armedCrashes - 1;
-          new StrikeCourier((store = this, id = m.id, kind = 1));
-        }
+        fireOwnerFault(m.id);
       }
       announceRowDone(refills);
     }
@@ -124,7 +153,15 @@ machine Store {
     }
 
     on eAssignReq do (m: (id: int)) {
-      new RunCourier((target = members[m.id], run = true));
+      if (epochMode) {
+        /* The leader writes the assignment itself, before anything is dispatched, so the
+           durable row is the arbiter rather than a record written after the fact. */
+        owner = m.id;
+        rowEpoch = epoch;
+        rowVersion = rowVersion + 1;
+        confirmed = false;
+      }
+      new RunCourier((target = members[m.id], run = true, epoch = epoch, version = rowVersion));
       /* kind 2: the deploy terminates the leader pod with this start still in flight.
          The dead leader takes its pending ledger with it. */
       if (armedLeaderKills > 0 && leader != 0 && (leader in live) && live[leader]) {
@@ -132,6 +169,21 @@ machine Store {
         new StrikeCourier((store = this, id = leader, kind = 1));
       }
       announceStore(1, 0);
+    }
+
+    /* The node checking in against the row it was assigned under. Wins only while the row
+       still names it at that same epoch -- so a command that outlived its assignment, or one
+       from a leader the cluster has moved past, starts nothing. */
+    on eConfirmRow do (m: (id: int, epoch: int, version: int, node: machine)) {
+      var ok: bool;
+      ok = (m.id in live) && live[m.id] && owner == m.id && rowEpoch == m.epoch
+           && rowVersion == m.version;
+      if (ok) {
+        confirmed = true;
+        fireOwnerFault(m.id);
+      }
+      new ConfirmCourier((target = m.node, ok = ok, epoch = m.epoch, version = m.version));
+      announceStore(0, 0);
     }
 
     /* Partition: cut the owner off (it keeps running) and eject it store-side. Ejection
@@ -171,6 +223,18 @@ machine Store {
     }
   }
 
+  /* One armed owner-fault on the node that has just taken the agent (partition before
+     crash), fired where ownership actually becomes real in each design. */
+  fun fireOwnerFault(id: int) {
+    if (armedPartitions > 0) {
+      armedPartitions = armedPartitions - 1;
+      new StrikeCourier((store = this, id = id, kind = 0));
+    } else if (armedCrashes > 0) {
+      armedCrashes = armedCrashes - 1;
+      new StrikeCourier((store = this, id = id, kind = 1));
+    }
+  }
+
   fun refillAll(): int {
     var i: int;
     var n: int;
@@ -194,10 +258,19 @@ machine Store {
 }
 
 /* Each response/fault rides its own courier so it interleaves with the ticks. */
+machine ConfirmCourier {
+  start state Deliver {
+    entry (m: (target: machine, ok: bool, epoch: int, version: int)) {
+      send m.target, eConfirmReply, (ok = m.ok, epoch = m.epoch, version = m.version);
+      raise halt;
+    }
+  }
+}
+
 machine RunCourier {
   start state Deliver {
-    entry (m: (target: machine, run: bool)) {
-      send m.target, eRun, (run = m.run,);
+    entry (m: (target: machine, run: bool, epoch: int, version: int)) {
+      send m.target, eRun, (run = m.run, epoch = m.epoch, version = m.version);
     }
   }
 }
@@ -245,6 +318,12 @@ machine Node {
   var id: int;
   var k: int;
   var sweep: bool;
+  var epochMode: bool;
+  /* The epoch this node last won a confirmation under. */
+  var myEpoch: int;
+  /* The assignment version this node's outstanding check-in is for. A reply for anything
+     else belongs to an attempt this node has already moved past. */
+  var myVersion: int;
   var budget: int;
   var localRun: bool;
   var pendingTarget: int;
@@ -255,11 +334,12 @@ machine Node {
   var owesFaultClose: bool;
 
   start state Booting {
-    entry (cfg: (store: machine, id: int, k: int, sweep: bool)) {
+    entry (cfg: (store: machine, id: int, k: int, sweep: bool, epochMode: bool)) {
       store = cfg.store;
       id = cfg.id;
       k = cfg.k;
       sweep = cfg.sweep;
+      epochMode = cfg.epochMode;
       budget = cfg.k;
       send store, eJoin, (node = this, id = id);
     }
@@ -274,7 +354,8 @@ machine Node {
     entry { announceMe(true); }
     on eGo goto Ticking;
     on eRefill do { consumeRefill(); }
-    on eRun do (m: (run: bool)) { applyRun(m.run); }
+    on eRun do (m: (run: bool, epoch: int, version: int)) { applyRun(m.run, m.epoch, m.version); }
+    on eConfirmReply do (m: (ok: bool, epoch: int, version: int)) { applyConfirm(m.ok, m.epoch, m.version); }
     on eCutoff goto Partitioned;
     on eCrash goto Dead;
     /* A sync reply can land after a cutoff+reconnect. */
@@ -292,16 +373,18 @@ machine Node {
       announceMe(false);
     }
     on eRefill do { consumeRefill(); goto Ticking; }
-    on eRun do (m: (run: bool)) { applyRun(m.run); }
+    on eRun do (m: (run: bool, epoch: int, version: int)) { applyRun(m.run, m.epoch, m.version); }
+    on eConfirmReply do (m: (ok: bool, epoch: int, version: int)) { applyConfirm(m.ok, m.epoch, m.version); }
     on eCutoff goto Partitioned;
     on eCrash goto Dead;
     ignore eSyncReply;
   }
 
   state AwaitSync {
-    on eSyncReply do (r: (owner: int, live: map[int, bool], amLeader: bool)) {
+    on eSyncReply do (r: (owner: int, live: map[int, bool], amLeader: bool, confirmed: bool)) {
       var target: int;
       var work: bool;
+      var unplaced: bool;
 
       /* GH-3604/D2 re-register after a heal: restore my assignment row for the agent I am
          still running. Faithful detail: this is an unconditional UPSERT, so it tramples
@@ -311,7 +394,13 @@ machine Node {
         owesReassert = false;
         if (localRun) {
           announce eMRowPending;
-          send store, eAddRow, (id = id,);
+          if (epochMode) {
+            /* A healed node re-asserts by asking, not by writing. If the agent has moved on
+               it loses, and the sweep below stops the copy it is still running. */
+            send store, eConfirmRow, (id = id, epoch = myEpoch, version = myVersion, node = this);
+          } else {
+            send store, eAddRow, (id = id,);
+          }
         }
       }
 
@@ -334,7 +423,21 @@ machine Node {
       }
 
       if (r.amLeader) {
-        if (r.owner == 0) {
+        /* Stock: a row of any kind means placed, because the row is only ever written by a
+           node that has already started.
+
+           Under epochs the row is written by the LEADER, up front and optimistically, so a
+           row is a claim rather than a fact and the leader has to be able to take it back --
+           otherwise a node chosen a moment before it became unreachable holds the agent for
+           good and nothing runs it. Taking it back is safe precisely because of the stamp:
+           re-writing the row is what makes the old node's check-in lose. */
+        if (epochMode) {
+          unplaced = r.owner == 0 || !(r.owner in r.live) || !r.live[r.owner];
+        } else {
+          unplaced = r.owner == 0;
+        }
+
+        if (unplaced) {
           /* The pending ledger holds an in-flight start on its chosen node: re-drive the
              SAME node rather than spawning a rival copy (GH-3698). Without a live entry
              the distribution is free to pick anyone — modelled as a nondeterministic
@@ -367,7 +470,8 @@ machine Node {
       goto Ticking;
     }
     on eRefill do { consumeRefill(); }
-    on eRun do (m: (run: bool)) { applyRun(m.run); }
+    on eRun do (m: (run: bool, epoch: int, version: int)) { applyRun(m.run, m.epoch, m.version); }
+    on eConfirmReply do (m: (ok: bool, epoch: int, version: int)) { applyConfirm(m.ok, m.epoch, m.version); }
     on eCutoff goto Partitioned;
     on eCrash goto Dead;
   }
@@ -389,7 +493,8 @@ machine Node {
       goto Ticking;
     }
     /* A command lost to an unreachable node still retires its courier's accounting. */
-    on eRun do (m: (run: bool)) { announce eMRunDone; }
+    on eRun do (m: (run: bool, epoch: int, version: int)) { announce eMRunDone; }
+    on eConfirmReply do (m: (ok: bool, epoch: int, version: int)) { announce eMRowDone; }
     on eRefill do { announce eMRefillDone; }
     on eCrash goto Dead;
     ignore eGo;
@@ -408,7 +513,8 @@ machine Node {
       announceDead();
       send store, eEjectMember, (id = id, counted = true);
     }
-    on eRun do (m: (run: bool)) { announce eMRunDone; }
+    on eRun do (m: (run: bool, epoch: int, version: int)) { announce eMRunDone; }
+    on eConfirmReply do (m: (ok: bool, epoch: int, version: int)) { announce eMRowDone; }
     on eRefill do { announce eMRefillDone; }
     /* A cutoff can race a crash: the store fired the strike while this node's eject was
        still in flight, so its +1 was already announced. Retire it — a dead node cannot
@@ -420,7 +526,28 @@ machine Node {
     ignore eCrash;
   }
 
-  fun applyRun(run: bool) {
+  fun applyRun(run: bool, epoch: int, version: int) {
+    if (epochMode && run) {
+      /* A fence may only ever move forward. Commands ride the same asynchronous path as
+         everything else, so an older assignment can arrive after a newer one; adopting its
+         version would walk this node's notion of "the attempt I am on" backwards, and the
+         stale answer it invites then stops an agent this node legitimately holds. The
+         checker found exactly that -- a v3 win followed by a late v2 command, and the v2
+         rejection landing against a fence that had regressed to match it. */
+      if (version <= myVersion) {
+        announce eMRunDone;
+        return;
+      }
+      myVersion = version;
+      /* Nothing starts on the strength of the command alone. Check in against the row
+         first; only winning that makes this node the owner. */
+      announce eMRowPending;
+      send store, eConfirmRow, (id = id, epoch = epoch, version = version, node = this);
+      announceMe(true);
+      announce eMRunDone;
+      return;
+    }
+
     localRun = run;
     /* Write my own durable row to match: StartAgentAsync -> upsertAssignmentAsync after
        the start (a re-dispatch to an already-running node is the D4 re-upsert), and
@@ -433,6 +560,27 @@ machine Node {
     }
     announceMe(budget > 0);
     announce eMRunDone;
+  }
+
+  /* The outcome of a check-in. Winning it starts the agent; losing it means the command
+     outlived its assignment, and anything already running here is an orphan. */
+  fun applyConfirm(ok: bool, epoch: int, version: int) {
+    if (version != myVersion) {
+      /* The answer to an attempt this node has already moved past. */
+      announce eMRowDone;
+      return;
+    }
+    if (ok) {
+      localRun = true;
+      myEpoch = epoch;
+    } else {
+      /* Losing the check-in means this node is an orphan. Reached only for the attempt this
+         node is actually on -- see the version guard above, and the monotonicity guard in
+         applyRun that keeps that comparison meaningful. */
+      localRun = false;
+    }
+    announceMe(budget > 0);
+    announce eMRowDone;
   }
 
   fun closeFaultIfOwed() {

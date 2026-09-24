@@ -170,3 +170,73 @@ its fault let the monitor read a false quiescence; and two fault-accounting race
 revision (a partition strike landing on an already-dead node, whose cutoff a Dead node must
 retire like any other stray command). Same lesson every time: tell the monitor about the
 work still owed before you announce the step that looks like rest.
+
+
+## The leader-epoch proposal, as an executable variant
+
+`epochMode` models the design the duplicates keep pointing at: the **leader** writes the
+assignment row, stamped with a leadership epoch (a virtual clock bumped on every handover),
+and a node may not start anything until it **wins a confirmation on that row** — "mark me
+confirmed where this agent's row still names me, at the epoch I was told". The two writes
+that make stock lose are gone: there is no unconditional `AddAssignmentAsync` upsert, and no
+start that happens before the store has agreed to it.
+
+What that buys, mechanically:
+
+- a command that outlives its assignment loses the compare and starts nothing, so an
+  unreachable node waking up late cannot pop a stale message and run a second copy;
+- a former leader that rejoins after a partition writes under an epoch the row has moved
+  past, so its assignments are ignored rather than obeyed;
+- the leader can take a claim back from a node it believes is gone, and know that the node
+  cannot quietly resume — taking the row back *is* what makes the old node's check-in fail.
+
+### Results (30k random schedules)
+
+| Test case | Stock | Sweep | Epoch |
+| --- | --- | --- | --- |
+| `tcLeaderHandover*` | **violation** (bug ledger (a)) | 0 bugs | **0 bugs** |
+| `tcPartitionHeal*` | **violation** (bug ledger (b)) | 0 bugs | violation, rare |
+| `tcChaos*` | — | 0 bugs | violation |
+
+**The handover duplicate is gone.** That is bug ledger (a) — the deploy-sim shape, the leader
+dying with a start in flight and its pending ledger, the new leader re-placing the agent, the
+one-row table reading immaculate throughout — and it is the case the epoch is aimed at. It
+goes green.
+
+### What the model found in the proposal
+
+Writing the row up front makes it a *claim* rather than a fact, and the first cut of this
+variant deadlocked on that: the leader wrote a row for a node that became unreachable before
+the command landed, the node never checked in, and nothing ever took the row back. The
+checker reported `settled with 0 nodes running the single agent` — not a duplicate, a
+**stranded agent**. So the proposal needs a rule stock does not: *a row whose node is not
+live is not a placement*, and the leader must be free to re-stamp it. That is modelled now
+(`unplaced` under `epochMode`), and it is safe for exactly the reason the epoch exists — the
+re-write is what invalidates the old node's check-in.
+
+Anyone implementing this should treat that as part of the design, not an afterthought: an
+optimistic claim needs a reclaim rule, or the fix for duplicates buys an outage instead.
+
+### The stamp has to fence the reply, not just the write
+
+The rare partition-path violation took 300k schedules to catch (`0.00% buggy`) and is the
+second design requirement this variant surfaced:
+
+```
+ConfirmCourier(13) -> eConfirmReply (ok:True,  epoch:2)   node wins, starts the agent
+ConfirmCourier(12) -> eConfirmReply (ok:False, epoch:0)   stale answer, arrives second
+                                                          -> the node stops what it owns
+```
+
+A node that has won a check-in at epoch 2 receives the answer to an *older* attempt and
+treats it as "you are an orphan". The result is `settled with 0 nodes running the single
+agent` — the design trading a duplicate for a stopped agent.
+
+So the epoch is not only for the write path. **A check-in result older than the one a node
+has already won must be ignored**, or a late rejection stops a healthy agent. The same holds
+for anything else that can answer late — an explicit decline under capacity-based assignment
+most of all, since rejection makes the unconfirmed window a routine state rather than a rare
+one, and a decline that arrives after the leader has re-stamped the row back to that node
+would otherwise clear a live claim.
+
+Modelled as `epoch >= myEpoch` in `applyConfirm`.
