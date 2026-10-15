@@ -1,9 +1,9 @@
-using System.Diagnostics.CodeAnalysis;
 using ImTools;
 using JasperFx.Core;
 using JasperFx.Core.Reflection;
 using Wolverine.Configuration;
 using Wolverine.Configuration.Capabilities;
+using Wolverine.Persistence.Durability;
 using Wolverine.Runtime.Agents;
 using Wolverine.Runtime.RemoteInvocation;
 using Wolverine.Runtime.Routing;
@@ -45,6 +45,23 @@ public interface IMessageRouteSource
 }
 
 #endregion
+
+/// <summary>
+/// Optional interface for an <see cref="IMessageRouteSource"/> whose routes should be combined with whatever
+/// the rest of the route source chain finds, as if this source had not matched at all. Normally a terminating
+/// source (explicit publishing rules, local routing, the stub transport) ends the chain as soon as ANY routes
+/// have been found, including routes from an earlier additive source, so an additive custom source quietly
+/// switches off every terminating source after it. The routes of a pass-through source do not count toward
+/// that check: later sources still run and decide whether to route the message exactly as they would without
+/// it. See GH-4930.
+/// </summary>
+public interface IPassThroughMessageRouteSource : IMessageRouteSource
+{
+    /// <summary>
+    /// When true, the routes this source finds do not stop later route sources from routing the message
+    /// </summary>
+    bool IsPassThrough { get; }
+}
 
 /// <summary>
 /// Optional interface for IMessageRouteSource implementations to expose their
@@ -93,6 +110,16 @@ internal class ExplicitRouting : IMessageRouteSource
             yield return explicitRoute;
         }
 
+        // GH-5046. Under ServerlessWithOutbox the local queues are gone, so an explicit rule to one routes to the
+        // durability pass inbox instead
+        if (runtime is WolverineRuntime { PassInbox: { } passInbox })
+        {
+            foreach (var inboxRoute in passInbox.ExplicitRoutesFor(messageType))
+            {
+                yield return inboxRoute;
+            }
+        }
+
         foreach (var topology in runtime.Options.MessagePartitioning.ShardedMessageTopologies)
         {
             if (topology.TryMatch(messageType, runtime, out var route))
@@ -124,6 +151,13 @@ internal class LocalRouting : IMessageRouteSource
 {
     public IEnumerable<IMessageRoute> FindRoutes(Type messageType, IWolverineRuntime runtime)
     {
+        // GH-5046. Under ServerlessWithOutbox there are no local queues, and a locally handled message goes to the
+        // durability pass inbox instead
+        if (runtime is WolverineRuntime { PassInbox: { } passInbox })
+        {
+            return passInbox.ConventionalRoutesFor(messageType);
+        }
+
         var options = runtime.Options;
         if (options.LocalRoutingConventionDisabled) return Array.Empty<IMessageRoute>();
         
@@ -213,49 +247,17 @@ public partial class WolverineRuntime
 {
     private ImHashMap<Type, IMessageRouter> _messageTypeRouting = ImHashMap<Type, IMessageRouter>.Empty;
 
-    // GH-4287. Router factories for the framework's own message types, closed by DIRECT
-    // construction. Under Native AOT the reflective CloseAndBuildAs miss path below throws
-    // MissingMethodException -- the closed generic's constructor metadata is trimmed -- and
-    // PrepopulateRoutingCache walks every one of these types at startup, so an AOT publish died
-    // on EmptyMessageRouter<Acknowledgement> / MessageRouter<IAgentCommand> before it could
-    // accept a single message. Direct construction roots the instantiations for the AOT
-    // compiler; user message types remain the app's rooting / source-generation story (#2769).
-    // Only consulted on a routing-cache miss, so a plain dictionary is fine here.
-    private static readonly Dictionary<Type, Func<WolverineRuntime, List<IMessageRoute>, IMessageRouter>>
-        _frameworkRouterFactories = new()
-        {
-            [typeof(Envelope)] = routerFactory<Envelope>(),
-            [typeof(Acknowledgement)] = routerFactory<Acknowledgement>(),
-            [typeof(FailureAcknowledgement)] = routerFactory<FailureAcknowledgement>(),
-            [typeof(IAgentCommand)] = routerFactory<IAgentCommand>()
-        };
-
-    private static Func<WolverineRuntime, List<IMessageRoute>, IMessageRouter> routerFactory<T>()
-    {
-        return (runtime, routes) => routes.Count != 0
-            ? new MessageRouter<T>(runtime, routes)
-            : new EmptyMessageRouter<T>(runtime);
-    }
-
-
-    // RoutingFor is the per-message-type router-resolution entry point. The cache-
-    // miss path closes MessageRouter<T> / EmptyMessageRouter<T> over the runtime-
-    // resolved messageType — same CloseAndBuildAs reflective pattern as chunk D
-    // and chunk I. AOT-clean apps in TypeLoadMode.Static pre-populate this cache
-    // at bootstrap (envelope-mapper / message-type discovery sources, see #2715
-    // and the AOT publishing guide) so the steady-state hot path is pure lookups
-    // and the miss path's reflective close never fires. Trim-only apps without
-    // source generation need MessageRouter<>/EmptyMessageRouter<> closed types
-    // preserved via TrimmerRootDescriptor on their message types.
+    // RoutingFor is the per-message-type router-resolution entry point. Pre-populated at startup by
+    // PrepopulateRoutingCache for every discovered message type, so the steady-state hot path is a pure
+    // lookup; the miss path below is for a type nothing discovered.
     //
-    // Leaf suppression rather than [RequiresDynamicCode] on RoutingFor because
-    // RoutingFor is on the per-message dispatch hot path through MessageContext.
-    // Cascading [Requires*] up there would force every user-facing send/publish
-    // API to declare it.
-    [UnconditionalSuppressMessage("Trimming", "IL2026",
-        Justification = "Closed generic resolved from runtime messageType; AOT consumers pre-populate _messageTypeRouting via source-generated discovery. See AOT guide.")]
-    [UnconditionalSuppressMessage("AOT", "IL3050",
-        Justification = "Closed generic resolved from runtime messageType; AOT consumers pre-populate _messageTypeRouting via source-generated discovery. See AOT guide.")]
+    // GH-4848. The miss path used to close MessageRouter<T> / EmptyMessageRouter<T> over the message type
+    // reflectively. That is a generic close at runtime, and in a native image it had to be rooted per
+    // message type by `codegen write` (GH-4287), hand-constructed for the framework's own internal messages
+    // (GH-4287, GH-4825), could not be rooted at all for a VALUE TYPE -- a handler returning Guid died here
+    // at startup -- and needed a typeof token for an interface. The routers only ever used T for typeof(T),
+    // so they take the Type as an argument now and there is no close to root, no factory table to keep in
+    // step, and no suppression to justify.
     public IMessageRouter RoutingFor(Type messageType)
     {
         if (messageType == typeof(object))
@@ -271,14 +273,9 @@ public partial class WolverineRuntime
 
         var routes = findRoutes(messageType);
 
-        // See _frameworkRouterFactories above (GH-4287) -- the framework's own message types get
-        // directly-constructed routers so a Native AOT publish never pays (or crashes on) the
-        // reflective close for types the application author cannot root.
-        var router = _frameworkRouterFactories.TryGetValue(messageType, out var factory)
-            ? factory(this, routes)
-            : routes.Count != 0
-                ? typeof(MessageRouter<>).CloseAndBuildAs<IMessageRouter>(this, routes, messageType)
-                : typeof(EmptyMessageRouter<>).CloseAndBuildAs<IMessageRouter>(this, messageType);
+        IMessageRouter router = routes.Count != 0
+            ? new MessageRouter(this, messageType, routes)
+            : new EmptyMessageRouter(this, messageType);
 
         // Skip framework-internal types (IAgentCommand, INotToBeRouted, IInternalMessage,
         // and types from assemblies marked [ExcludeFromServiceCapabilities]) so they
@@ -318,11 +315,20 @@ public partial class WolverineRuntime
     private List<IMessageRoute> findRoutes(Type messageType)
     {
         var routes = new List<IMessageRoute>();
+
+        // GH-4930: routes from a pass-through source never end the chain, so only the others are counted
+        var blocking = 0;
         foreach (var source in Options.RouteSources())
         {
-            routes.AddRange(source.FindRoutes(messageType, this));
+            var found = source.FindRoutes(messageType, this).ToList();
+            routes.AddRange(found);
 
-            if (routes.Count != 0 && !source.IsAdditive) break;
+            if (!source.IsPassThrough())
+            {
+                blocking += found.Count;
+            }
+
+            if (blocking != 0 && !source.IsAdditive) break;
         }
 
         return routes;
@@ -340,13 +346,16 @@ public partial class WolverineRuntime
         // Mirror findRoutes() exactly so the explanation matches real routing behavior: routes
         // accumulate across sources, and a non-additive (terminating) source short-circuits the
         // chain once the accumulated set is non-empty — even if that source itself produced none.
+        // Routes from a pass-through source (GH-4930) are left out of that check.
         var accumulated = new List<IMessageRoute>();
+        var blocking = 0;
         var terminated = false;
         string? terminatingSourceName = null;
 
         foreach (var source in Options.RouteSources())
         {
             var step = new RouteSourceStep { Source = source.Describe(this) };
+            step.Source.IsPassThrough = source.IsPassThrough();
 
             if (terminated)
             {
@@ -362,7 +371,12 @@ public partial class WolverineRuntime
 
             accumulated.AddRange(produced);
 
-            if (accumulated.Count != 0 && !source.IsAdditive)
+            if (!source.IsPassThrough())
+            {
+                blocking += produced.Count;
+            }
+
+            if (blocking != 0 && !source.IsAdditive)
             {
                 terminated = true;
                 terminatingSourceName = step.Source.Name;
@@ -381,9 +395,12 @@ public partial class WolverineRuntime
     /// types. Called from <see cref="WolverineRuntime.HostService.StartAsync"/>
     /// after the handler graph has compiled and the route sources are wired up,
     /// so the per-message <see cref="RoutingFor"/> hot path never pays the
-    /// first-occurrence reflection cost (CloseAndBuildAs over MessageRouter&lt;T&gt;
-    /// / EmptyMessageRouter&lt;T&gt;). Closes the AOT story for the per-message
-    /// router resolution from AOT pillar issue #2769.
+    /// first-occurrence router construction. Until GH-4848 that construction was a
+    /// reflective generic close, and this warm-up was also where a native image
+    /// found out about any message type nothing had rooted; the routers take the
+    /// <see cref="Type"/> directly now, so it is a plain constructor call for
+    /// every type. Closes the AOT story for the per-message router resolution
+    /// from AOT pillar issue #2769.
     /// </summary>
     /// <remarks>
     /// Tolerates duplicates and the typeof(object) sentinel; <see cref="RoutingFor"/>
@@ -392,10 +409,6 @@ public partial class WolverineRuntime
     /// cache lookup is the same dictionary either way.
     /// </remarks>
     /// <param name="messageTypes">Message types to resolve and cache.</param>
-    [UnconditionalSuppressMessage("Trimming", "IL2026",
-        Justification = "Pre-populating the message-router cache at host startup; same suppression as RoutingFor. See AOT guide / #2769.")]
-    [UnconditionalSuppressMessage("AOT", "IL3050",
-        Justification = "Pre-populating the message-router cache at host startup; same suppression as RoutingFor. See AOT guide / #2769.")]
     internal void PrepopulateRoutingCache(IEnumerable<Type>? messageTypes)
     {
         if (messageTypes == null) return;
@@ -412,6 +425,13 @@ public partial class WolverineRuntime
         }
     }
 
+    /// <summary>
+    ///     GH-5046. Only under <see cref="DurabilityMode.ServerlessWithOutbox" />, once started: where the messages
+    ///     this application handles itself, and the scheduled sends a transport cannot schedule natively, are
+    ///     written for the durability pass. Null in every other mode
+    /// </summary>
+    internal DurabilityPassInbox? PassInbox { get; private set; }
+
     internal ISendingAgent? DetermineLocalSendingAgent(Type messageType)
     {
         if (Options.LocalRouting.Assignments.TryGetValue(messageType, out var endpoint))
@@ -422,8 +442,21 @@ public partial class WolverineRuntime
         return null;
     }
 
+    private void clearAllRouting()
+    {
+        _messageTypeRouting = ImHashMap<Type, IMessageRouter>.Empty;
+    }
+
     internal void ClearRoutingFor(Type messageType)
     {
         _messageTypeRouting = _messageTypeRouting.Remove(messageType);
+    }
+}
+
+internal static class MessageRouteSourceExtensions
+{
+    internal static bool IsPassThrough(this IMessageRouteSource source)
+    {
+        return source is IPassThroughMessageRouteSource { IsPassThrough: true };
     }
 }

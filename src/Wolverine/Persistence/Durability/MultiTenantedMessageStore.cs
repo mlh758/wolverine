@@ -3,6 +3,7 @@ using ImTools;
 using JasperFx;
 using JasperFx.Blocks;
 using JasperFx.Core;
+using JasperFx.Core.Reflection;
 using JasperFx.Descriptors;
 using JasperFx.MultiTenancy;
 using Microsoft.Extensions.Logging;
@@ -26,6 +27,9 @@ public partial class MultiTenantedMessageStore : IMessageStore, IMessageInbox, I
     private ImHashMap<string, IMessageStore> _byTenant = ImHashMap<string, IMessageStore>.Empty;
     private bool _initialized;
 
+
+    // GH-4902. Tenant databases come from the same provider as the main one
+    public EnvelopeIdGeneration? PreferredEnvelopeIdGeneration => Main.PreferredEnvelopeIdGeneration;
 
     public MultiTenantedMessageStore(IMessageStore main, IWolverineRuntime runtime,
         ITenantedMessageSource source)
@@ -130,21 +134,54 @@ public partial class MultiTenantedMessageStore : IMessageStore, IMessageInbox, I
             return;
         }
 
+        // GH-4659. A deferred envelope comes straight back from the broker, so while this tenant's
+        // database is down its stranded messages spin as fast as the database can refuse a connection.
+        // Refuse for free instead: no connection, no socket, no log line per turn.
+        var brake = brakeFor(database);
+        if (!brake.TryEnter())
+        {
+            throw new TenantedInboxWriteException([envelope], false,
+                [new TenantDatabaseBrakedException(envelope.TenantId)]);
+        }
+
         try
         {
             await database.Inbox.StoreIncomingAsync(envelope);
+            brake.Release();
         }
         catch (DuplicateIncomingEnvelopeException)
         {
             // GH-4435. Never wrap this -- DurableReceiver's deduplication path keys off the exact type.
+            // A duplicate still proves the database answered, so it releases the brake.
+            brake.Release();
             throw;
         }
         catch (Exception e)
         {
+            brake.Trip();
+
             // GH-4435. Mark the failure tenant-scoped so the receiver defers this one envelope back to
             // the broker instead of pausing a listener that serves every other tenant.
             throw new TenantedInboxWriteException([envelope], false, [e]);
         }
+    }
+
+    // GH-4659. Keyed on the store instance rather than the tenant id: many tenant ids can resolve to one
+    // database, and a brake belongs to the database that is actually down. _byTenant is AddOrUpdate-only
+    // with no eviction, so a store handle is stable for the life of the host.
+    private ImHashMap<IMessageStore, TenantWriteBrake> _brakes = ImHashMap<IMessageStore, TenantWriteBrake>.Empty;
+
+    private TenantWriteBrake brakeFor(IMessageStore store)
+    {
+        if (_brakes.TryFind(store, out var brake))
+        {
+            return brake;
+        }
+
+        brake = new TenantWriteBrake(_runtime.DurabilitySettings.TenantWriteBrakeCycle);
+        _brakes = _brakes.AddOrUpdate(store, brake);
+
+        return brake;
     }
 
     async Task IMessageInbox.StoreIncomingAsync(IReadOnlyList<Envelope> envelopes)
@@ -198,10 +235,59 @@ public partial class MultiTenantedMessageStore : IMessageStore, IMessageInbox, I
 
         if (failures.Count == 0 && groups.Count == 1)
         {
-            // One database owns the whole batch. Await it directly and let everything it throws --
-            // DuplicateIncomingEnvelopeException included -- reach the caller untouched.
-            var single = groups.First();
-            await single.Key.Inbox.StoreIncomingAsync(single.Value);
+            // One database owns the whole batch, so skip the per-group bookkeeping below and await it
+            // directly.
+            var (store, batch) = groups.First();
+
+            // The main store's failures propagate untouched: the receiver pauses for inbox recovery on
+            // those, which is the behavior this path has always had.
+            if (ReferenceEquals(store, Main))
+            {
+                await store.Inbox.StoreIncomingAsync(batch);
+                return;
+            }
+
+            // GH-4659. This path needs the brake more than any other one does. As the comment below says,
+            // a stranded tenant's message -- and every redelivery of a deferred one -- usually arrives on
+            // its own, so the whole batch resolves to that single tenant store and lands right here. A
+            // brake that covered only the per-group loop would have missed the spin it was written for.
+            var singleBrake = brakeFor(store);
+            if (!singleBrake.TryEnter())
+            {
+                throw new TenantedInboxWriteException(batch, false,
+                    [new TenantDatabaseBrakedException(batch[0].TenantId)]);
+            }
+
+            try
+            {
+                await store.Inbox.StoreIncomingAsync(batch);
+                singleBrake.Release();
+            }
+            catch (DuplicateIncomingEnvelopeException)
+            {
+                // GH-4435. Never wrap this -- DurableReceiver's deduplication path keys off the exact type.
+                // A duplicate still proves the database answered, so it releases the brake.
+                singleBrake.Release();
+                throw;
+            }
+            catch (Exception e)
+            {
+                singleBrake.Trip();
+
+                // GH-4658. This used to escape RAW, and a raw exception misses the IncludesMainStore check
+                // in DurableReceiver: one tenant's database being down paused the listener for every other
+                // tenant, which is the exact thing the rest of GH-4435 exists to prevent.
+                //
+                // With a broker in front this is the COMMON case rather than an edge. A stranded tenant's
+                // message usually arrives on its own, and so does every redelivery of a deferred one, so
+                // the whole batch resolves to that one tenant's store. Which meant whether a tenant outage
+                // paused the listener came down to nothing but batch composition.
+                //
+                // Nothing committed, so nothing is stamped WasPersistedInInbox -- the receiver's
+                // per-envelope fallback has to re-attempt every one of these.
+                throw new TenantedInboxWriteException(batch, false, [e]);
+            }
+
             return;
         }
 
@@ -210,9 +296,22 @@ public partial class MultiTenantedMessageStore : IMessageStore, IMessageInbox, I
 
         foreach (var pair in groups)
         {
+            // GH-4659. Main is never braked: a failure there pauses the listener for inbox recovery, which
+            // is its own back-off, and holding it back would delay the recovery probe itself.
+            var isMain = ReferenceEquals(pair.Key, Main);
+            var brake = isMain ? null : brakeFor(pair.Key);
+
+            if (brake is { } held && !held.TryEnter())
+            {
+                failures.Add(new TenantDatabaseBrakedException(pair.Value[0].TenantId));
+                unpersisted.AddRange(pair.Value);
+                continue;
+            }
+
             try
             {
                 await pair.Key.Inbox.StoreIncomingAsync(pair.Value);
+                brake?.Release();
 
                 // GH-4435. The caller decides what to ack from the exception below, and it re-runs the
                 // whole batch through the per-envelope path. An envelope whose group DID commit must not
@@ -223,15 +322,18 @@ public partial class MultiTenantedMessageStore : IMessageStore, IMessageInbox, I
             catch (DuplicateIncomingEnvelopeException e)
             {
                 // A store's batched insert is all-or-nothing, so nothing in this group landed.
+                // A duplicate still proves the database answered, so it releases the brake.
+                brake?.Release();
                 duplicates.AddRange(e.Duplicates);
                 unpersisted.AddRange(pair.Value);
             }
             catch (Exception e)
             {
+                brake?.Trip();
                 failures.Add(e);
                 unpersisted.AddRange(pair.Value);
 
-                if (ReferenceEquals(pair.Key, Main))
+                if (isMain)
                 {
                     includesMainStore = true;
                 }
@@ -258,6 +360,14 @@ public partial class MultiTenantedMessageStore : IMessageStore, IMessageInbox, I
         return await database.Inbox.ExistsAsync(envelope, cancellation);
     }
 
+    // GH-5049. Forwarded to the tenant's database explicitly: the default implementation would answer from
+    // ExistsAsync instead
+    public async Task<bool> IsHandledAsync(Envelope envelope, CancellationToken cancellation)
+    {
+        var database = await GetDatabaseAsync(envelope.TenantId);
+        return await database.Inbox.IsHandledAsync(envelope, cancellation);
+    }
+
     async Task IMessageInbox.RescheduleExistingEnvelopeForRetryAsync(Envelope envelope)
     {
         var database = await GetDatabaseAsync(envelope.TenantId);
@@ -268,6 +378,12 @@ public partial class MultiTenantedMessageStore : IMessageStore, IMessageInbox, I
     {
         var database = await GetDatabaseAsync(envelope.TenantId);
         await database.Inbox.MarkIncomingEnvelopeAsHandledAsync(envelope);
+    }
+
+    async Task IMessageInbox.DeleteIncomingEnvelopeAsync(Envelope envelope)
+    {
+        var database = await GetDatabaseAsync(envelope.TenantId);
+        await database.Inbox.DeleteIncomingEnvelopeAsync(envelope);
     }
 
     // GH-4435. Group by the RESOLVED store, and stop swallowing a tenant that cannot be resolved. A
@@ -618,6 +734,10 @@ public partial class MultiTenantedMessageStore : IMessageStore, IMessageInbox, I
     // above: the master is authoritative, per-tenant rows would be duplicates.
     public IRecurringMessageStore RecurringMessages => Main.RecurringMessages;
 
+    // Logical deduplication claims live in the main store, as [DeduplicatedWithResponse] claims already do.
+    // Left at the interface default, every [Deduplicated] chain threw on its first keyed message.
+    public IDeduplicationStore Deduplication => Main.Deduplication;
+
     public IMessageStoreAdmin Admin => this;
 
     [UnconditionalSuppressMessage("Trimming", "IL2026",
@@ -774,6 +894,11 @@ public partial class MultiTenantedMessageStore : IMessageStore, IMessageInbox, I
         }
     }
 
+    // GH-4593: forwarded like every other node member. Answering the interface default here instead
+    // would report a multi-tenanted PostgreSQL cluster -- where the node rows live in Main and do carry
+    // the column -- as unable to advertise load, and warn about a feature that works.
+    bool INodeAgentPersistence.AdvertisesNodeLoad => Main.Nodes.AdvertisesNodeLoad;
+
     Task INodeAgentPersistence.ClearAllAsync(CancellationToken cancellationToken)
     {
         return Main.Nodes.ClearAllAsync(cancellationToken);
@@ -898,8 +1023,13 @@ public partial class MultiTenantedMessageStore : IMessageStore, IMessageInbox, I
             return await store.EnrollAndFetchSagaStorage<TId, TSaga>(context);
         }
 
+        // GH-4531: the remedy here is different from the single-store case -- the saga either moves off
+        // the tenant store, or the tenant store has to be one that supports sagas.
         throw new InvalidOperationException(
-            "The tenant stores do not implement ISagaSupport and cannot be used for saga persistence");
+            $"The tenant store for tenant '{context.TenantId}' does not implement {typeof(ISagaSupport).FullNameInCode()} and cannot be used for saga persistence. " +
+            "Saga state is stored by the message store: PersistMessagesWithPostgresql/SqlServer/MySql/Sqlite/Oracle (lightweight saga tables), " +
+            "IntegrateWithWolverine() on a Marten/Polecat/Fisher store, an EF Core DbContext under UseEntityFrameworkCoreTransactions(), " +
+            "or RavenDb/CosmosDb/Redis persistence. Register a tenant store that supports sagas, or move this saga off the tenant store.");
     }
 
     public async Task InitializeAsync(IWolverineRuntime runtime)

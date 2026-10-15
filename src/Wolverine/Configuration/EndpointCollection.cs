@@ -18,6 +18,21 @@ public interface IEndpointCollection : IAsyncDisposable
     IEnumerable<IListeningAgent> ActiveListeners();
     ISendingAgent GetOrBuildSendingAgent(Uri address, Action<Endpoint>? configureNewEndpoint = null);
     Endpoint? EndpointFor(Uri uri);
+
+    /// <summary>
+    /// The external slot endpoint whose global-partition companion local queue is this address, or null when
+    /// the address is not a companion queue. See the implementation for why ownership cannot be asked of the
+    /// local address itself.
+    /// </summary>
+    Uri? GlobalPartitionSlotFor(Uri localQueueUri);
+
+    /// <summary>
+    /// True when this address is itself a global partition's external slot endpoint -- the address a
+    /// scheduled message to a global partition parks at (GH-4673). See the implementation for why that is
+    /// not the same question as <see cref="GlobalPartitionSlotFor"/>.
+    /// </summary>
+    bool IsGlobalPartitionSlot(Uri address);
+
     ISendingAgent AgentForLocalQueue(string queueName);
     Endpoint? EndpointByName(string endpointName);
     IListeningAgent? FindListeningAgent(Uri uri);
@@ -59,13 +74,50 @@ public interface IEndpointCollection : IAsyncDisposable
     {
         return EndpointFor(address) is { IsSingleNodeListener: true };
     }
+
+}
+
+public static class EndpointCollectionRecoveryExtensions
+{
+    /// <summary>
+    /// Does the node hosting this address's listener own its inbox recovery, rather than the per-database
+    /// durability agent? Every durability agent has to ask this before it recovers dormant inbox rows, because
+    /// the agent is assigned per *database* and routinely runs on a node that may not execute this address.
+    ///
+    /// <para>Two kinds of address answer yes. A single node listener (GH-3590) is the obvious one. The other is
+    /// a global partition's companion local queue: that address is live on every node --
+    /// <c>LocalQueue.IsSingleNodeListener</c> is deliberately false (GH-3856) -- but only the node owning the
+    /// slot may execute from it, so the agent recovering it means the message runs beside the owner under the
+    /// same group id, which is the one thing global partitioning exists to prevent. See GH-4776; the slot's own
+    /// <see cref="ListenerScope.Exclusive"/> listener drives recovery for the companion queue instead.</para>
+    /// </summary>
+    /// <remarks>
+    /// Deliberately an extension method rather than a default interface member, and that is load-bearing rather
+    /// than stylistic. A default member is intercepted by a mocking proxy like any other interface call, so a
+    /// <c>Substitute.For&lt;IEndpointCollection&gt;()</c> would answer <c>false</c> without ever running this body
+    /// -- silently un-skipping every single node listener in any test that stubs <c>IsSingleNodeListener</c>, which
+    /// is exactly how the GH-3590 suite is written. A static method cannot be intercepted, so a substitute runs
+    /// this logic for real and the stubbed members underneath it still answer.
+    /// </remarks>
+    public static bool ListenerOwnsItsInboxRecovery(this IEndpointCollection endpoints, Uri address)
+    {
+        return endpoints.IsSingleNodeListener(address) || endpoints.GlobalPartitionSlotFor(address) != null;
+    }
 }
 
 public class EndpointCollection : IEndpointCollection
 {
     private readonly object _channelLock = new();
+    private readonly object _listenerLock = new();
 
-    private readonly Dictionary<Uri, ListeningAgent> _listeners = new();
+    // GH-4646: this was a plain Dictionary. StartAgents.StartBatchAsync fans agent starts out across
+    // up to Durability.MaxAgentStartParallelism threads (10 by default), so a failover that hands this
+    // node several exclusive listener agents at once had that many threads writing the dictionary while
+    // GlobalPartitionedRoute read it on every send. A read that caught a resize corrupted the instance
+    // for good: every later lookup threw "Operations that change non-concurrent collections must have
+    // exclusive access", and the node never routed again until it was replaced. ImHashMap gives the
+    // send path a lock-free read; writers swap the map under _listenerLock so no start is lost.
+    private ImHashMap<Uri, ListeningAgent> _listeners = ImHashMap<Uri, ListeningAgent>.Empty;
     private readonly WolverineOptions _options;
     private readonly WolverineRuntime _runtime;
 
@@ -101,7 +153,7 @@ public class EndpointCollection : IEndpointCollection
             }
         }
 
-        foreach (var value in _listeners.Values) await value.DisposeAsync();
+        foreach (var kv in _listeners.Enumerate()) await kv.Value.DisposeAsync();
     }
 
     public IEnumerable<ISendingAgent> ActiveSendingAgents()
@@ -158,14 +210,14 @@ public class EndpointCollection : IEndpointCollection
 
     public IEnumerable<IListeningAgent> ActiveListeners()
     {
-        return _listeners.Values;
+        return _listeners.Enumerate().Select(x => x.Value);
     }
 
     public IReadOnlyList<EndpointHealthSnapshot> CollectEndpointHealth()
     {
         var snapshots = new List<EndpointHealthSnapshot>();
 
-        foreach (var listener in _listeners.Values)
+        foreach (var listener in ActiveListeners())
         {
             var loopHealth = receiveLoopHealthOf(listener);
             snapshots.Add(new EndpointHealthSnapshot(
@@ -370,12 +422,12 @@ public class EndpointCollection : IEndpointCollection
 
     public IListeningAgent? FindListeningAgent(Uri uri)
     {
-        return _listeners.GetValueOrDefault(uri);
+        return _listeners.TryFind(uri, out var agent) ? agent : null;
     }
 
     public IListeningAgent? FindListeningAgent(string endpointName)
     {
-        return _listeners.Values.FirstOrDefault(x => x.Endpoint.EndpointName.EqualsIgnoreCase(endpointName));
+        return ActiveListeners().FirstOrDefault(x => x.Endpoint.EndpointName.EqualsIgnoreCase(endpointName));
     }
 
     public async Task StartListenersAsync()
@@ -386,15 +438,50 @@ public class EndpointCollection : IEndpointCollection
             .Where(x => x is not LocalQueue)
             .Where(x => x.ShouldAutoStartAsListener(_options.Durability));
 
+        // GH-4569: a warm-up node listens for agent commands and their replies, and for nothing else. That is
+        // the control endpoint and the reply endpoint of the transport that owns it -- not every System-role
+        // endpoint, because a System endpoint can still carry application traffic (the Azure Service Bus
+        // retry queue redelivers application messages), and the reply endpoints of some transports are not
+        // marked System at all.
+        if (_options.Durability.NodeRole == NodeRole.Warmup)
+        {
+            var controlEndpoints = WarmupControlEndpoints(_options);
+            listeningEndpoints = listeningEndpoints.Where(controlEndpoints.Contains);
+        }
+
         foreach (var endpoint in listeningEndpoints)
         {
             await StartListenerAsync(endpoint, _runtime.Cancellation);
         }
     }
 
+    /// <summary>
+    ///     GH-4569: the only endpoints a <see cref="NodeRole.Warmup" /> node listens to -- the node's control
+    ///     endpoint, and the reply endpoint of the transport that owns it, where the answers to the agent
+    ///     commands this node sends arrive.
+    /// </summary>
+    internal static IReadOnlyList<Endpoint> WarmupControlEndpoints(WolverineOptions options)
+    {
+        var control = options.Transports.NodeControlEndpoint;
+        if (control == null) return [];
+
+        var endpoints = new List<Endpoint> { control };
+
+        var reply = options.Transports
+            .FirstOrDefault(t => t.Endpoints().Contains(control))?
+            .ReplyEndpoint();
+
+        if (reply != null && !endpoints.Contains(reply))
+        {
+            endpoints.Add(reply);
+        }
+
+        return endpoints;
+    }
+
     public async Task StopListenerAsync(Endpoint endpoint, CancellationToken cancellationToken)
     {
-        if (_listeners.TryGetValue(endpoint.Uri, out var agent))
+        if (_listeners.TryFind(endpoint.Uri, out var agent))
         {
             await agent.StopAndDrainAsync();
         }
@@ -415,6 +502,64 @@ public class EndpointCollection : IEndpointCollection
         _singleNodeListeners = _singleNodeListeners.AddOrUpdate(address, isSingleNode);
 
         return isSingleNode;
+    }
+
+    private ImHashMap<Uri, Uri?> _globalPartitionSlots = ImHashMap<Uri, Uri?>.Empty;
+
+    /// <summary>
+    /// GH-4700. The external slot endpoint whose companion local queue is <paramref name="localQueueUri"/>,
+    /// or null when that address is not a global partition's companion queue. The forward map is stamped on
+    /// the external slot (<see cref="Endpoint.GlobalPartitionLocalQueueUri"/>, set in
+    /// GlobalPartitionedMessageTopology), so the reverse lookup is a scan -- cached the way
+    /// <see cref="IsSingleNodeListener"/> is, because the scheduled poller asks it once per distinct
+    /// destination on every pass.
+    ///
+    /// Needed because a companion queue address answers "do I have a listener here?" with yes on EVERY node
+    /// -- LocalQueue.IsSingleNodeListener is deliberately false (GH-3856) and FindListenerCircuit below
+    /// builds a circuit for any local:// scheme. Slot ownership is the only thing that distinguishes the
+    /// nodes, and it is a question about the EXTERNAL endpoint.
+    /// </summary>
+    public Uri? GlobalPartitionSlotFor(Uri localQueueUri)
+    {
+        if (_globalPartitionSlots.TryFind(localQueueUri, out var slotUri))
+        {
+            return slotUri;
+        }
+
+        slotUri = localQueueUri.Scheme == TransportConstants.Local
+            ? _options.Transports.AllEndpoints()
+                .FirstOrDefault(x => x.GlobalPartitionLocalQueueUri == localQueueUri)?.Uri
+            : null;
+
+        _globalPartitionSlots = _globalPartitionSlots.AddOrUpdate(localQueueUri, slotUri);
+
+        return slotUri;
+    }
+
+    private ImHashMap<Uri, bool> _isGlobalPartitionSlot = ImHashMap<Uri, bool>.Empty;
+
+    /// <summary>
+    /// GH-4822. A scheduled message to a global partition parks in the inbox at the external slot's own
+    /// address (GH-4673), and <see cref="GlobalPartitionSlotFor"/> deliberately answers null for that address
+    /// -- it is not a companion queue. Ownership still has to be settled for it at promotion time, though: a
+    /// node that once owned the slot keeps its stopped listening agent registered, so
+    /// <see cref="FindListenerCircuit"/> hands the envelopes to a listener with no receiver. Cached the same way
+    /// as the other lookups here, because the scheduled poller asks once per distinct destination per pass.
+    /// </summary>
+    public bool IsGlobalPartitionSlot(Uri address)
+    {
+        if (_isGlobalPartitionSlot.TryFind(address, out var isSlot))
+        {
+            return isSlot;
+        }
+
+        isSlot = address.Scheme != TransportConstants.Local
+                 && _options.Transports.AllEndpoints()
+                     .Any(x => x.Uri == address && x.GlobalPartitionLocalQueueUri != null);
+
+        _isGlobalPartitionSlot = _isGlobalPartitionSlot.AddOrUpdate(address, isSlot);
+
+        return isSlot;
     }
 
     public IListenerCircuit? FindListenerCircuit(Uri address)
@@ -478,7 +623,7 @@ public class EndpointCollection : IEndpointCollection
 
     public async Task StartListenerAsync(Endpoint endpoint, CancellationToken cancellationToken)
     {
-        if (_listeners.TryGetValue(endpoint.Uri, out var agent))
+        if (_listeners.TryFind(endpoint.Uri, out var agent))
         {
             if (agent.Status == ListeningStatus.Accepting) return;
             await agent.StartAsync();
@@ -488,12 +633,12 @@ public class EndpointCollection : IEndpointCollection
         endpoint.Compile(_runtime);
         agent = new ListeningAgent(endpoint, _runtime);
         await agent.StartAsync().ConfigureAwait(false);
-        _listeners[agent.Uri] = agent;
+        await registerListenerAsync(agent);
     }
 
     public async Task StartListenerAsync(Endpoint endpoint, IListener listener, CancellationToken cancellationToken)
     {
-        if (_listeners.TryGetValue(endpoint.Uri, out var agent))
+        if (_listeners.TryFind(endpoint.Uri, out var agent))
         {
             if (agent.Status == ListeningStatus.Accepting) return;
             await agent.StartAsync();
@@ -503,7 +648,25 @@ public class EndpointCollection : IEndpointCollection
         endpoint.Compile(_runtime);
         agent = new ListeningAgent(endpoint, _runtime);
         await agent.StartAsync().ConfigureAwait(false);
-        _listeners[agent.Uri] = agent;
+        await registerListenerAsync(agent);
+    }
+
+    // The check-then-start above cannot be held under _listenerLock without serializing every agent
+    // start, which is exactly the parallelism GH-3604 added. So the swap happens here instead, and a
+    // second start of the SAME endpoint that slipped past the check loses: the registered agent stands
+    // and the duplicate is disposed rather than left polling an exclusive queue unreachably.
+    private async Task registerListenerAsync(ListeningAgent agent)
+    {
+        lock (_listenerLock)
+        {
+            if (!_listeners.TryFind(agent.Uri, out _))
+            {
+                _listeners = _listeners.AddOrUpdate(agent.Uri, agent);
+                return;
+            }
+        }
+
+        await agent.DisposeAsync();
     }
 
     public LocalQueue? LocalQueueForMessageType(Type messageType)
@@ -621,9 +784,9 @@ public class EndpointCollection : IEndpointCollection
     /// </summary>
     public void LatchAllReceivers()
     {
-        foreach (var listener in _listeners.Values)
+        foreach (var kv in _listeners.Enumerate())
         {
-            listener.LatchReceiver();
+            kv.Value.LatchReceiver();
         }
 
         foreach (var queue in _localSenders.Enumerate().Select(x => x.Value).OfType<DurableLocalQueue>())

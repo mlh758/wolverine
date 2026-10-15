@@ -95,6 +95,11 @@ public sealed partial class HandlerDiscovery
         HandlerQuery.Excludes.WithAttribute<WolverineIgnoreAttribute>();
     }
 
+    private bool matchesHandlerQuery(Type type)
+    {
+        return HandlerQuery.Includes.Matches(type) && !HandlerQuery.Excludes.Matches(type);
+    }
+
     private static bool isNotPublicType(Type type)
     {
         if (type.IsPublic)
@@ -117,8 +122,8 @@ public sealed partial class HandlerDiscovery
     
     /// <summary>
     ///  Customize the conventional filtering on the handler type discovery. This is *additive* to the
-    /// built in conventional handler discovery. Disabling conventional discovery will negate anything
-    /// done with this method
+    /// built in conventional handler discovery. If you also call <see cref="DisableConventionalDiscovery"/>,
+    /// the rules added here replace the built in conventions instead of adding to them
     /// </summary>
     /// <param name="configure"></param>
     /// <returns></returns>
@@ -221,11 +226,92 @@ public sealed partial class HandlerDiscovery
             Assemblies.Fill(options.ApplicationAssembly);
         }
 
+        // GH-4699. The registry stands in for the assembly scan, so it has to be subject to the same
+        // switch the scan is: handlerTypes is *conventionally discovered* output, captured by an earlier
+        // `codegen write`, and DisableConventionalDiscovery() says not to use any of it. Without this the
+        // flag was silently inert in TypeLoadMode.Static (and under UseStaticRegistries()) and the
+        // excluded handlers were registered and dispatched anyway -- the stale generated body still
+        // attaches, because a chain keeps its message-type-derived TypeName. The loud version, a
+        // MissingPreBuiltTypesException naming chains the application had excluded, was only the visible
+        // half. Mirrors the _conventionalDiscoveryDisabled branch in FindCalls above.
+        //
+        // GH-4984: "mirrors" has to include the application's OWN CustomizeHandlerDiscovery() rules, which that
+        // branch still runs (HandlerQuery.Find) -- disabling the conventions only drops the built-in includes.
+        // Discarding the whole registry lost those handlers in Static mode while Dynamic mode found them. So keep
+        // the registry types the current HandlerQuery still selects, with the same include/exclude test
+        // TypeQuery.Find applies. With no custom includes nothing matches, which is exactly GH-4699's behavior,
+        // and a stale registry still cannot bring back a type the current rules exclude.
+        if (_conventionalDiscoveryDisabled)
+        {
+            return handlerTypes
+                .Where(matchesHandlerQuery)
+                .Concat(_explicitTypes)
+                .Distinct()
+                .SelectMany(actionsFromType)
+                .ToArray();
+        }
+
         return handlerTypes
             .Concat(_explicitTypes)
             .Distinct()
             .SelectMany(actionsFromType)
             .ToArray();
+    }
+
+    /// <summary>
+    /// GH-4702. The types that look like they were meant to be handlers but were never discovered, because
+    /// conventional discovery matches the "Handler"/"Consumer" suffix EXACTLY and a plural name --
+    /// OrderHandlers, BillingConsumers -- does not end with either. Plural reads naturally for a class holding
+    /// several Handle methods, so it is easy to hit, and the only downstream trace is a much later
+    /// Information-level "No routes can be determined for Envelope".
+    ///
+    /// Note the asymmetry that makes this a real trap rather than a typo: plural IS accepted at the METHOD
+    /// level -- Handles and Consumes are both in <see cref="_validMethods"/> -- just not at the type level.
+    ///
+    /// Call only AFTER <see cref="FindCalls"/>, which is what runs specifyConventionalHandlerDiscovery() to
+    /// populate <see cref="HandlerQuery"/>'s includes. Asking before that would report every candidate as a
+    /// miss. There is deliberately no equivalent on the static-registry path: it does not scan at all, so it
+    /// has no rejected-candidate set to report.
+    /// </summary>
+    [UnconditionalSuppressMessage("Trimming", "IL2026",
+        Justification =
+            "Startup diagnostic over the same assemblies conventional discovery already scanned, and only reachable from the scanning branch of HandlerGraph.compileWithRuntimeScanning -- a trimmed or AOT app runs the static-registry branch, which never calls this. See AOT guide.")]
+    internal IReadOnlyList<Type> FindNearMissHandlerTypes()
+    {
+        if (_conventionalDiscoveryDisabled)
+        {
+            // No conventional include was ever added, so EVERY concrete type in the assembly is technically
+            // unmatched. Nothing here is a "near miss" -- the user asked for explicit control.
+            return [];
+        }
+
+        string[] pluralSuffixes = [HandlerChain.HandlerSuffix + "s", HandlerChain.ConsumerSuffix + "s"];
+
+        // The name test is the gate, so GetMethods() only ever runs on the handful of plural-named types
+        // rather than on every type in the application. TypeRepository memoizes its per-assembly type list
+        // (the same one HandlerQuery.Find just walked), so re-reading it costs no further reflection.
+        return TypeRepository
+            .FindTypes(Assemblies, TypeClassification.Concretes | TypeClassification.Closed,
+                type => pluralSuffixes.Any(suffix => type.Name.EndsWith(suffix, StringComparison.Ordinal)))
+            .Distinct()
+
+            // Already discovered by some other convention -- [WolverineHandler], IWolverineHandler, Saga, or
+            // a user's own CustomizeHandlerDiscovery suffix. Wolverine's own ValidMessageHandlers sample is
+            // this case.
+            .Where(type => !HandlerQuery.Includes.Matches(type))
+
+            // Deliberately opted out ([WolverineIgnore]) or ineligible whatever it is named (not public).
+            // Renaming would not help, so the suggestion below would be wrong.
+            .Where(type => !HandlerQuery.Excludes.Matches(type))
+
+            // IncludeType() registers a type without going through HandlerQuery at all
+            .Where(type => !_explicitTypes.Contains(type))
+
+            // Finally, the expensive part: does it actually declare something discovery would have taken?
+            // Reuses the very method rules FindCalls uses, so this cannot drift from what "handler-shaped"
+            // means.
+            .Where(type => actionsFromType(type).Any())
+            .ToList();
     }
 
     // Locates the pre-generated HandlerRegistry subclass in the application assembly and

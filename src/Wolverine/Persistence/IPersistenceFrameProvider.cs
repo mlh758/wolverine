@@ -44,6 +44,21 @@ public interface IPersistenceFrameProvider
     Type? TryDetermineTransactionOwnerType(IChain chain, IServiceContainer container) => null;
 
     /// <summary>
+    ///     Does this provider own <paramref name="storageType" />, the type a developer named in a
+    ///     <c>[Transactional(typeof(X))]</c> or <c>[Storage(typeof(X))]</c> designation? GH-4631.
+    /// </summary>
+    /// <remarks>
+    ///     Only consulted when a chain has more than one provider that <see cref="CanApply" /> — a handler
+    ///     taking both an EF Core <c>DbContext</c> and a Marten <c>IDocumentSession</c>, say — where the
+    ///     designation is the only thing that says which store commits. Answer for the shape of type this
+    ///     integration is designated by (EF Core: anything castable to <c>DbContext</c> or a registered
+    ///     DbContext abstraction; the document stores: their own <c>IDocumentStore</c> / session
+    ///     interfaces, which covers an ancillary store marker), not for whether that particular store is
+    ///     registered. Returning false — the default — simply removes this provider from the running.
+    /// </remarks>
+    bool OwnsStorageType(Type storageType, IServiceContainer container) => false;
+
+    /// <summary>
     ///     Use for Saga creation support as returned value
     /// </summary>
     /// <param name="entityType"></param>
@@ -85,7 +100,48 @@ public interface IPersistenceFrameProvider
     Frame CommitUnitOfWorkFrame(Variable saga, IServiceContainer container);
     Frame DetermineUpdateFrame(Variable saga, IServiceContainer container);
     Frame DetermineDeleteFrame(Variable sagaId, Variable saga, IServiceContainer container);
-    
+
+    /// <summary>
+    ///     The update frame for an entity that arrived as a <see cref="Update{T}" /> return value, rather
+    ///     than as a saga Wolverine itself read into a local of its own. GH-4613.
+    /// </summary>
+    /// <remarks>
+    ///     <para>
+    ///     <see cref="DetermineUpdateFrame" /> serves two callers that need different code, and the
+    ///     difference is not visible in its arguments. <see cref="Sagas.SagaChain" /> calls it for a saga
+    ///     Wolverine loaded a moment earlier, so the session or context is already tracking that instance
+    ///     and a version, revision or ETag from the read is in scope. <c>Update&lt;T&gt;.BuildFrame</c>
+    ///     calls it for whatever the handler returned, which may be an entity built from the message, taken
+    ///     from a request body, or loaded with <c>AsNoTracking()</c> — nothing tracks it, and there was no
+    ///     read to declare a version against.
+    ///     </para>
+    ///     <para>
+    ///     A provider whose write is unconditional — every document store that spells this
+    ///     <c>session.Store(entity)</c> — needs no override; the default delegates and the two paths stay
+    ///     identical. Override it when the saga path does something the storage-action path must not,
+    ///     which in practice means either optimistic concurrency (Redis compare-and-swap, Marten's
+    ///     <c>UpdateRevision</c>, Cosmos' <c>IfMatchEtag</c>) or, for EF Core, relying on change tracking
+    ///     that a returned entity was never enrolled in.
+    ///     </para>
+    /// </remarks>
+    Frame DetermineStorageUpdateFrame(Variable entity, IServiceContainer container)
+        => DetermineUpdateFrame(entity, container);
+
+    /// <summary>
+    ///     The insert frame for an entity that arrived as an <see cref="Insert{T}" /> return value rather
+    ///     than as a saga Wolverine is starting. GH-4613, and the same reasoning as
+    ///     <see cref="DetermineStorageUpdateFrame" />.
+    /// </summary>
+    /// <remarks>
+    ///     There is deliberately no <c>DetermineStorageStoreFrame</c> or storage-action delete: nothing but
+    ///     <c>Store&lt;T&gt;.BuildFrame</c> calls <see cref="DetermineStoreFrame" />, and nothing but
+    ///     <c>Delete&lt;T&gt;.BuildFrame</c> calls the single-argument
+    ///     <see cref="DetermineDeleteFrame(Variable,IServiceContainer)" />, so both of those are already
+    ///     the storage-action entry point and an alias would carry no information.
+    /// </remarks>
+    Frame DetermineStorageInsertFrame(Variable entity, IServiceContainer container)
+        => DetermineInsertFrame(entity, container);
+
     /// <summary>
     /// Create an "upsert" Frame for the variable. Not every persistence provider will be able to support this
     /// and should throw NotSupportedException if it does not
@@ -106,7 +162,65 @@ public interface IPersistenceFrameProvider
 
     Frame DetermineStorageActionFrame(Type entityType, Variable action, IServiceContainer container);
 
+    /// <summary>
+    ///     GH-4629. Apply an entire <see cref="UnitOfWork{T}" /> in one frame, for a provider that can
+    ///     do better in bulk than the default "loop and apply one action at a time".
+    /// </summary>
+    /// <remarks>
+    ///     Returning <see langword="false" /> -- the default -- keeps the shipped behaviour, which is
+    ///     the right answer for every provider whose per-action work is already a purely in-memory
+    ///     session call. EF Core overrides it because <c>Store</c> has no upsert statement to lean on
+    ///     and has to ask the database whether each row exists: one <c>WHERE key IN (...)</c> for the
+    ///     whole unit of work instead of a <c>FindAsync</c> round trip apiece.
+    /// </remarks>
+    /// <param name="entityType">The unit of work's entity type.</param>
+    /// <param name="unitOfWork">The variable holding the <see cref="UnitOfWork{T}" />.</param>
+    /// <param name="container">Active codegen service container.</param>
+    /// <param name="frame">The bulk frame, when the provider has one.</param>
+    bool TryBuildUnitOfWorkFrame(Type entityType, Variable unitOfWork, IServiceContainer container,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out Frame? frame)
+    {
+        frame = null;
+        return false;
+    }
+
     Frame[] DetermineFrameToNullOutMaybeSoftDeleted(Variable entity);
+
+    /// <summary>
+    ///     GH-4505. Attempt to supply frames that make a logical deduplication claim ride this provider's
+    ///     own transaction, replacing the claim-and-release pair that
+    ///     <see cref="Codegen.ChainDeduplicationExtensions" /> otherwise weaves in.
+    /// </summary>
+    /// <remarks>
+    ///     <para>
+    ///     Returning <see langword="false" /> — the default — keeps the shipped behaviour: the claim is
+    ///     written up front on a connection of its own and given back in a <c>finally</c> when the chain
+    ///     fails. That is correct, and it is what a non-transactional chain must keep, because there is no
+    ///     transaction for the claim to ride.
+    ///     </para>
+    ///     <para>
+    ///     A provider should return <see langword="true" /> only when it can prove the deduplication table
+    ///     is reachable from the same transaction the handler commits through. For Marten that means a
+    ///     single-database store, where Wolverine's message store is built from Marten's own
+    ///     <c>NpgsqlDataSource</c>; database-per-tenant builds the message store somewhere else entirely
+    ///     and must fall through.
+    ///     </para>
+    /// </remarks>
+    /// <param name="chain">The chain being woven. Consult it for the ancillary store and the refusal shape.</param>
+    /// <param name="deduplicationId">The resolved logical id, which may be null or empty at runtime.</param>
+    /// <param name="requirement">What the chain asked for, including whether the id is required.</param>
+    /// <param name="container">Active codegen service container.</param>
+    /// <param name="deduplication">The frames, when this provider owns the claim.</param>
+    bool TryBuildTransactionalDeduplication(
+        IChain chain,
+        Variable deduplicationId,
+        DeduplicationRequirement requirement,
+        IServiceContainer container,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TransactionalDeduplication? deduplication)
+    {
+        deduplication = null;
+        return false;
+    }
 
     /// <summary>
     /// Attempt to build a codegen <see cref="Frame"/> that executes a query specification

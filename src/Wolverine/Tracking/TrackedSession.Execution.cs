@@ -14,12 +14,16 @@ internal partial class TrackedSession
         _otherHosts.AddRange(parent._otherHosts);
         _primaryLogger = parent._primaryLogger;
         _ignoreMessageRules.AddRange(parent._ignoreMessageRules);
+        _ignoreEnvelopeRules.AddRange(parent._ignoreEnvelopeRules);
         _ignoreSystemCommands = parent._ignoreSystemCommands;
+        _hostRules.AddRange(parent._hostRules);
+        _applyHostRules = parent._applyHostRules;
         _source = new();
 
         AssertAnyFailureAcknowledgements = parent.AssertAnyFailureAcknowledgements;
         AssertNoExceptions = false;
         AlwaysTrackExternalTransports = parent.AlwaysTrackExternalTransports;
+        CorrelationId = parent.CorrelationId;
 
         Execution = c => func(_primaryLogger, c, _cancellation.Token);
     }
@@ -28,6 +32,7 @@ internal partial class TrackedSession
     {
         await using var scope = _primaryHost.Services.CreateAsyncScope();
         var context = scope.ServiceProvider.GetRequiredService<IMessageContext>();
+        if (CorrelationId is not null) context.CorrelationId = CorrelationId;
         await execution(context).WaitAsync(Timeout).ConfigureAwait(false);
     }
     

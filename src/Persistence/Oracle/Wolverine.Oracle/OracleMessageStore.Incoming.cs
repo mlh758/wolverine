@@ -140,7 +140,7 @@ internal partial class OracleMessageStore
                 $"UPDATE {SchemaName}.{DatabaseConstants.IncomingTable} SET " +
                 $"{DatabaseConstants.ExecutionTime} = :time, {DatabaseConstants.Status} = '{EnvelopeStatus.Scheduled}', " +
                 $"{DatabaseConstants.Attempts} = :attempts, {DatabaseConstants.OwnerId} = {TransportConstants.AnyNode} " +
-                $"WHERE id = :id AND {DatabaseConstants.ReceivedAt} = :uri");
+                $"WHERE id = :id AND {DatabaseConstants.ReceivedAt} = :uri AND {DatabaseConstants.Status} <> '{EnvelopeStatus.Handled}'");
             cmd.With("id", envelope.Id);
             cmd.Parameters.Add(new OracleParameter("time", OracleDbType.TimeStampTZ) { Value = envelope.ScheduledTime!.Value });
             cmd.With("attempts", envelope.Attempts);
@@ -151,21 +151,42 @@ internal partial class OracleMessageStore
 
         if (rowsAffected == 0)
         {
-            await StoreIncomingAsync(envelope);
+            try
+            {
+                await StoreIncomingAsync(envelope);
+            }
+            catch (DuplicateIncomingEnvelopeException)
+            {
+                // GH-4216: the only row for this identity is a retained Handled one. The message already
+                // completed, so a retry booked after the fact is discarded rather than executed again
+            }
         }
     }
 
     public async Task ScheduleExecutionAsync(Envelope envelope)
     {
+        // GH-4216: a Handled row is never resurrected by a late retry booking; see MessageDatabase<T>.ScheduleExecutionSql
         await using var conn = await _dataSource.OpenConnectionAsync(_cancellation);
         await using var cmd = conn.CreateCommand(
             $"UPDATE {SchemaName}.{DatabaseConstants.IncomingTable} SET " +
             $"{DatabaseConstants.ExecutionTime} = :time, {DatabaseConstants.Status} = '{EnvelopeStatus.Scheduled}', " +
             $"{DatabaseConstants.Attempts} = :attempts, {DatabaseConstants.OwnerId} = {TransportConstants.AnyNode} " +
-            $"WHERE id = :id AND {DatabaseConstants.ReceivedAt} = :uri");
+            $"WHERE id = :id AND {DatabaseConstants.ReceivedAt} = :uri AND {DatabaseConstants.Status} <> '{EnvelopeStatus.Handled}'");
         cmd.With("id", envelope.Id);
         cmd.Parameters.Add(new OracleParameter("time", OracleDbType.TimeStampTZ) { Value = envelope.ScheduledTime!.Value });
         cmd.With("attempts", envelope.Attempts);
+        cmd.With("uri", envelope.Destination?.ToString() ?? string.Empty);
+        await cmd.ExecuteNonQueryAsync(_cancellation);
+        await conn.CloseAsync();
+    }
+
+    public async Task DeleteIncomingEnvelopeAsync(Envelope envelope)
+    {
+        await using var conn = await _dataSource.OpenConnectionAsync(_cancellation);
+        await using var cmd = conn.CreateCommand(
+            $"DELETE FROM {SchemaName}.{DatabaseConstants.IncomingTable} " +
+            $"WHERE id = :id AND {DatabaseConstants.ReceivedAt} = :uri");
+        cmd.With("id", envelope.Id);
         cmd.With("uri", envelope.Destination?.ToString() ?? string.Empty);
         await cmd.ExecuteNonQueryAsync(_cancellation);
         await conn.CloseAsync();
@@ -250,7 +271,7 @@ internal partial class OracleMessageStore
         await using var conn = await _dataSource.OpenConnectionAsync(_cancellation);
         await using var cmd = conn.CreateCommand(
             $"UPDATE {SchemaName}.{DatabaseConstants.IncomingTable} SET " +
-            $"{DatabaseConstants.Status} = '{EnvelopeStatus.Handled}', {DatabaseConstants.KeepUntil} = :keepUntil " +
+            $"{DatabaseConstants.Status} = '{EnvelopeStatus.Handled}', {DatabaseConstants.KeepUntil} = :keepUntil, {DatabaseConstants.OwnerId} = {TransportConstants.AnyNode} " +
             $"WHERE id = :id AND {DatabaseConstants.ReceivedAt} = :uri");
         cmd.Parameters.Add(new OracleParameter("keepUntil", OracleDbType.TimeStampTZ) { Value = (object?)envelope.KeepUntil ?? DBNull.Value });
         cmd.With("id", envelope.Id);
@@ -267,14 +288,16 @@ internal partial class OracleMessageStore
     /// Guid as <c>byte[]</c> — exactly what <see cref="StoreIncomingAsync(DbTransaction, Envelope[])"/> and
     /// <see cref="MarkIncomingEnvelopeAsHandledAsync(Envelope)"/> already do. Runs inside the caller's EF
     /// Core transaction, so the durable-inbox mark-as-handled stays part of the application's commit.
+    /// Matches the whole inbox identity (id and received_at), like the other mark-as-handled statements in
+    /// this store.
     /// </summary>
     public async Task MarkIncomingEnvelopeAsHandledInTransactionAsync(DbConnection conn, DbTransaction? tx,
         Envelope envelope, DateTimeOffset keepUntil, CancellationToken cancellation)
     {
         await using var cmd = ((OracleConnection)conn).CreateCommand(
             $"UPDATE {SchemaName}.{DatabaseConstants.IncomingTable} SET " +
-            $"{DatabaseConstants.Status} = '{EnvelopeStatus.Handled}', {DatabaseConstants.KeepUntil} = :keepUntil " +
-            $"WHERE id = :id");
+            $"{DatabaseConstants.Status} = '{EnvelopeStatus.Handled}', {DatabaseConstants.KeepUntil} = :keepUntil, {DatabaseConstants.OwnerId} = {TransportConstants.AnyNode} " +
+            $"WHERE id = :id AND {DatabaseConstants.ReceivedAt} = :uri");
         if (tx != null)
         {
             cmd.Transaction = (OracleTransaction)tx;
@@ -282,6 +305,7 @@ internal partial class OracleMessageStore
 
         cmd.Parameters.Add(new OracleParameter("keepUntil", OracleDbType.TimeStampTZ) { Value = keepUntil });
         cmd.With("id", envelope.Id);
+        cmd.With("uri", envelope.Destination?.ToString() ?? string.Empty);
         await cmd.ExecuteNonQueryAsync(cancellation);
     }
 
@@ -296,7 +320,7 @@ internal partial class OracleMessageStore
         {
             await using var cmd = conn.CreateCommand(
                 $"UPDATE {SchemaName}.{DatabaseConstants.IncomingTable} SET " +
-                $"{DatabaseConstants.Status} = '{EnvelopeStatus.Handled}', {DatabaseConstants.KeepUntil} = :keepUntil " +
+                $"{DatabaseConstants.Status} = '{EnvelopeStatus.Handled}', {DatabaseConstants.KeepUntil} = :keepUntil, {DatabaseConstants.OwnerId} = {TransportConstants.AnyNode} " +
                 $"WHERE id = :id AND {DatabaseConstants.ReceivedAt} = :uri");
             cmd.Transaction = tx;
             cmd.Parameters.Add(new OracleParameter("keepUntil", OracleDbType.TimeStampTZ) { Value = (object?)envelope.KeepUntil ?? DBNull.Value });
@@ -315,7 +339,10 @@ internal partial class OracleMessageStore
         await using var cmd = conn.CreateCommand(
             $"UPDATE {SchemaName}.{DatabaseConstants.IncomingTable} SET " +
             $"{DatabaseConstants.OwnerId} = 0 " +
-            $"WHERE {DatabaseConstants.OwnerId} = :ownerId AND {DatabaseConstants.ReceivedAt} = :uri");
+            // GH-4739: see MessageDatabase.ReleaseIncomingAsync. Oracle's owner index is unfiltered, so the
+            // extra clause buys nothing here, but keeping the statement identical to the portable one means
+            // the next person does not have to wonder which of the two is right.
+            $"WHERE {DatabaseConstants.OwnerId} = :ownerId AND {DatabaseConstants.OwnerId} <> 0 AND {DatabaseConstants.ReceivedAt} = :uri");
         cmd.With("ownerId", ownerId);
         cmd.With("uri", receivedAt.ToString());
         await cmd.ExecuteNonQueryAsync(_cancellation);
@@ -341,13 +368,16 @@ internal partial class OracleMessageStore
     {
         if (incoming.Count == 0) return;
 
+        // GH-5022: a node claiming rows restarts their stale clock; releasing them to any node does not need to
+        var restartClock = ownerId == TransportConstants.AnyNode ? string.Empty : restartIncomingStaleClock;
+
         await using var conn = await _dataSource.OpenConnectionAsync(_cancellation);
         var tx = (OracleTransaction)await conn.BeginTransactionAsync(_cancellation);
 
         foreach (var envelope in incoming)
         {
             await using var cmd = conn.CreateCommand(
-                $"UPDATE {SchemaName}.{DatabaseConstants.IncomingTable} SET {DatabaseConstants.OwnerId} = :owner " +
+                $"UPDATE {SchemaName}.{DatabaseConstants.IncomingTable} SET {DatabaseConstants.OwnerId} = :owner{restartClock} " +
                 "WHERE id = :id");
             cmd.Transaction = tx;
             cmd.With("owner", ownerId);

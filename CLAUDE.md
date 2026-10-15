@@ -53,13 +53,38 @@ build.ps1               # Windows
 # Start test infrastructure
 docker compose up -d    # PostgreSQL, SQL Server, RabbitMQ, Kafka, etc.
 
-# Run tests
-dotnet test             # All tests
-dotnet test src/Testing/CoreTests/
+# Run tests: dotnet test names the project or solution with an option, never positionally
+dotnet test --solution wolverine.slnx
+dotnet test --project src/Testing/CoreTests -f net9.0
+dotnet test --project src/Testing/CoreTests -f net9.0 --filter-class "*Acceptance.wolverine_as_command_bus*"
+dotnet test --project src/Testing/CoreTests -f net9.0 --filter "FullyQualifiedName~batching"
 
 # Documentation
 npm install && npm run docs
 ```
+
+**Test stack:** every test project is xUnit v3 **4.x** on **Microsoft.Testing.Platform 2.x** (GH-4979).
+The root `global.json` sets `"test": {"runner": "Microsoft.Testing.Platform"}`, which platform 2.x needs on
+the .NET 10 SDK, so `dotnet test` runs in the platform's own mode:
+
+- Name the target with `--project` or `--solution`. The positional form (`dotnet test src/Testing/CoreTests`)
+  is refused.
+- Test-host options go straight on the command line, with no `--` separator. An option the host does not
+  know exits 5 ("Zero tests ran") before anything runs; `--nologo` is one such option.
+- Filters: xUnit's `--filter-class`, `--filter-method`, `--filter-namespace`, `--filter-trait`,
+  `--filter-not-*` and `--filter-query`. xUnit 4 also takes the old VSTest grammar via `--filter`
+  (`"FullyQualifiedName~X"`, `"Category!=Flaky"`).
+- Running the built executable directly works too, with the same options:
+  `src/Testing/CoreTests/bin/Release/net9.0/CoreTests --filter-class "*Acceptance*"`.
+- CI does not use `dotnet test` except in `fsharp.yml`. The Nuke targets run each test host through
+  Bobcat's supervisor (`build/SupervisedTests.cs`) with C# filter predicates, so a CI target is
+  `./build.sh CoreTests --framework net9.0` locally.
+- **Gating a Stoat plan on a suite:** run its target with `BOBCAT_RUN_TAG={plan}/{node}` set exactly as the
+  plan gave it. Every supervised run publishes to the Bobcat monitor when one answers. The command per
+  suite, the Docker services each needs and what can run side by side are in `.claude/docs/test_gates.md`.
+- `[assembly: CollectionBehavior(DisableTestParallelization = true)]` no longer compiles; use
+  `[assembly: Xunit.v3.Parallelization(Mode = Xunit.Sdk.ParallelMode.None)]`. A helper library that
+  references the platform but is not a test host needs `IsTestingPlatformApplication=false`; none does today.
 
 **Solutions** (new `.slnx` XML format):
 - `wolverine.slnx` - Full solution
@@ -222,6 +247,9 @@ When working on specific areas, consult these files:
 | Topic | File |
 |-------|------|
 | Architectural patterns & conventions | `.claude/docs/architectural_patterns.md` |
+| AOT suppression audit (GH-4810) | `.claude/docs/aot_suppression_audit.md` |
+| Test suites as Stoat gates: commands, Docker services, parallelism (GH-5019) | `.claude/docs/test_gates.md` |
+| `ServerlessWithOutbox` settled design decisions (GH-5016 / GH-5017) | `.claude/docs/serverless_with_outbox_decisions.md` |
 
 ## Version
 

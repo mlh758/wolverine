@@ -12,20 +12,21 @@ using Weasel.Core.Migrations;
 using Weasel.Sqlite;
 using Wolverine.Logging;
 using Wolverine.Persistence.Durability;
+using Wolverine.Persistence.Sagas;
 using Wolverine.RDBMS;
 using Wolverine.RDBMS.Sagas;
 using Wolverine.RDBMS.Transport;
 using Wolverine.Runtime;
 using Wolverine.Runtime.Agents;
 using Wolverine.Sqlite.Schema;
-using Wolverine.Sqlite.Sagas;
+using Wolverine.Sqlite.Internals;
 using Wolverine.Sqlite.Util;
 using Wolverine.Transports;
 using DbCommandBuilder = Weasel.Core.DbCommandBuilder;
 
 namespace Wolverine.Sqlite;
 
-internal class SqliteMessageStore : MessageDatabase<SqliteConnection>
+internal partial class SqliteMessageStore : MessageDatabase<SqliteConnection>, ISagaStorageCodeSource
 {
     /// <summary>
     /// GH-4375. SQLITE_MAX_VARIABLE_NUMBER, measured at 32,766 against the bundled SQLite 3.50.4 by
@@ -135,6 +136,158 @@ internal class SqliteMessageStore : MessageDatabase<SqliteConnection>
         return false;
     }
 
+    /// <summary>
+    /// GH-4567. Bound the handled-envelope reap, as PostgreSQL and SQL Server already do. Without an
+    /// override the base returns null and <c>DeleteExpiredHandledEnvelopesCommand</c> falls back to one
+    /// unbounded statement.
+    /// </summary>
+    /// <remarks>
+    /// SQLite has no <c>DELETE ... LIMIT</c> in its default build, but every ordinary table has a
+    /// <c>rowid</c>, so the bound goes through a subquery — the same shape as PostgreSQL's <c>ctid</c> one.
+    /// It matters more here than anywhere else: a SQLite write takes a lock over the whole database file
+    /// and there is only one writer, so a long reap stalls every other write in the application, not just
+    /// contending inbox traffic.
+    /// </remarks>
+    public override string? BatchedDeleteExpiredHandledEnvelopesSql(int batchSize)
+    {
+        var table = this.TableNameFor(DatabaseConstants.IncomingTable);
+
+        return
+            $"delete from {table} where rowid in (select rowid from {table} " +
+            $"where {DatabaseConstants.Status} = '{EnvelopeStatus.Handled}' and {DatabaseConstants.KeepUntil} <= @now limit {batchSize});";
+    }
+
+    /// <summary>
+    /// GH-4567. Bound the deduplication-claim reap. Fisher-backed applications took the unbounded path,
+    /// and a busy chain under the default 24-hour window accumulates a day of claims before the reaper
+    /// runs. Same rowid bound as <see cref="BatchedDeleteExpiredHandledEnvelopesSql"/>.
+    /// </summary>
+    public override string? BatchedDeleteExpiredDeduplicationClaimsSql(int batchSize)
+    {
+        // GH-4757: whichever table the configured mode provisioned.
+        var table = this.TableNameFor(DeduplicationTableNameFor(Durability));
+
+        return
+            $"delete from {table} where rowid in (select rowid from {table} " +
+            $"where {DatabaseConstants.Expires} <= @now limit {batchSize});";
+    }
+
+    /// <summary>GH-4742. As <see cref="BatchedDeleteExpiredDeduplicationClaimsSql" />.</summary>
+    public override string? BatchedDeleteExpiredDeduplicatedResponsesSql(int batchSize)
+    {
+        var table = this.TableNameFor(DatabaseConstants.DeduplicatedResponsesTableName);
+
+        return
+            $"delete from {table} where rowid in (select rowid from {table} " +
+            $"where {DatabaseConstants.Expires} <= @now limit {batchSize});";
+    }
+
+    /// <summary>
+    /// GH-4565. Whether <paramref name="ex"/> is a unique-constraint violation raised by the INBOX table
+    /// specifically, as opposed to anywhere else in the transaction.
+    /// </summary>
+    /// <remarks>
+    /// <para>Distinct from <see cref="isExceptionFromDuplicateEnvelope"/>, which is deliberately
+    /// table-agnostic: its caller has already established that the failing insert was the inbox one, and it
+    /// is reused for the deduplication table and the dynamic listener registry. This predicate is for
+    /// callers with no such context — the <c>Discard()</c> rule in <c>FisherIntegration</c>, which sees
+    /// every exception a handler's transaction can raise.</para>
+    ///
+    /// <para>SQLite names the columns, and therefore the tables, in the message:
+    /// <c>UNIQUE constraint failed: wolverine_incoming_envelopes.id</c>, comma-separated for a composite
+    /// key. <c>SqliteException</c> exposes nothing structured, so the message is what is read.</para>
+    /// </remarks>
+    public static bool IsDuplicateIncomingEnvelope(Exception ex)
+    {
+        for (var current = ex; current != null; current = current.InnerException)
+        {
+            if (current is SqliteException sqliteException
+                && isUniqueViolation(sqliteException)
+                && tablesFrom(sqliteException.Message).Any(IncomingTableNaming.IsIncomingTable))
+            {
+                return true;
+            }
+
+            if (current is AggregateException aggregate
+                && aggregate.InnerExceptions.Any(IsDuplicateIncomingEnvelope))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// GH-4571. Whether <paramref name="ex"/> is the one failure a transactional deduplication claim's
+    /// optimistic check cannot prevent: two genuinely concurrent callers both read "not claimed", both
+    /// enlist the INSERT, and the second to commit trips the deduplication table's primary key.
+    /// </summary>
+    /// <remarks>
+    /// Scoped to the deduplication table for the same reason <see cref="IsDuplicateIncomingEnvelope"/> is
+    /// scoped to the inbox: a bare constraint-code test would also match a duplicate key raised by the
+    /// application's own documents in the same transaction, and report that to the caller as "already
+    /// handled". SQLite puts the table name in the message and nowhere else.
+    /// </remarks>
+    public static bool IsDuplicateDeduplicationClaim(Exception ex)
+    {
+        for (var current = ex; current != null; current = current.InnerException)
+        {
+            if (current is SqliteException sqliteException
+                && isUniqueViolation(sqliteException)
+                && tablesFrom(sqliteException.Message).Any(IncomingTableNaming.IsDeduplicationTable))
+            {
+                return true;
+            }
+
+            if (current is AggregateException aggregate
+                && aggregate.InnerExceptions.Any(IsDuplicateDeduplicationClaim))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool isUniqueViolation(SqliteException ex)
+        // SQLITE_CONSTRAINT_PRIMARYKEY (1555), SQLITE_CONSTRAINT_UNIQUE (2067), or the bare
+        // SQLITE_CONSTRAINT (19) older builds report
+        => ex.SqliteExtendedErrorCode is 1555 or 2067 || ex.SqliteErrorCode == 19;
+
+    /// <summary>
+    /// The table names out of <c>UNIQUE constraint failed: t.a, t.b</c>. Empty when the message is not
+    /// that shape — a composite key lists one <c>table.column</c> pair per constraint column.
+    /// </summary>
+    /// <remarks>
+    /// The driver wraps SQLite's own text, so the whole message reads
+    /// <c>SQLite Error 19: 'UNIQUE constraint failed: wolverine_incoming_envelopes.id'.</c> — note the
+    /// closing quote and period AFTER the column name. Trimming them is not cosmetic: leave them on and
+    /// the last '.' in the pair is that trailing one rather than the table/column separator, so every
+    /// table name comes out wrong and the predicate answers false for the inbox itself.
+    /// </remarks>
+    private static IEnumerable<string> tablesFrom(string message)
+    {
+        const string marker = "constraint failed:";
+
+        var start = message.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (start < 0) yield break;
+
+        foreach (var pair in message.Substring(start + marker.Length).Split(','))
+        {
+            // Strip a trailing "(19)" the raw sqlite text can carry...
+            var trimmed = pair.Trim();
+            var parenthesis = trimmed.IndexOf('(');
+            if (parenthesis >= 0) trimmed = trimmed.Substring(0, parenthesis);
+
+            // ...then the driver's own quoting and sentence punctuation
+            trimmed = trimmed.Trim().TrimEnd('.', '\'', '"', ' ');
+
+            var lastDot = trimmed.LastIndexOf('.');
+            if (lastDot > 0) yield return trimmed.Substring(0, lastDot);
+        }
+    }
+
     protected override void writePagingAfter(DbCommandBuilder builder, int offset, int limit)
     {
         if (limit > 0)
@@ -150,9 +303,9 @@ internal class SqliteMessageStore : MessageDatabase<SqliteConnection>
         }
     }
 
-    public override ISchemaObject AddExternalMessageTable(ExternalMessageTable definition)
+    public override ITable AddExternalMessageTable(ExternalMessageTable definition)
     {
-        var table = new Weasel.Sqlite.Tables.Table(definition.TableName);
+        var table = new Weasel.Sqlite.Tables.Table(prefixedTableName(definition.TableName));
         table.AddColumn(definition.IdColumnName, "TEXT").AsPrimaryKey();
         table.AddColumn(definition.JsonBodyColumnName, "TEXT").NotNull();
         if (definition.TimestampColumnName.IsNotEmpty())
@@ -182,13 +335,15 @@ internal class SqliteMessageStore : MessageDatabase<SqliteConnection>
         await conn.CloseAsync();
     }
 
-    protected override Task deleteMany(DbTransaction tx, Guid[] ids, DbObjectName tableName,
-        string idColumnName)
+    protected override Task deleteManyAsync(DbTransaction tx, Guid[] ids, DbObjectName tableName,
+        string idColumnName, CancellationToken token)
     {
         var idList = string.Join(",", ids.Select(id => $"'{id:D}'"));
-        return tx.CreateCommand($"delete from {tableName.QualifiedName} where lower({idColumnName}) IN ({idList})")
-            .ExecuteNonQueryAsync();
+        return tx.CreateCommand($"delete from {prefixedTableName(tableName)} where lower({idColumnName}) IN ({idList})")
+            .ExecuteNonQueryAsync(token);
     }
+
+    private string prefixedTableName(DbObjectName tableName) => TablePrefixing.Apply(tableName.Schema, tableName.Name);
 
     // Polling lock: delegate to the AdvisoryLock instance. The previous override here
     // ran INSERT OR IGNORE and returned true unconditionally, which falsely reported
@@ -248,7 +403,7 @@ internal class SqliteMessageStore : MessageDatabase<SqliteConnection>
 
     protected override DbCommand buildFetchSql(SqliteConnection conn, DbObjectName tableName, string[] columnNames, int maxRecords)
     {
-        return conn.CreateCommand($"select {columnNames.Join(", ")} from {tableName.QualifiedName} LIMIT {maxRecords}");
+        return conn.CreateCommand($"select {columnNames.Join(", ")} from {prefixedTableName(tableName)} LIMIT {maxRecords}");
     }
 
     public override async Task<PersistedCounts> FetchCountsAsync()
@@ -289,6 +444,9 @@ internal class SqliteMessageStore : MessageDatabase<SqliteConnection>
             .ExecuteScalarAsync();
 
         counts.DeadLetter = Convert.ToInt32(deadLetterCount);
+
+        // GH-4499 follow-up: the head of the outbox, so a stuck outbox can be told from a busy one
+        await fetchOldestOutgoingAsync(counts);
 
         return counts;
     }
@@ -362,6 +520,9 @@ internal class SqliteMessageStore : MessageDatabase<SqliteConnection>
     /// Mirrors <c>PostgresqlMessageStore._reassignIncomingSql</c>, which does the same job through
     /// <c>unnest(@ids, @uris)</c>. See GH-4209 for the incident that first exposed the shape.
     /// </summary>
+    // GH-5022: the same clock as the inbox timestamp column default
+    protected override string currentTimestampSql => "datetime('now')";
+
     private string writePromotionSql(DbCommand command, string tableName, IReadOnlyList<Envelope> envelopes)
     {
         var matchesById = Durability.MessageIdentity == MessageIdentity.IdOnly;
@@ -383,7 +544,7 @@ internal class SqliteMessageStore : MessageDatabase<SqliteConnection>
             clauses.Add($"({idMatch} and {DatabaseConstants.ReceivedAt} = @uri{i})");
         }
 
-        return $"update {tableName} set owner_id = @owner, status = '{EnvelopeStatus.Incoming}' " +
+        return $"update {tableName} set owner_id = @owner, status = '{EnvelopeStatus.Incoming}'{restartIncomingStaleClock} " +
                $"where status = '{EnvelopeStatus.Scheduled}' and ({string.Join(" or ", clauses)})";
     }
 
@@ -424,12 +585,10 @@ internal class SqliteMessageStore : MessageDatabase<SqliteConnection>
 
             await tx.CommitAsync(cancellationToken);
 
-            // Stamp owning store on each row so downstream pipeline routes its
-            // writes back here. See GH-2576.
-            foreach (var envelope in envelopes)
-            {
-                envelope.Store = this;
-            }
+            // Mirror onto the in-memory envelopes what the UPDATE above just did to their rows:
+            // owning store (GH-2576) and promoted status (GH-4673).
+            DatabasePersistence.MarkPromotedFromScheduled(envelopes, this,
+                durabilitySettings.AssignedNodeNumber);
 
             await runtime.EnqueueDirectlyAsync(envelopes);
         }
@@ -466,15 +625,16 @@ internal class SqliteMessageStore : MessageDatabase<SqliteConnection>
         }
     }
 
-    public override async Task PublishMessageToExternalTableAsync(ExternalMessageTable table, string messageTypeName, byte[] json,
+    public override async Task PublishMessageToExternalTableAsync(ExternalMessageTable table, string? messageTypeName, byte[] json,
         CancellationToken token)
     {
         await using var conn = await DataSource.OpenConnectionAsync(token).ConfigureAwait(false);
+        var tableName = prefixedTableName(table.TableName);
 
         if (table.MessageTypeColumnName.IsEmpty())
         {
             await conn.CreateCommand(
-                    $"insert into {table.TableName.QualifiedName} ({table.IdColumnName}, {table.JsonBodyColumnName}) values (@id, @json)")
+                    $"insert into {tableName} ({table.IdColumnName}, {table.JsonBodyColumnName}) values (@id, @json)")
                 .With("id", Guid.NewGuid().ToString())
                 .With("json", System.Text.Encoding.UTF8.GetString(json))
                 .ExecuteNonQueryAsync(token);
@@ -482,10 +642,10 @@ internal class SqliteMessageStore : MessageDatabase<SqliteConnection>
         else
         {
             await conn.CreateCommand(
-                    $"insert into {table.TableName.QualifiedName} ({table.IdColumnName}, {table.JsonBodyColumnName}, {table.MessageTypeColumnName}) values (@id, @json, @message)")
+                    $"insert into {tableName} ({table.IdColumnName}, {table.JsonBodyColumnName}, {table.MessageTypeColumnName}) values (@id, @json, @message)")
                 .With("id", Guid.NewGuid().ToString())
                 .With("json", System.Text.Encoding.UTF8.GetString(json))
-                .With("message", messageTypeName)
+                .With("message", messageTypeName!)
                 .ExecuteNonQueryAsync(token);
         }
 
@@ -521,9 +681,21 @@ internal class SqliteMessageStore : MessageDatabase<SqliteConnection>
         yield return new DeadLettersTable(Durability, SchemaName);
 
         // GH-4180. Every store role, not just Main -- see the PostgreSQL twin.
-        if (Durability.EnableMessageDeduplication)
+        // GH-4757: exactly one of the two, never both. The hash mode's key is a binary column, which
+        // cannot be reached from the original table by any migration Weasel can express.
+        if (Durability.MessageDeduplicationMode == MessageDeduplicationMode.CompareByString)
         {
             yield return new DeduplicationTable(SchemaName);
+        }
+        else if (Durability.MessageDeduplicationMode == MessageDeduplicationMode.CompareByHash)
+        {
+            yield return new HashedDeduplicationTable(SchemaName);
+        }
+
+        // GH-4742. Every store role, behind its own opt-in.
+        if (Durability.EnableDeduplicatedResponses)
+        {
+            yield return new DeduplicatedResponsesTable(SchemaName);
         }
 
         // Recurring-message tracking — Main store only, behind the opt-in. See the PostgreSQL twin.
@@ -548,6 +720,15 @@ internal class SqliteMessageStore : MessageDatabase<SqliteConnection>
             nodeTable.AddColumn("health_check", "TEXT").NotNull().DefaultValueByExpression("(datetime('now'))");
             nodeTable.AddColumn("version", "TEXT");
             nodeTable.AddColumn("capabilities", "TEXT");
+
+            // GH-4593, mirroring the PostgreSQL gate from GH-3959: provisioned only behind the opt-in so
+            // an upgrade migrates nothing, and SqliteNodePersistence gates every statement naming it on
+            // the same flag. REAL rather than TEXT -- unlike the timestamps around it, this value is only
+            // ever compared numerically and never round-tripped through a format.
+            if (Durability.CapacityAwareAssignment)
+            {
+                nodeTable.AddColumn(DatabaseConstants.LoadFactor, "REAL");
+            }
 
             yield return nodeTable;
 
@@ -632,6 +813,26 @@ internal class SqliteMessageStore : MessageDatabase<SqliteConnection>
     public void AddTable(Weasel.Sqlite.Tables.Table table)
     {
         _otherTables.Add(table);
+    }
+
+    /// <summary>
+    ///     GH-4805. Lets generated saga code construct <see cref="DatabaseSagaSchema{T,TId}" /> itself,
+    ///     which is the only way the saga path runs in a native image — <see cref="SagaSchemaFor{T,TId}" />
+    ///     below is an abstract generic method, and ILC cannot dispatch one.
+    /// </summary>
+    /// <remarks>
+    ///     <c>MakeGenericType</c> is safe here and nowhere near the runtime path: this is called once per
+    ///     saga chain while the chain model is built, under the JIT, and the <see cref="Type" /> it returns
+    ///     is only rendered as source text. Note the argument order — this store's schema is
+    ///     <c>DatabaseSagaSchema&lt;TSaga, TId&gt;</c>, whereas the SQL Server one declares its parameters
+    ///     the other way round, which is exactly why each store answers this for itself.
+    /// </remarks>
+    [UnconditionalSuppressMessage("AOT", "IL3050",
+        Justification = "GH-4805. The closed type is RENDERED AS SOURCE TEXT by EnrollAndFetchSagaStorageFrame and never instantiated from this Type. Called once per saga chain while the chain model is built -- codegen time, under the JIT -- so this line does not execute in a native image at all; the generated code that replaces it is what runs there. Removing this call is the entire point of the change: it is what lets the native image construct the schema without MakeGenericType.")]
+    public SagaSchemaCodegen? SagaSchemaCodegenFor(Type sagaType, Type idType)
+    {
+        return new SagaSchemaCodegen(typeof(DatabaseSagaSchema<,>).MakeGenericType(sagaType, idType),
+            typeof(RelationalSagaStorage));
     }
 
     public override DatabaseSagaSchema<T, TId> SagaSchemaFor<T, TId>()

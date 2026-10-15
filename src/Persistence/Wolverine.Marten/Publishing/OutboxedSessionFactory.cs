@@ -200,9 +200,16 @@ public class OutboxedSessionFactory
             session.Listeners.Add(new PublishIncomingEventsBeforeCommit(context));
         }
 
-        if (_shouldTrackAppends)
+        // GH-4931: a tracked session hears what this session appends, whether or not the observer does
+        if (_shouldTrackAppends || _runtime is WolverineRuntime { ActiveSession: not null })
         {
             session.Listeners.Add(new NotifyObserverOfAppendedEvents(context));
+        }
+
+        // GH-4940: the concurrent-append test hook, only while a tracked session is running
+        if (_runtime is WolverineRuntime { ActiveSession: not null })
+        {
+            session.Listeners.Add(new FireConcurrentAppendBeforeSave(context));
         }
 
         session.Listeners.Add(new FlushOutgoingMessagesOnCommit(context, transaction.Store));

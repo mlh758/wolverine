@@ -11,6 +11,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Routing;
 using Wolverine.Http.CodeGen;
+using Wolverine.Http.Policies;
 using Wolverine.Http.Resources;
 using Wolverine.Persistence.Codegen;
 using Wolverine.Logging;
@@ -53,7 +54,8 @@ public partial class HttpChain
             // have run, and the compensating-release frame depends on it. AssembleTypes is the first
             // point after both. Idempotent, so a chain assembled into two GeneratedAssemblies (which
             // happens under `codegen write` -- see GH-3692) is woven once.
-            this.ApplyDeduplication();
+            this.ApplyDeduplication(assembly.Rules, _parent.Container);
+            applyDeduplicatedWithResponse();
 
             _generatedType = assembly.AddType(_fileName!, typeof(HttpHandler));
 
@@ -68,7 +70,8 @@ public partial class HttpChain
             var loggedType = determineLogMarkerType();
 
             handleMethod.Sources.Add(new LoggerVariableSource(loggedType));
-            handleMethod.Sources.Add(new MessageBusSource());
+            handleMethod.Sources.Add(new MessageBusSource(_parent.Options.EnableRelayOfUserName,
+                _parent.ApplyCorrelationIdHeaderToAllEndpoints));
 
             // Per-method scoping for SourceServiceFromHttpContext<T>(). Registering on the
             // method (rather than WolverineOptions.CodeGeneration.Sources) keeps the
@@ -107,9 +110,21 @@ public partial class HttpChain
 
         // GH-2908: resolve the generated handler by its full name (a targeted lookup, no GetTypes()
         // enumeration in the pre-generated/Static case); fall back to the reflective scan only if it misses.
-        _handlerType = assembly.GetType($"{containingNamespace}.{_fileName}")
+        var found = assembly.GetType($"{containingNamespace}.{_fileName}")
             ?? assembly.ExportedTypes.FirstOrDefault(x => x.Name == _fileName)
             ?? assembly.GetTypes().FirstOrDefault(x => x.Name == _fileName);
+
+        // GH-4749: a miss must never discard a type that was already attached. Every call to
+        // InitializeSynchronously hands this chain a BRAND NEW GeneratedAssembly, and AssembleTypes
+        // above no-ops once _generatedType exists -- so a second initialization probes an assembly
+        // that cannot possibly contain this handler. Assigning unconditionally there would null out
+        // a perfectly good _handlerType and leave buildHandler() throwing for the life of the host.
+        // The return still keys off _handlerType so that a chain which has never attached anything
+        // reports false -- HttpGraph.AssertPreBuiltTypesExist relies on that for TypeLoadMode.Static.
+        if (found != null)
+        {
+            _handlerType = found;
+        }
 
         return _handlerType != null;
     }
@@ -134,6 +149,8 @@ public partial class HttpChain
             Postprocessors.Add(new WriteEmptyBodyStatusCode());
         }
 
+        assertDeduplicatedWithResponseIsJson();
+
         if (TryInferMessageIdentity(out var identity))
         {
             if (AuditedMembers.All(x => x.Member != identity))
@@ -157,6 +174,8 @@ public partial class HttpChain
 
             Middleware.Insert(0, new AuditToActivityFrame(this, auditInputType));
         }
+
+        bufferRequestForDeduplicatedWithResponse();
 
         // Allow for immutable request types that get overwritten by middleware
         if (RequestBodyVariable != null)
@@ -212,6 +231,12 @@ public partial class HttpChain
         }
 
         yield return Method;
+
+        // The endpoint ran, so a [Deduplicated] claim is now released only on a throw or a failure status.
+        if (Middleware.OfType<ReleaseDeduplicationIdOnHttpFailureFrame>().Any())
+        {
+            yield return new MethodCall(typeof(HttpHandler), nameof(HttpHandler.MarkDeduplicatedEndpointRan));
+        }
 
         var actionsOnOtherReturnValues = (NoContent ? Method.Creates : Method.Creates.Skip(1))
             .Select(x => x.ReturnAction(this)).SelectMany(x => x.Frames()).ToArray();

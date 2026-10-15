@@ -19,6 +19,7 @@ using Wolverine.Configuration.Capabilities;
 using Wolverine.Http.ApiVersioning;
 using Wolverine.Http.CodeGen;
 using Wolverine.Http.Diagnostics;
+using Wolverine.Http.Runtime;
 using Wolverine.Http.Transport;
 using Wolverine.Http.Validation;
 using Wolverine.Http.Validation.Internals;
@@ -172,6 +173,9 @@ public static class WolverineHttpEndpointRouteBuilderExtensions
         // apps that call UseNewtonsoftJsonForSerialization() pay for it now.
         services.AddSingleton<HttpTransportExecutor>();
 
+        // GH-4742. What [DeduplicatedWithResponse] endpoints claim and record through.
+        services.AddSingleton<DeduplicatedResponses>();
+
         // GH-3690 — the HTTP transport's send side needs an IWolverineHttpTransportClient and an
         // IHttpClientFactory. Every application had to register both by hand, and the samples that got it
         // wrong failed at runtime rather than at startup. Register them here: TryAdd so an application
@@ -276,12 +280,20 @@ public static class WolverineHttpEndpointRouteBuilderExtensions
 
         options.Endpoints.AutoAntiforgeryOnFormEndpoints = options._autoAntiforgeryOnFormEndpoints;
         options.Endpoints.RejectUnparseableQueryValues = options.RejectUnparseableQueryValues;
+        options.Endpoints.ApplyCorrelationIdHeaderToAllEndpoints = options.ApplyCorrelationIdHeaderToAllEndpoints;
         options.Endpoints.DiscoverEndpoints(options);
         runtime.Options.Parts.Add(options.Endpoints);
 
         serviceProvider.GetRequiredService<WolverineSupplementalCodeFiles>().Collections.Add(options.Endpoints);
 
         endpoints.DataSources.Add(options.Endpoints);
+
+        // Make the whole route table — Wolverine's endpoints and everybody else's — visible to an
+        // ApiExplorer read taken before the host starts. Done here, on the thread composing the
+        // application, because ASP.NET Core enumerates the collection this writes without
+        // synchronization while the host is starting. See HostEndpointDataSources, GH-3421 and GH-4500.
+        options.HostEndpointsPublished =
+            HostEndpointDataSources.IsRoot(endpoints) && HostEndpointDataSources.TryPublish(endpoints);
     }
 
     internal static WolverineRuntime GetWolverineRuntime(IEndpointRouteBuilder endpoints)

@@ -84,8 +84,10 @@ using var host = await Host.CreateDefaultBuilder()
 
         // Opt in to logical message deduplication. This provisions a new
         // "wolverine_deduplication" table -- nothing else about your message
-        // storage changes, and leaving this off means no schema migration at all
-        opts.Durability.EnableMessageDeduplication = true;
+        // storage changes, and leaving this at None means no schema migration at all.
+        // CompareByHash compares ids by a binary SHA-256, so they mean the same thing
+        // on every database engine
+        opts.Durability.MessageDeduplicationMode = MessageDeduplicationMode.CompareByHash;
 
         // How long a logical id is honoured before the reaper removes it.
         // The default is 24 hours. This IS the guarantee, so size it against
@@ -97,7 +99,7 @@ using var host = await Host.CreateDefaultBuilder()
 <!-- endSnippet -->
 
 ::: warning
-If a handler asks for deduplication and `EnableMessageDeduplication` is left off, Wolverine logs a
+If a handler asks for deduplication and `MessageDeduplicationMode` is left at `None`, Wolverine logs a
 warning at startup and that handler **throws on its first message**. It is deliberately a warning
 rather than a startup failure: `[Deduplicated]` lives on a handler type, and handler types are
 discovered by every host that scans their assembly. In a modular monolith where one module wants
@@ -107,6 +109,47 @@ through no fault of its own configuration.
 What is *not* softened is the guarantee itself. A store that cannot enforce deduplication throws
 rather than answering "yes, that's new" to every id, so a misconfigured host can never quietly
 process a duplicate.
+:::
+
+### How two ids are compared <Badge type="tip" text="6.45" />
+
+`MessageDeduplicationMode` has three values. Each one uses its own table, and no mode ever alters
+another mode's table:
+
+| Mode | Table | Comparison |
+|---|---|---|
+| `None` (default) | neither | no deduplication |
+| `CompareByHash` | `wolverine_deduplication_hashed` — a binary SHA-256 is the primary key, `deduplication_id` rides along as a plain column | identical on every engine |
+| `CompareByString` | `wolverine_deduplication`, exactly as it has always been — `deduplication_id` is the primary key | whatever the column's collation says |
+
+`CompareByString` is what Wolverine shipped in 6.31, and it compares the ids as strings — which in a
+relational database means the column's collation decides, not your application. On PostgreSQL and SQLite
+that is a byte comparison and the ids behave as written. On SQL Server and MySQL the default collations
+are case-insensitive, and MySQL's is accent-insensitive too, so `Abc` and `abc` are one claim and so are
+`José` and `Jose`; SQL Server's `varchar` additionally substitutes `?` for any character outside its code
+page. The consequence is work wrongly refused as a duplicate — never a duplicate let through — and the
+same ids behaving differently on different engines.
+
+`CompareByHash` stores the SHA-256 of the id's UTF-8 bytes in a binary column and makes that the primary
+key. Binary has no collation, so the comparison is the same everywhere. The readable `deduplication_id`
+is still stored next to it, so a stuck claim can be identified by eye, but it deliberately carries no
+unique constraint of its own — if it did, a case-insensitive collation would still refuse `abc` after
+`Abc` and nothing would have been fixed.
+
+The two tables are separate because moving a primary key from a text column onto a binary one is not a
+migration that can be applied in place — on SQLite it is a full table rebuild. A second table means the
+switch costs nothing: Wolverine creates the one the configured mode needs and leaves the other alone.
+
+::: warning Upgrading
+`Durability.EnableMessageDeduplication = true` is now obsolete and maps to `CompareByHash`, so the first
+deploy after upgrading provisions `wolverine_deduplication_hashed`. Nothing happens to the existing
+`wolverine_deduplication` table: it is not altered, not dropped, and the claims in it are not lost. They
+simply stop being consulted and are reaped on their own `expires`, so the table empties itself within
+`DeduplicationWindow` and can be dropped by hand at any point after that.
+
+Switching is lossless in both directions for the same reason. Setting
+`MessageDeduplicationMode = MessageDeduplicationMode.CompareByString` goes back to the original table
+with its claims intact, and switching forward again finds the hashed table still as it was.
 :::
 
 ### Deduplicating a message handler
@@ -223,7 +266,7 @@ using var host = await Host.CreateDefaultBuilder()
     .UseWolverine(opts =>
     {
         opts.PersistMessagesWithPostgresql("connection string");
-        opts.Durability.EnableMessageDeduplication = true;
+        opts.Durability.MessageDeduplicationMode = MessageDeduplicationMode.CompareByHash;
 
         // Compose the logical id from more than one member, or from anything
         // else you can reach from the message
@@ -246,7 +289,7 @@ using var host = await Host.CreateDefaultBuilder()
 ::: warning
 Deriving an id does not deduplicate anything by itself. It only *stamps* `Envelope.DeduplicationId`.
 Enforcement is still `[Deduplicated]` on the receiving handler or endpoint, plus
-`Durability.EnableMessageDeduplication`. The two halves are deliberately separate: the publisher and
+`Durability.MessageDeduplicationMode`. The two halves are deliberately separate: the publisher and
 the consumer are frequently different applications, and the publisher should not have to know whether
 anyone downstream is deduplicating.
 :::
@@ -304,7 +347,7 @@ using var host = await Host.CreateDefaultBuilder()
     .UseWolverine(opts =>
     {
         opts.PersistMessagesWithPostgresql("connection string");
-        opts.Durability.EnableMessageDeduplication = true;
+        opts.Durability.MessageDeduplicationMode = MessageDeduplicationMode.CompareByHash;
 
         // Apply logical deduplication to every handler matching a filter, instead
         // of decorating each one. Useful when the rule is "every create-style
@@ -331,20 +374,88 @@ worse than no guarantee, because it holds in testing and fails in production. Si
 how long a duplicate could plausibly arrive: an operator double-click is seconds, a console republish
 is minutes, an agent pre-publishing tomorrow's occurrences is a day.
 
+When one handler's duplicates arrive on a different timescale from the rest, give it its own window
+with `WindowInSeconds` on the attribute, as `[DeduplicatedWithResponse]` does for HTTP endpoints. `0`,
+the default, uses `DeduplicationWindow`; a negative value fails when the chain is built.
+
+<!-- snippet: sample_deduplicated_with_its_own_window -->
+<a id='snippet-sample_deduplicated_with_its_own_window'></a>
+```cs
+public record DeviceStateReported(string DeviceId, string State);
+
+public static class DeviceStateHandler
+{
+    // The vendor echoes a report within a minute or two, but legitimately
+    // reports the same state again hours later. Ten minutes refuses the
+    // echoes without refusing the genuine repeat
+    [Deduplicated(WindowInSeconds = 600)]
+    public static void Handle(DeviceStateReported message)
+    {
+        // ...
+    }
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/PersistenceTests/Samples/DeduplicationSamples.cs#L169-L185' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_deduplicated_with_its_own_window' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+Each claim stores its own expiry, so changing a window later leaves claims already recorded alone. The
+same property works on `[Deduplicated]` HTTP endpoints and gRPC methods.
+
 A background reaper deletes expired claims on its own timer
 (`Durability.DeduplicationCleanupPollingTime`, default 5 minutes), in bounded batches, in its own
 transaction. It logs how many claims it removed each cycle — a count that keeps climbing is the signal
 that the window is too long, the cadence too slow, or the volume higher than the settings assume.
 
+An expired claim is still honoured until the reaper removes it, so a repeat can be refused for up to one
+cleanup interval after its window. Keep a handler's `WindowInSeconds` well above that interval, or
+shorten `DeduplicationCleanupPollingTime`.
+
 ### Failed handlers do not poison the id
 
-If your handler throws, the claim is released and a retry gets through. Where the handler is
-transactional the claim was written inside that transaction and the rollback removes it; where it is
-not, Wolverine issues a compensating release.
+If your handler throws, a retry gets through. This matters more than it sounds: without it, the first
+failed attempt would permanently claim that logical id, every retry would be discarded as a duplicate
+of its own failed attempt, and the work would silently never happen while the logs reported successful
+deduplication.
 
-This matters more than it sounds. Without it, the first failed attempt would permanently claim that
-logical id, every retry would be discarded as a duplicate of its own failed attempt, and the work
-would silently never happen while the logs reported successful deduplication.
+Wolverine gets there two different ways, and which one you get depends on where the claim can be
+written.
+
+**The claim rides your transaction.** On a chain that commits through a Marten session — an
+`[Aggregate]`/`[WriteAggregate]` handler, an endpoint with `AutoApplyTransactions`, anything with a
+`SaveChangesAsync` — the claim is queued onto that same unit of work. It is written if and only if your
+transaction commits. A handler that throws never commits, so it never claimed; an HTTP endpoint that
+answers a `ProblemDetails` 404 returns before the commit, so it never claimed either. There is nothing
+to undo, which also means there is no window in which a prompt retry could see a claim for work that
+never happened.
+
+::: warning
+With a **database per tenant** this does not apply, however the chain commits. The claims live in the
+main database and the session commits to a tenant one, so queueing the claim onto that unit of work
+would be riding the wrong transaction. Wolverine refuses it and uses the compensating path below
+instead — which means a handler that throws *did* claim, and relies on the release to undo it.
+:::
+
+The one case this cannot decide up front is two genuinely concurrent callers under the same key.
+Neither one's claim is committed yet, so neither is visible to the other, and both proceed. The
+deduplication table's primary key settles it at commit time: one transaction wins, and the loser is
+refused exactly as if it had been caught by the up-front check — a 409 on HTTP, a discard on a handler.
+Worth knowing that the loser does its work and throws it away at commit rather than being refused
+before doing any, so a handler with side effects *outside* the transaction should account for that.
+
+**The claim is compensated.** Everywhere else — a Buffered or Inline endpoint, an HTTP endpoint with no
+transactional middleware, a `[Transactional]` handler on a plain relational message store — the claim
+is written up front on its own connection, and Wolverine gives it back when the chain fails.
+
+HTTP endpoints have a second way to fail on that path, and it is not an exception: a FluentValidation
+400, a `ProblemDetails` returned from a `Validate` method, a 404 from `[WriteAggregate]` on a missing
+stream. The handler never ran, so the claim is released there too — any response of 400 or above gives
+the key back, and the release is registered to run before the response is flushed so a prompt retry
+cannot beat it. A 2xx or a 3xx keeps it, so an idempotency key means "this succeeded once" rather than
+"this was attempted once".
+
+Either way the guarantee you see is the same. The difference is cost: the transactional path pays one
+round trip, shared with whatever read your handler was already doing, where the compensating path pays
+one to claim and another to release.
 
 ### Why a separate table
 
@@ -374,9 +485,10 @@ The claims live in `wolverine_deduplication` rather than as a column on
 - **Storage:** the RDBMS message stores — PostgreSQL, SQL Server, MySQL and SQLite (and therefore
   Marten-backed applications). Other stores report themselves as unsupported and fail loudly rather
   than passing every duplicate through.
-- **Scope:** logical ids are unique per message store, not per tenant. In a database-per-tenant
-  setup each tenant database has its own table and is therefore naturally isolated; under conjoined
-  (single-database) tenancy the id is global.
+- **Scope:** logical ids are unique per message store, not per tenant. With a database per tenant the
+  claims are kept in the main database, as `[DeduplicatedWithResponse]` claims are, and under
+  conjoined (single-database) tenancy they share the one database. Either way an id is global across
+  tenants, so include the tenant in it if two tenants can legitimately use the same one.
 - **Fire-and-forget only.** Replaying the *original response* of a deduplicated `InvokeAsync<T>` is
   Stripe-style idempotency-key machinery — storing and returning the prior result — and is not part
   of this feature. HTTP endpoints get a useful answer regardless, because a status code is a

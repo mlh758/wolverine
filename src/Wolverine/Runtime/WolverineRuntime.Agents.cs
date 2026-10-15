@@ -6,6 +6,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Wolverine.Persistence.Durability;
 using Wolverine.Runtime.Agents;
+using Wolverine.Util;
 
 namespace Wolverine.Runtime;
 
@@ -154,7 +155,8 @@ public partial class WolverineRuntime : IAgentRuntime
         // the persist first, every evaluation that runs — the kickstart's included — sees the change.
         var (nodes, assignments) = await Storage.Nodes.LoadNodeAgentStateAsync(cancellationToken);
         assignments.MergeChanges(restrictions);
-        await Storage.Nodes.PersistAgentRestrictionsAsync(assignments.FindChanges(), cancellationToken);
+        var changes = assignments.FindChanges();
+        await Storage.Nodes.PersistAgentRestrictionsAsync(changes, cancellationToken);
 
         // Still worth doing before the explicit evaluation below: refreshes this node's heartbeat and,
         // on the leader, settles leadership/ejection state so the evaluation runs against a live grid.
@@ -184,6 +186,76 @@ public partial class WolverineRuntime : IAgentRuntime
             throw new AggregateException(
                 "One or more agent commands carrying this restriction change failed. The restriction itself was persisted.",
                 failures);
+        }
+
+        await assertReleasedAgentsAreRunningAsync(changes, cancellationToken);
+    }
+
+    /// <summary>
+    ///     GH-4871. An UNCONFIRMED start is not a failure to the drain above -- AssignAgents races the reply
+    ///     against presence polls, logs "confirmed 0 of 1 requested agents" and returns an empty command set,
+    ///     because for the leader's own periodic evaluation the right answer is to try again next time (GH-3748 /
+    ///     GH-3750). For an operator's restart or pin it is the whole answer: before this, a restart that
+    ///     started nothing returned exactly like one that worked, and CritterWatch acknowledged it as a success
+    ///     while the projection ran on no node (CritterWatch#1393, from the GH-4868 field case).
+    ///
+    ///     <para>
+    ///     The store already knows the truth, and reading it is independent of how the commands reported: a node
+    ///     writes the agent's assignment row before it replies to a start. It is a bounded WAIT rather than a
+    ///     single read because the kickstart above runs its own evaluation whose commands go out through the
+    ///     per-destination dispatcher asynchronously; whichever evaluation claims the agent first in the pending
+    ///     ledger is the one that moves it, and when that is the kickstart's the inline drain has nothing to
+    ///     await. A healthy change converges within milliseconds, so the wait only runs its full
+    ///     <see cref="DurabilitySettings.AgentRestrictionConfirmationTimeout" /> when an agent genuinely will not
+    ///     start.
+    ///     </para>
+    ///
+    ///     <para>
+    ///     Deliberately only the start direction. A pause's stop is awaited inline by the drain, and the stop's
+    ///     own assignment delete is owner-scoped and best-effort -- a row that outlives a stop whose delete was
+    ///     cancelled or failed would turn a pause that worked into a false failure here, whereas a missing row
+    ///     after a release is exactly the condition this exists to report. Balanced only: a Solo node has no
+    ///     leader and never persists assignments, so there is nothing to read there.
+    ///     </para>
+    /// </summary>
+    private async Task assertReleasedAgentsAreRunningAsync(IReadOnlyList<AgentRestriction> changes,
+        CancellationToken cancellationToken)
+    {
+        if (Options.Durability.Mode != DurabilityMode.Balanced)
+        {
+            return;
+        }
+
+        // None covers both a lifted pause and a removed pin; either way the agent should be running somewhere.
+        var shouldRun = changes
+            .Where(x => x.Type is AgentRestrictionType.None or AgentRestrictionType.Pinned)
+            .Select(x => x.AgentUri)
+            .Distinct()
+            .ToArray();
+
+        if (shouldRun.Length == 0)
+        {
+            return;
+        }
+
+        var deadline = DateTimeOffset.UtcNow.Add(Options.Durability.AgentRestrictionConfirmationTimeout);
+        while (true)
+        {
+            var (nodes, _) = await Storage.Nodes.LoadNodeAgentStateAsync(cancellationToken);
+            var assigned = nodes.SelectMany(x => x.ActiveAgents).ToHashSet();
+
+            var notRunning = shouldRun.Where(x => !assigned.Contains(x)).ToList();
+            if (notRunning.Count == 0)
+            {
+                return;
+            }
+
+            if (DateTimeOffset.UtcNow >= deadline)
+            {
+                throw new AgentRestrictionsNotConfirmedException(notRunning);
+            }
+
+            await Task.Delay(250.Milliseconds(), cancellationToken);
         }
     }
 
@@ -258,7 +330,14 @@ public partial class WolverineRuntime : IAgentRuntime
         switch (Options.Durability.Mode)
         {
             case DurabilityMode.Balanced:
-                await startDurableScheduledJobs();
+                // GH-4569: every Balanced node polls the scheduled rows of its stores whether or not it was
+                // assigned anything, and executes what comes due on itself. A warm-up node must never run a
+                // production message, so it does not poll at all; the serving nodes keep doing it.
+                if (Options.Durability.NodeRole == NodeRole.Serving)
+                {
+                    await startDurableScheduledJobs();
+                }
+
                 startNodeAgentController();
                 break;
 
@@ -271,6 +350,7 @@ public partial class WolverineRuntime : IAgentRuntime
 
 
             case DurabilityMode.Serverless:
+            case DurabilityMode.ServerlessWithOutbox:
             case DurabilityMode.MediatorOnly:
                 break;
         }
@@ -327,6 +407,45 @@ public partial class WolverineRuntime : IAgentRuntime
         await envelope.StoreAndForwardAsync();
     }
 
+    /// <summary>
+    /// GH-4734. Claim this node's durable identity -- its row in the node table, and with it the
+    /// <see cref="DurabilitySettings.AssignedNodeNumber" /> that every envelope it owns is stamped with --
+    /// BEFORE the messaging transports start.
+    ///
+    /// <para>
+    /// This used to happen in <see cref="startNodeAgentWorkflowAsync" />, after the listeners were already
+    /// consuming. Until it ran, Durability.AssignedNodeNumber still held the per-process default from
+    /// <see cref="WolverineOptions" /> -- a hash of a fresh Guid -- so a node starting on a queue backlog
+    /// claimed those rows under an owner id that was in no node table. The orphaned-message sweep then
+    /// released them as "previously owned by departed nodes" (the premise it states in
+    /// ReleaseOrphanedMessagesCommand.liveOwnersAsync -- that an owner_id can only appear in the envelope
+    /// table once that node's registration has committed -- was exactly what this order falsified), and the
+    /// ones not yet processed ran a second time, with the same envelope id. One node was enough; no node had
+    /// to fail. The durable inbox's no-more-than-once guarantee did not hold across any scale-up, restart or
+    /// deploy that found a backlog.
+    /// </para>
+    ///
+    /// <para>
+    /// Nothing here needs a transport: <c>WolverineNode.For</c> reads
+    /// <c>Options.Transports.NodeControlEndpoint</c>, which is established either at configuration time
+    /// (broker control queues) or in <c>IMessageStore.Initialize</c>, both already done by this point;
+    /// <c>PersistAsync</c> is a write against a schema <c>tryMigrateStorage()</c> has already migrated; and
+    /// the <see cref="IStaticAgentFamily" /> instances were constructed back in <c>startAgentsAsync</c>. Solo
+    /// mode has always done its registration here, in <c>startAgentsAsync</c> -- this brings Balanced into
+    /// line with it rather than inventing a new order. The dispatcher and the heartbeat / health-check loops
+    /// stay AFTER the transports, because those do talk over the control endpoint.
+    /// </para>
+    /// </summary>
+    private async Task registerLocalNodeAsync()
+    {
+        if (NodeController == null) return;
+
+        _startupAgentCommands = await NodeController.StartLocalAgentProcessingAsync(Options);
+        Replies.AssignedNodeNumber = Options.Durability.AssignedNodeNumber;
+    }
+
+    private AgentCommands? _startupAgentCommands;
+
     private async Task startNodeAgentWorkflowAsync()
     {
         // GH-3698: commands execute on the dispatcher's per-destination lanes, independently of the loop
@@ -349,20 +468,27 @@ public partial class WolverineRuntime : IAgentRuntime
             // NodeAgentController.PendingDispatches.
             NodeController.PendingDispatches = _dispatcher.TryFindPendingDestination;
 
-            var commands = await NodeController.StartLocalAgentProcessingAsync(Options);
-            Replies.AssignedNodeNumber = Options.Durability.AssignedNodeNumber;
-            
-            foreach (var command in commands)
+            // A node that has left the cluster takes its lane with it: nothing queued there can succeed, and
+            // a command executing against it would otherwise wait out its whole reply window.
+            NodeController.NodeDeparted = _dispatcher.AbandonLane;
+
+            // GH-4734: registration itself moved ahead of the transports (see registerLocalNodeAsync), but
+            // anything it asks to be PUBLISHED has to wait until there is a transport to publish over.
+            foreach (var command in _startupAgentCommands ?? AgentCommands.Empty)
             {
                 await new MessageBus(this).PublishAsync(command);
             }
+
+            _startupAgentCommands = null;
         }
 
         // GH-3604 (D1): the heartbeat runs on its OWN loop, independent of executeHealthChecks. See
         // writeHeartbeats. Start it first so a slow first assignment evaluation can't delay the very
         // first heartbeat either.
-        _heartbeatLoop = Task.Run(writeHeartbeats, Cancellation);
-        _healthCheckLoop = Task.Run(executeHealthChecks, Cancellation);
+        // GH-4650. Both detached: each tick starts its own bounded activity, and neither loop should
+        // inherit whatever was current when the host started.
+        _heartbeatLoop = DetachedTask.Run(writeHeartbeats, Cancellation);
+        _healthCheckLoop = DetachedTask.Run(executeHealthChecks, Cancellation);
     }
 
     // GH-3604 (D1): keep the node heartbeat wholly independent of DoHealthChecksAsync and the agent-command
@@ -462,6 +588,7 @@ public partial class WolverineRuntime : IAgentRuntime
         }
 
         controller.PendingDispatches = null;
+        controller.NodeDeparted = null;
 
         var deferredWork = controller.TakeDeferredWork();
         if (deferredWork != null)
@@ -501,6 +628,7 @@ public partial class WolverineRuntime : IAgentRuntime
         }
 
         controller.PendingDispatches = null;
+        controller.NodeDeparted = null;
 
         var deferredWork = controller.TakeDeferredWork();
         if (deferredWork != null)

@@ -52,6 +52,16 @@ public sealed partial class WolverineRuntime : IWolverineRuntime, IWolverineRunt
     private readonly Lazy<MetricsAccumulator> _accumulator;
     private readonly Lazy<ISagaStoreDiagnostics> _sagaStorage;
 
+    internal static Func<Guid> IdGeneratorFor(EnvelopeIdGeneration generation)
+    {
+        return generation switch
+        {
+            EnvelopeIdGeneration.GuidV7 => Guid.CreateVersion7,
+            EnvelopeIdGeneration.NewIdSqlServerOrder => MassTransit.NewId.NextGuid,
+            _ => MassTransit.NewId.NextSequentialGuid
+        };
+    }
+
     public WolverineRuntime(WolverineOptions options,
         IServiceContainer container,
         ILoggerFactory loggers)
@@ -60,11 +70,7 @@ public sealed partial class WolverineRuntime : IWolverineRuntime, IWolverineRunt
         Options = options;
         Handlers = options.HandlerGraph;
 
-        Envelope.IdGenerator = options.EnvelopeIdGeneration switch
-        {
-            EnvelopeIdGeneration.GuidV7 => Guid.CreateVersion7,
-            _ => MassTransit.NewId.NextSequentialGuid
-        };
+        Envelope.IdGenerator = IdGeneratorFor(options.EnvelopeIdGeneration);
 
         _accumulator = new Lazy<MetricsAccumulator>(() => new MetricsAccumulator(this));
 
@@ -105,6 +111,21 @@ public sealed partial class WolverineRuntime : IWolverineRuntime, IWolverineRunt
         Pipeline = new HandlerPipeline(this, this);
 
         _container = container;
+
+        // GH-5016 / PR #5044. Registered here rather than in StartAsync: resource setup on startup
+        // (AddResourceSetupOnStartup, ResetResourceState, `resources setup`) compiles the broker endpoints
+        // before the runtime's StartAsync runs, and Endpoint.Compile() applies endpoint policies only once, so
+        // a policy added later left every RabbitMQ endpoint Inline and the outbox silently off
+        //
+        // GH-5051. Plain Serverless had the same ordering problem with ServerlessEndpointsMustBeInlinePolicy
+        if (options.Durability.Mode == DurabilityMode.ServerlessWithOutbox)
+        {
+            options.Policies.Add(new ServerlessWithOutboxEndpointsPolicy());
+        }
+        else if (options.Durability.Mode == DurabilityMode.Serverless)
+        {
+            options.Policies.Add(new ServerlessEndpointsMustBeInlinePolicy());
+        }
 
         // GH-3564: when UseClaimCheck deferred to a DI-registered IClaimCheckStore (the
         // ...FromServices overloads), hand it the built service provider now so the claim-check

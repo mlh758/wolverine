@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using JasperFx.CodeGeneration.Frames;
@@ -29,6 +30,14 @@ public sealed record EventModelSliceSeed(
     Type? HandlerType)
 {
     /// <summary>
+    ///     The method on <see cref="HandlerType" /> that handles the command -- the user's <c>Handle</c> /
+    ///     <c>Consume</c> / endpoint method, never the generated <c>MessageHandler</c> / <c>HttpHandler</c>
+    ///     override. Its name becomes <see cref="EventModelSliceDescriptor.HandlerMethod" />, so a viewer can
+    ///     navigate from a slice to the code that implements it.
+    /// </summary>
+    public MethodInfo? HandlerMethod { get; init; }
+
+    /// <summary>
     ///     The chain's response type, when it has one an HTTP resource, a gRPC response. A response is
     ///     never an emitted event or a published message, so it is excluded from the return values
     ///     <see cref="EventModelRoles.Describe" /> classifies. Null for chains that have no response concept.
@@ -44,7 +53,8 @@ public sealed record EventModelSliceSeed(
 
     /// <summary>
     ///     True for a read-only trigger — an HTTP <c>GET</c> / <c>HEAD</c>. A query chain that writes
-    ///     nothing is a <see cref="SlicePattern.View" /> slice reading its response type as a read model.
+    ///     nothing is a <see cref="SlicePattern.Query" /> slice reading its response type
+    ///     (<see cref="EventModelSliceDescriptor.ReadsFrom" />) — GH-4975.
     /// </summary>
     public bool IsQuery { get; init; }
 }
@@ -106,14 +116,18 @@ public static class EventModelRoles
             ? TriggerKind.JobScheduler
             : TriggerKind.MessageHandler;
 
-        var handlerType = chain.Handlers.FirstOrDefault()?.HandlerType;
+        // The user's handler class and method -- never the generated MessageHandler subclass
+        var handler = chain.Handlers.FirstOrDefault();
 
         return Describe(chain, new EventModelSliceSeed(
             DisplayNameFor(chain.MessageType),
             triggerKind,
             null,
             chain.MessageType,
-            handlerType));
+            handler?.HandlerType)
+        {
+            HandlerMethod = handler?.Method
+        });
     }
 
     /// <summary>
@@ -190,10 +204,14 @@ public static class EventModelRoles
         if (seed.IsQuery && !roles.AppendsEvents && roles.EmittedEvents.Count == 0 &&
             roles.PublishedMessages.Count == 0)
         {
-            pattern = SlicePattern.View;
+            // GH-4975 (jasperfx#1003). A read-only trigger is a Query slice, not a View: it READS its
+            // response's read model, aggregate or document, it does not produce it. The View that does
+            // produce it -- usually a projection -- stays its own slice, and the read on ReadsFrom is what
+            // links the two (EventModelLinkKind.ReadModelRead).
+            pattern = SlicePattern.Query;
             if (seed.ResponseType is { } response && response != typeof(void))
             {
-                roles.ReadModels.Add(readModelOf(response));
+                roles.ReadsFrom.Add(readModelOf(response));
             }
         }
         else if (seed.TriggerKind == TriggerKind.JobScheduler)
@@ -224,6 +242,16 @@ public static class EventModelRoles
             // say". Only here, where nothing else answers: every branch above derives the pattern from
             // the trigger, and a declaration does not contradict what the code does know.
             pattern = declaredPattern(chain);
+
+            // GH-4975. A handler declared [SlicePattern(SlicePattern.Query)] answers InvokeAsync<T>: what it
+            // returns is the reply, which it READS, not a message it cascades. Only when the handler writes
+            // nothing -- a "query" that appends events keeps them, and upstream flags it as a
+            // PatternViolation hotspot rather than this reader hiding it.
+            if (pattern == SlicePattern.Query && !roles.AppendsEvents && roles.EmittedEvents.Count == 0)
+            {
+                foreach (var reply in roles.PublishedMessages) roles.ReadsFrom.Add(readModelOf(reply));
+                roles.PublishedMessages.Clear();
+            }
         }
 
         // GH-4181. TriggerLabel is deliberately NOT claimed here. Every structural fact a derived
@@ -246,6 +274,7 @@ public static class EventModelRoles
             roles.ReadModels.Select(TypeDescriptor.For).ToList())
         {
             Pattern = pattern,
+            HandlerMethod = seed.HandlerMethod?.Name,
             TriggerKind = seed.TriggerKind,
             TriggerOrigin = seed.TriggerOrigin,
             AggregateTypes = roles.Aggregates.Select(TypeDescriptor.For).ToList(),
@@ -355,6 +384,12 @@ public static class EventModelRoles
             }
         }
 
+        // GH-4914. What JasperFx.Events.SourceGenerator read from the handler's BODY (jasperfx#990): the
+        // events appended to an IEventStream<T>, passed to StartStream or put in an EventsToAppend --
+        // exactly the shapes whose types the signature erases. Additive like [Emits], which stays the
+        // override for an event the generator cannot see (built in a helper, or held as object).
+        foreach (var eventType in emittedFromSource(call)) roles.EmittedEvents.Add(eventType);
+
         // [DeciderFunction] / [AggregateHandler] on the method or the handler type: the aggregate
         // is the one the attribute names, else the one the workflow would infer from the signature
         var decider = call.Method.GetAttribute<DeciderFunctionAttribute>()
@@ -401,6 +436,23 @@ public static class EventModelRoles
         }
     }
 
+    // Per handler assembly, read once: diagnostic surface only, never per message
+    private static readonly ConcurrentDictionary<Assembly, ILookup<(Type HandlerType, string MethodName), Type>> _emittedFromSource = new();
+
+    /// <summary>
+    ///     The events the source generator's <see cref="EmittedEventsAttribute" /> manifest lists for this
+    ///     handler method (jasperfx#990). Empty for an assembly the generator never ran on.
+    /// </summary>
+    private static IEnumerable<Type> emittedFromSource(MethodCall call)
+    {
+        var manifest = _emittedFromSource.GetOrAdd(call.HandlerType.Assembly, static assembly => assembly
+            .GetCustomAttributes<EmittedEventsAttribute>()
+            .SelectMany(x => x.EventTypes.Select(e => (Key: (x.HandlerType, x.MethodName), Event: e)))
+            .ToLookup(x => x.Key, x => x.Event));
+
+        return manifest[(call.HandlerType, call.Method.Name)];
+    }
+
     /// <summary>
     ///     The pattern a <see cref="SlicePatternAttribute" /> declares on the chain's handler method, else on
     ///     its handler type; null when neither does. GH-4395.
@@ -432,7 +484,7 @@ public static class EventModelRoles
     }
 
     /// <summary>
-    ///     The read model behind a <see cref="SlicePattern.View" /> slice's response. A response that is a
+    ///     The read model behind a <see cref="SlicePattern.Query" /> slice's response. A response that is a
     ///     <em>collection</em> of a type is a view over that type -- "a list of Account" reads the same
     ///     Account read model the sibling single-document routes name -- so the element type is what the
     ///     slice reports, and the slice folds onto the canvas node that already exists rather than minting
@@ -600,7 +652,7 @@ public static class EventModelRoles
         /// <summary>
         /// GH-4419: the types this chain READS — <c>[ReadModel]</c> and <c>[Entity]</c> parameters — kept
         /// apart from <see cref="ReadModels" />, which is what the chain <em>produces</em> (an
-        /// <c>IStorageAction&lt;T&gt;</c> return, a query's response body). Upstream models the two as
+        /// <c>IStorageAction&lt;T&gt;</c> return). A query's response body is READ (GH-4975). Upstream models the two as
         /// different roles, and the Automation input edge — Event → Read Model → ⚙ Command — can only be
         /// drawn from the read side, because a link needs a producer at one end and a reader at the other.
         /// </summary>
@@ -648,6 +700,8 @@ public static class EventModelRoles
         private readonly List<Type> _types = new();
 
         public int Count => _types.Count;
+
+        public void Clear() => _types.Clear();
 
         public void Add(Type type)
         {

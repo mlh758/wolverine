@@ -12,6 +12,7 @@ using Wolverine.Configuration;
 using Wolverine.Polecat.Codegen;
 using Wolverine.Polecat.Requirements;
 using Wolverine.Persistence;
+using Wolverine.Persistence.Codegen;
 using Wolverine.Persistence.Sagas;
 using Wolverine.Runtime;
 
@@ -45,6 +46,75 @@ internal partial class PolecatPersistenceFrameProvider : IPersistenceFrameProvid
         return Nullable.GetUnderlyingType(idProp.PropertyType) ?? idProp.PropertyType;
     }
 
+    /// <inheritdoc />
+    /// <remarks>
+    ///     GH-4570, the Polecat half of GH-4505. Unlike Marten, Wolverine's message store here is a separate
+    ///     <c>DbDataSource</c> against the same SQL Server database
+    ///     (<c>SqlServerMessageStore</c> builds one from the connection string), so the claim cannot simply
+    ///     be queued as a storage operation — it is enlisted as an <c>ITransactionParticipant</c>, which is
+    ///     handed the live connection and transaction.
+    ///     <para>
+    ///     Database-per-tenant falls through to the claim-and-release path deliberately: that composition
+    ///     builds the main message store from <c>PolecatIntegration.MainConnectionString</c>, which is a
+    ///     different database from the tenant one the session commits to.
+    ///     </para>
+    /// </remarks>
+    public bool TryBuildTransactionalDeduplication(IChain chain, Variable deduplicationId,
+        DeduplicationRequirement requirement, IServiceContainer container,
+        [NotNullWhen(true)] out TransactionalDeduplication? deduplication)
+    {
+        deduplication = null;
+
+        // Not CanApply -- that answers "could this provider own the chain's transaction?", and a chain that
+        // merely takes an IDocumentSession satisfies it without ever committing one. Riding a transaction
+        // that is never committed writes no claim at all, so the endpoint silently loses deduplication
+        // entirely: every replay runs. Ask for the commit frame itself, which is the thing the claim has to
+        // ride. See the Marten twin and deduplication_without_a_commit_keeps_the_release.
+        if (!chain.Middleware.OfType<CreateDocumentSessionFrame>().Any()) return false;
+        if (!chain.Postprocessors.OfType<DocumentSessionSaveChanges>().Any()) return false;
+
+        // Conservative on a tenancy this cannot read: an unknown cardinality falls back to
+        // claim-and-release, which is correct everywhere, rather than assuming the message store shares
+        // the session's database.
+        var tenancy = resolveDeduplicationStore(chain, container).Options.Tenancy;
+        if (tenancy is null || tenancy.Cardinality != JasperFx.Descriptors.DatabaseCardinality.Single)
+        {
+            return false;
+        }
+
+        var marker = chain.DetermineAncillaryStoreType();
+        var check = new PolecatDeduplicationClaimExistsFrame(deduplicationId, marker);
+
+        deduplication = new TransactionalDeduplication
+        {
+            Check = check,
+            IsDuplicate = check.Variable,
+            Claim = new QueuePolecatDeduplicationClaimFrame(deduplicationId, check.Variable, marker,
+                requirement.Window),
+            CommitRaceWrapper = new RefuseDuplicateClaimAtCommitFrame(
+                PolecatDeduplicationFailures.Classifier,
+                lost => chain.BuildDeduplicationStopCondition(lost, DeduplicationOutcome.Duplicate, requirement))
+        };
+
+        return true;
+    }
+
+    /// <summary>
+    /// The store this chain writes to, on the same terms as the Marten twin: a store type this integration
+    /// does not own, or one not registered in this container, falls through to the default store.
+    /// </summary>
+    private static IDocumentStore resolveDeduplicationStore(IChain chain, IServiceContainer container)
+    {
+        if (chain.DetermineAncillaryStoreType() is { } storeType && storeType.CanBeCastTo<IDocumentStore>()
+                                                                 && container.Services.GetService(storeType) is
+                                                                     IDocumentStore ancillary)
+        {
+            return ancillary;
+        }
+
+        return container.GetInstance<IDocumentStore>();
+    }
+
     public void ApplyTransactionSupport(IChain chain, IServiceContainer container)
     {
         if (!chain.Middleware.OfType<CreateDocumentSessionFrame>().Any())
@@ -69,6 +139,15 @@ internal partial class PolecatPersistenceFrameProvider : IPersistenceFrameProvid
     public void ApplyTransactionSupport(IChain chain, IServiceContainer container, Type entityType)
     {
         ApplyTransactionSupport(chain, container);
+    }
+
+    /// <summary>
+    /// GH-4631. Polecat is designated by one of its own store or session interfaces, which is also what an
+    /// ancillary store marker type (<c>AddPolecatStore&lt;IMyStore&gt;()</c>) derives from.
+    /// </summary>
+    public bool OwnsStorageType(Type storageType, IServiceContainer container)
+    {
+        return storageType.CanBeCastTo<IDocumentStore>() || storageType.CanBeCastTo<IQuerySession>();
     }
 
     public bool CanApply(IChain chain, IServiceContainer container)
@@ -99,15 +178,27 @@ internal partial class PolecatPersistenceFrameProvider : IPersistenceFrameProvid
         // vanished, with no exception.
         //
         // GH-3956: same hole on the DOCUMENT side. See MartenPersistenceFrameProvider.CanApply.
-        // IDocumentReadOperations is probed but NOT matched, exactly as IQuerySession has always been --
-        // a read-only parameter is not evidence that the chain writes anything.
-        return serviceDependencies.Any(x => x == typeof(IDocumentSession) || x == typeof(IDocumentOperations)
-                                            || x.Closes(typeof(IEventStream<>))
-                                            || x == typeof(global::JasperFx.Events.IEventOperations)
-                                            || x == typeof(global::JasperFx.Events.IEventStoreOperations)
-                                            || x == typeof(global::Polecat.Events.IEventOperations)
-                                            || x == typeof(global::JasperFx.Events.Documents.IDocumentSessionOperations)
-                                            || x == typeof(global::JasperFx.Events.Documents.IDocumentWriteOperations));
+        // IDocumentReadOperations and IQuerySession are probed but not matched on their own -- a read-only
+        // parameter is not evidence that the chain writes anything.
+        if (serviceDependencies.Any(x => x == typeof(IDocumentSession) || x == typeof(IDocumentOperations)
+                                         || x.Closes(typeof(IEventStream<>))
+                                         || x == typeof(global::JasperFx.Events.IEventOperations)
+                                         || x == typeof(global::JasperFx.Events.IEventStoreOperations)
+                                         || x == typeof(global::Polecat.Events.IEventOperations)
+                                         || x == typeof(global::JasperFx.Events.Documents.IDocumentSessionOperations)
+                                         || x == typeof(global::JasperFx.Events.Documents.IDocumentWriteOperations)))
+        {
+            return true;
+        }
+
+        // GH-4907: the IQuerySession permutation of GH-2941, as fixed for Marten in #4910. A read-only
+        // parameter is served by casting the outbox-enrolled IDocumentSession, so a chain that reads AND
+        // sends messages queues its envelopes on a session nothing commits: a scheduled message is never
+        // handled, and a durable local one only ever runs from memory. Reading alone still does not claim
+        // the chain; reading plus sending does.
+        return serviceDependencies.Any(x => x == typeof(IQuerySession)
+                                            || x == typeof(global::JasperFx.Events.Documents.IDocumentReadOperations))
+               && chain.CanSendMessages(container);
     }
 
     private static bool ChainHasPolecatSessionAttributes(IChain chain)

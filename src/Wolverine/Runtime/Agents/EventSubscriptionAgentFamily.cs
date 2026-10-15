@@ -175,9 +175,35 @@ public class EventSubscriptionAgentFamily : IStaticAgentFamily, IEventSubscripti
     }
 
     public string Scheme => SchemeName;
-    public ValueTask<IReadOnlyList<Uri>> AllKnownAgentsAsync()
+
+    /// <summary>
+    ///     GH-4569: set on a <see cref="NodeRole.Warmup" /> node. The node then advertises -- and can build --
+    ///     async projection shards only, never subscriptions: a subscription is a side effect by definition, and
+    ///     the serving nodes keep running every one of them until cut over.
+    /// </summary>
+    internal bool IsWarmup { get; private set; }
+
+    internal void UseWarmupRole()
     {
-        return SupportedAgentsAsync();
+        IsWarmup = true;
+        foreach (var entry in _stores.Enumerate())
+        {
+            entry.Value.ProjectionsOnly = true;
+        }
+    }
+
+    // The enumeration AllKnownAgentsAsync handed the leader for the evaluation in progress, for
+    // EvaluateAssignmentsAsync to reuse. Every enumeration rebuilds each store's usage descriptor, and for a
+    // master-table tenancy that is a database round trip per store -- paid twice per evaluation when the
+    // retirement pass asked again a few milliseconds later. Consumed once so a list can never outlive the
+    // evaluation it was taken for.
+    private IReadOnlyList<Uri>? _enumeratedForThisEvaluation;
+
+    public async ValueTask<IReadOnlyList<Uri>> AllKnownAgentsAsync()
+    {
+        var agents = await SupportedAgentsAsync();
+        _enumeratedForThisEvaluation = agents;
+        return agents;
     }
 
     public async ValueTask<IAgent> BuildAgentAsync(Uri uri, IWolverineRuntime wolverineRuntime)
@@ -280,7 +306,8 @@ public class EventSubscriptionAgentFamily : IStaticAgentFamily, IEventSubscripti
     {
         var retired = new HashSet<Uri>();
 
-        var supported = (await SupportedAgentsAsync()).ToHashSet();
+        var enumerated = Interlocked.Exchange(ref _enumeratedForThisEvaluation, null) ?? await SupportedAgentsAsync();
+        var supported = enumerated.ToHashSet();
         var supportedTenantNeutral = supported
             .Select(TenantNeutralKeyOf)
             .Where(x => x != null)

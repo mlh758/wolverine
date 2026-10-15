@@ -45,6 +45,13 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
     private bool _latched;
     private int _inboxUnavailableSignaled;
 
+    // The InboxStaleTime heartbeat: the envelopes this receiver holds in memory, and the timer that restarts their
+    // rows' stale clock. Both null unless InboxStaleTime is set and the inbox supports it.
+    private readonly InboxCustody? _custody;
+    private readonly Timer? _heartbeat;
+    private readonly TimeSpan _heartbeatPeriod;
+    private int _heartbeating;
+
     public DurableReceiver(Endpoint endpoint, IWolverineRuntime runtime, IHandlerPipeline pipeline)
     {
         _endpoint = endpoint;
@@ -56,6 +63,16 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
         _logger = runtime.LoggerFactory.CreateLogger<DurableReceiver>();
 
         Uri = endpoint.Uri;
+
+        // The stale sweep releases an owned inbox row once its clock is older than InboxStaleTime. A row this
+        // receiver is still holding -- queued here, or running in a handler -- is not stuck, so its clock is
+        // restarted three times per InboxStaleTime while it is held.
+        if (_settings.InboxStaleTime is { } staleTime && _inbox is IMessageInboxHeartbeat)
+        {
+            _custody = new InboxCustody();
+            _heartbeatPeriod = TimeSpan.FromTicks(Math.Max(staleTime.Ticks / 3, TimeSpan.FromMilliseconds(50).Ticks));
+            _heartbeat = new Timer(_ => _ = restartHeldStaleClocksAsync(), null, _heartbeatPeriod, _heartbeatPeriod);
+        }
 
         ShouldPersistBeforeProcessing = !(endpoint is IDatabaseBackedEndpoint);
 
@@ -96,38 +113,47 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
 
         Func<Envelope, CancellationToken, Task> execute = async (envelope, _) =>
         {
-            if (_latched)
-            {
-                return;
-            }
-
             try
             {
-                envelope.ContentType ??= EnvelopeConstants.JsonContentType;
+                if (_latched)
+                {
+                    return;
+                }
 
-                await pipeline.InvokeAsync(envelope, this).ConfigureAwait(false);
-            }
-            catch (Exception? e)
-            {
-                // CritterWatch#942 — everything in this recovery path must be exception-safe: an
-                // escape here faults the execution block terminally (jasperfx#506) and a faulted
-                // block never recovers. Both the requeue and the log call can throw under the same
-                // memory pressure that caused the original failure.
                 try
                 {
-                    if (_receiver != null)
-                    {
-                        await _receiver.PostAsync(envelope).ConfigureAwait(false);
-                    }
+                    envelope.ContentType ??= EnvelopeConstants.JsonContentType;
 
-                    // This *should* never happen, but of course it will
-                    _logger.LogError(e, "Unexpected pipeline invocation error");
+                    await pipeline.InvokeAsync(envelope, this).ConfigureAwait(false);
                 }
-                catch
+                catch (Exception? e)
                 {
-                    // The message is lost to this attempt, but durable inbox recovery re-offers it;
-                    // the listener survives.
+                    // CritterWatch#942 — everything in this recovery path must be exception-safe: an
+                    // escape here faults the execution block terminally (jasperfx#506) and a faulted
+                    // block never recovers. Both the requeue and the log call can throw under the same
+                    // memory pressure that caused the original failure.
+                    try
+                    {
+                        if (_receiver != null)
+                        {
+                            // Still held: the requeue is counted in before this execution counts out below
+                            _custody?.Enter(envelope, DateTimeOffset.UtcNow);
+                            await _receiver.PostAsync(envelope).ConfigureAwait(false);
+                        }
+
+                        // This *should* never happen, but of course it will
+                        _logger.LogError(e, "Unexpected pipeline invocation error");
+                    }
+                    catch
+                    {
+                        // The message is lost to this attempt, but durable inbox recovery re-offers it;
+                        // the listener survives.
+                    }
                 }
+            }
+            finally
+            {
+                _custody?.Leave(envelope);
             }
         };
         
@@ -203,6 +229,27 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
             }, _logger,
             _settings.Cancellation);
 
+        // GH-4664. This block's default budget was 3 retries over ~400ms, and exhausting it discarded the
+        // completion with one line at Information. The envelope's inbox row then stayed Incoming and owned
+        // by THIS node, which is the one state nothing reclaims: the recovery sweep reads owner_id = 0
+        // only, and the dead-node sweep deliberately never touches a live node's rows (GH-3850). So a
+        // database blip during a handler's last millisecond stranded that message until the node next
+        // restarted -- days, in a long-running service -- and DurabilitySettings.InboxStaleTime, whose own
+        // documentation says it "should NOT ever be necessary", was the only way back.
+        //
+        // Unlike the first write of an envelope (GH-4662), there is nothing to hand back to a caller here
+        // and nothing to lose by waiting: the row is already durable, this node still owns it so no other
+        // node can pick it up twice, and the handler has already run. So keep retrying, backing off to the
+        // same 30s ceiling InboxHealthRestarter uses, until the store comes back or the host shuts down --
+        // at which point DrainAsync releases the ownership anyway. The cost is holding the envelope in
+        // memory for the length of the outage.
+        _markAsHandled.MaximumAttempts = int.MaxValue;
+        _markAsHandled.Pauses =
+        [
+            50.Milliseconds(), 100.Milliseconds(), 250.Milliseconds(), 1.Seconds(), 2.Seconds(), 5.Seconds(),
+            10.Seconds(), 30.Seconds()
+        ];
+
         if (_settings.MarkAsHandledBatchSize > 1)
         {
             _completionCoalescer = new InboxCompletionCoalescer(
@@ -262,6 +309,12 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
     {
         if (_runtime.Stores == null) return;
 
+        // GH-5040: a database-backed endpoint never writes the inbox itself -- its dequeue already moved the row
+        // into the inbox of the transport's own store. Pointing the envelope at the handler's ancillary store
+        // here sent the mark-handled to a database that has no such row, and the row stayed Incoming in the
+        // main store to be replayed on every restart
+        if (!ShouldPersistBeforeProcessing) return;
+
         // Uri, not just the message type: a sticky handler makes the owning store endpoint specific,
         // and this receiver only ever feeds the handler chain for its own endpoint (GH-3886).
         var store = _runtime.Stores.TryFindAncillaryStoreForMessageType(Uri, envelope.MessageType);
@@ -280,8 +333,49 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
         }
     }
 
+    /// <summary>
+    /// One heartbeat tick: restart the stale clock of every envelope held here for at least one period. Never
+    /// overlaps itself and never throws; a failed write is retried on the next tick, which still leaves two more
+    /// before the sweep could release the row.
+    /// </summary>
+    private async Task restartHeldStaleClocksAsync()
+    {
+        if (_custody == null || Interlocked.Exchange(ref _heartbeating, 1) == 1) return;
+
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            var due = _custody.FindDue(now.Subtract(_heartbeatPeriod));
+            if (due.Count == 0) return;
+
+            await ((IMessageInboxHeartbeat)_inbox).RestartStaleClockAsync(_settings.AssignedNodeNumber, due)
+                .ConfigureAwait(false);
+            _custody.MarkClockRestarted(due, now);
+        }
+        catch (Exception e)
+        {
+            try
+            {
+                _logger.LogWarning(e,
+                    "Unable to restart the InboxStaleTime clock of messages held by {Uri}. Retrying on the next heartbeat",
+                    Uri);
+            }
+            catch
+            {
+                // Logging failed; the next tick tries again regardless
+            }
+        }
+        finally
+        {
+            Volatile.Write(ref _heartbeating, 0);
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
+        if (_heartbeat != null) await _heartbeat.DisposeAsync().ConfigureAwait(false);
+        _custody?.Clear();
+
         await _receiver.WaitForCompletionAsync().ConfigureAwait(false);
 
         _incrementAttempts.Dispose();
@@ -374,12 +468,13 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
 
     public async ValueTask DeferAsync(Envelope envelope)
     {
-        // GH-826, the attempts are already incremented from the executor
-        if (!envelope.IsFromLocalDurableQueue())
-        {
-            envelope.Attempts++;
-        }
-
+        // GH-4851. Deliberately NOT incrementing Attempts here, for any envelope. Every execution goes through
+        // Executor.ExecuteAsync (or TracingExecutor), which increments Attempts as it starts, so the requeued
+        // execution counts itself. GH-826 removed the second increment for envelopes sent by a DurableLocalQueue
+        // only, which left every external durable listener -- a database queue, a broker -- reporting attempts
+        // 1 then 3 on a Requeue, and firing attempt-bounded policies one try early. The persisted value below
+        // is the attempt that just failed; a recovered row resumes at the next one, which is the same number
+        // an in-memory requeue would reach.
         await _incrementAttempts.PostAsync(envelope).ConfigureAwait(false);
 
         if (_latched)
@@ -413,6 +508,7 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
         // sure the ancillary-store routing is applied here too so the
         // mark-as-handled SQL goes to the correct store. See GH-2576.
         assignAncillaryStoreIfNeeded(envelope);
+        _custody?.Enter(envelope, DateTimeOffset.UtcNow);
         _receiver.Post(envelope);
     }
 
@@ -426,6 +522,7 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
         // through the assignAncillaryStoreIfNeeded calls in receiveOneAsync /
         // ProcessReceivedMessagesAsync. See GH-2576.
         assignAncillaryStoreIfNeeded(envelope);
+        _custody?.Enter(envelope, DateTimeOffset.UtcNow);
         return _receiver.PostAsync(envelope);
     }
 
@@ -494,12 +591,31 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
         _latched = true;
         _receiver.Complete();
 
+        // GH-4797. Non-null only when the bounded wait below gave up with work still running, and it is then
+        // the thing the release has to wait for. See deferReleaseUntilIdleAsync.
+        Task? stillRunning = null;
+
         if (waitForCompletion)
         {
             try
             {
                 var completion = _receiver.WaitForCompletionAsync();
-                await Task.WhenAny(completion, Task.Delay(_settings.DrainTimeout)).ConfigureAwait(false);
+                var timeout = Task.Delay(_settings.DrainTimeout);
+
+                // GH-4797. Which task won is load-bearing, and Task.WhenAny discards it. The blanket
+                // ReleaseIncomingAsync at the end of this method hands every row at this address back to
+                // AnyNode, and running it while handlers are still executing lets another node claim and
+                // re-execute a message this node has not finished -- for an exclusive listener, and especially
+                // a global partition slot handing over (GH-4777), exactly the intra-group concurrency the
+                // partitioned modes exist to prevent.
+                if (await Task.WhenAny(completion, timeout).ConfigureAwait(false) == timeout)
+                {
+                    stillRunning = completion;
+
+                    _logger.LogWarning(
+                        "Drain at {Uri} timed out after {DrainTimeout} with {QueueCount} message(s) still queued or in flight. Their inbox rows will be held until the work finishes rather than released now, so nothing else can claim a message still executing here. See GH-4797",
+                        Uri, _settings.DrainTimeout, QueueCount);
+                }
             }
             catch (Exception e)
             {
@@ -517,7 +633,102 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
         await _completeBlock.DrainAsync().ConfigureAwait(false);
         await _deferBlock.DrainAsync().ConfigureAwait(false);
 
+        if (stillRunning == null)
+        {
+            await releaseIncomingAsync().ConfigureAwait(false);
+            return;
+        }
+
+        deferReleaseUntilIdleAsync(stillRunning);
+    }
+
+    /// <summary>
+    /// A second <c>received_at</c> address this receiver executes rows from, released alongside its own on
+    /// drain. Set on a global partition's companion local queue to the slot's external address: a durable
+    /// database-backed slot writes the inbox row at the SLOT's address when it pops (GH-4288), and the bridge
+    /// then hands the envelope to this receiver, so the companion queue's backlog is split across two
+    /// addresses. Releasing only <see cref="Uri"/> on drain left every row that had come through the shard
+    /// queue table Incoming and owned by the ex-owner -- a live node, so neither the orphan sweep nor the next
+    /// owner's recovery loop would ever look at it. Null everywhere else.
+    /// </summary>
+    internal Uri? AlsoReleaseIncomingAt { get; set; }
+
+    private async Task releaseIncomingAsync()
+    {
         await executeWithRetriesAsync(() => _inbox.ReleaseIncomingAsync(_settings.AssignedNodeNumber, Uri)).ConfigureAwait(false);
+
+        // Deliberately on the same path as the primary release, so the GH-4797 hold on in-flight work applies
+        // to both addresses: an envelope that came through the shard queue is just as much "still executing
+        // here" as one that took the local shortcut.
+        if (AlsoReleaseIncomingAt != null)
+        {
+            var alsoReleaseAt = AlsoReleaseIncomingAt;
+            await executeWithRetriesAsync(() => _inbox.ReleaseIncomingAsync(_settings.AssignedNodeNumber, alsoReleaseAt)).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// GH-4797. Hold the release until the work this drain could not wait out has actually finished, instead of
+    /// handing rows to <c>AnyNode</c> underneath a running handler.
+    ///
+    /// <para>Deliberately not awaited. The drain is on the path an exclusive-listener agent's <c>StopAsync</c>
+    /// returns through, and <c>ReassignAgent</c> gates the gaining node's start on that return -- so blocking
+    /// here until a slow handler finished would convert a correctness problem into a slot that is served
+    /// nowhere while it waits, which is the worse failure (GH-3856's direction). The stop still completes
+    /// promptly; what changes is that nothing else can claim these rows in the meantime.</para>
+    ///
+    /// <para>The rows are not stranded in the normal case. A handler that finishes settles its own row, and
+    /// anything merely queued-and-abandoned is released by the continuation below. The residual case is a
+    /// handler that never returns at all: those rows stay owned by this node until it stops -- where
+    /// <c>ReleaseAllOwnershipAsync</c> covers them -- or until the orphan sweep reclaims them after it is
+    /// declared dead. That is the deliberate trade for this fix: a bounded delay in placing a message, rather
+    /// than two nodes running it at once.</para>
+    ///
+    /// <para>One caveat worth naming, since it bounds what this can promise: the retry blocks above have
+    /// already been drained by the time a late handler completes, so its mark-as-handled may not land. The
+    /// release below then legitimately offers that row to another node, and it runs a second time. That is
+    /// at-least-once behaving as documented -- and strictly better than the same duplicate happening
+    /// <em>concurrently</em>, which is what this method exists to stop.</para>
+    /// </summary>
+    private void deferReleaseUntilIdleAsync(Task stillRunning)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                // The task was started by DrainAsync, not here -- which is the whole point: this is the
+                // handler work that drain could not wait out. Same suppression as AgentWorkConfirmation.
+#pragma warning disable VSTHRD003
+                await stillRunning.ConfigureAwait(false);
+#pragma warning restore VSTHRD003
+            }
+            catch (Exception e)
+            {
+                // The wait faulting tells us nothing about whether handlers are still running, so fall
+                // through to the release rather than holding the rows on an unknown.
+                _logger.LogDebug(e,
+                    "Error waiting for in-flight message processing to finish at {Uri} before releasing its inbox rows",
+                    Uri);
+            }
+
+            try
+            {
+                await releaseIncomingAsync().ConfigureAwait(false);
+
+                _logger.LogInformation(
+                    "Released the held inbox rows for {Uri} now that the work outstanding at drain time has finished. See GH-4797",
+                    Uri);
+            }
+            catch (Exception e)
+            {
+                // Nothing above this to catch it -- and a throw out of a fire-and-forget task is an
+                // unobserved exception, not a diagnostic. The rows stay owned by this node and are reclaimed
+                // when it stops or is declared dead.
+                _logger.LogError(e,
+                    "Error releasing the held inbox rows for {Uri} after its drain timed out; they will be reclaimed when this node stops",
+                    Uri);
+            }
+        });
     }
 
     public void Dispose()
@@ -1027,7 +1238,15 @@ public class DurableReceiver : ILocalQueue, IChannelCallback, ISupportNativeSche
             }
             catch (Exception e)
             {
-                _logger.LogError(e, "Error trying to persist incoming envelopes at {Uri}", Uri);
+                // GH-4658. Only the failures that actually mean "nothing can be persisted" are an Error
+                // here. A tenant-scoped failure gets its own Warning from the helper below, naming the
+                // same Uri and the envelope count -- and while a tenant's database is down its envelopes
+                // are redelivered continuously, so logging both lines per turn buried the log in Errors
+                // over a condition the listener is deliberately riding out.
+                if (e is not TenantedInboxWriteException { IncludesMainStore: false })
+                {
+                    _logger.LogError(e, "Error trying to persist incoming envelopes at {Uri}", Uri);
+                }
 
                 // GH-4435. Envelopes whose own store committed are already stamped WasPersistedInInbox by
                 // MultiTenantedMessageStore, so the per-envelope path below acks and enqueues those and

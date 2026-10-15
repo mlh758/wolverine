@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using JasperFx;
 using JasperFx.Core;
 using JasperFx.Core.Reflection;
@@ -31,12 +32,65 @@ internal class MapEventTypeMessages : IWolverineExtension
     }
 }
 
+// GH-4902. Polecat's integration only reaches the service collection, so the envelope id choice is applied
+// through an extension, which Wolverine runs after the UseWolverine() configuration and before startup.
+// True forces SQL Server-ordered ids; false pins the default ids so the automatic switch does not apply,
+// unless something was chosen explicitly already
+internal class PolecatEnvelopeIdChoice(bool optimizeEnvelopeIdsForSqlServer) : IWolverineExtension
+{
+    public void Configure(WolverineOptions options)
+    {
+        if (optimizeEnvelopeIdsForSqlServer)
+        {
+            options.EnvelopeIdGeneration = EnvelopeIdGeneration.NewIdSqlServerOrder;
+        }
+        else if (!options.EnvelopeIdGenerationIsExplicit)
+        {
+            options.EnvelopeIdGeneration = EnvelopeIdGeneration.NewId;
+        }
+    }
+}
+
 public static class WolverineOptionsPolecatExtensions
 {
     /// <summary>
     ///     Integrate Polecat with Wolverine's persistent outbox and add Polecat-specific middleware
+    ///     to Wolverine, optionally opting into envelope ids ordered for SQL Server
+    /// </summary>
+    /// <param name="optimizeEnvelopeIdsForSqlServer">
+    /// GH-4902. Polecat keeps Wolverine's envelopes in SQL Server, so when it is every message store in the
+    /// application Wolverine already switches to <see cref="EnvelopeIdGeneration.NewIdSqlServerOrder"/> at
+    /// startup, unless <see cref="WolverineOptions.EnvelopeIdGeneration"/> was set explicitly. True sets it
+    /// explicitly anyway. False opts out of the automatic switch and keeps the default ids -- use that when this
+    /// application sends messages to services that store their envelopes in PostgreSQL. An explicit
+    /// EnvelopeIdGeneration is left alone when false, and there is no schema change either way.
+    /// </param>
+    public static PolecatConfigurationExpression IntegrateWithWolverine(
+        this PolecatConfigurationExpression expression,
+        bool optimizeEnvelopeIdsForSqlServer,
+        Action<PolecatIntegration>? configure = null)
+    {
+        expression.Services.AddSingleton<IWolverineExtension>(new PolecatEnvelopeIdChoice(optimizeEnvelopeIdsForSqlServer));
+
+        return expression.IntegrateWithWolverine(configure);
+    }
+
+    /// <summary>
+    ///     Integrate Polecat with Wolverine's persistent outbox and add Polecat-specific middleware
     ///     to Wolverine
     /// </summary>
+    // GH-4825. Polecat registers JasperFx's DeadLetterEvent as a document, and its DocumentMapping then
+    // finds the identity by walking GetProperties() for an "Id" member. Nothing statically reflects over
+    // DeadLetterEvent.Id, so ILC drops the property metadata and a native image fails while the first HTTP
+    // chain is built: "Document type 'JasperFx.Events.Daemon.DeadLetterEvent' must have a public property
+    // named 'Id'...". Found by Wolverine.AotSmoke.Polecat.
+    //
+    // Declared here because this is the assembly a Wolverine + Polecat application statically reaches.
+    // The registration itself is Polecat's, so a Polecat app published WITHOUT Wolverine hits the same
+    // gap and wants the annotation upstream; this does not take that fix's place.
+    // Fully qualified deliberately: a `using JasperFx.Events.Daemon` here makes IProjectionCoordinator
+    // ambiguous against Wolverine.Polecat.Distribution's own.
+    [DynamicDependency(DynamicallyAccessedMemberTypes.All, typeof(JasperFx.Events.Daemon.DeadLetterEvent))]
     public static PolecatConfigurationExpression IntegrateWithWolverine(
         this PolecatConfigurationExpression expression,
         Action<PolecatIntegration>? configure = null)
@@ -207,6 +261,11 @@ public static class WolverineOptionsPolecatExtensions
         // PolecatIntegration.Configure adds a PrimeScopedSessionFrame over this holder, so it has to be
         // registered wherever the integration is -- an ancillary-only host included (GH-4145).
         services.TryAddScoped<ScopedDocumentSessionHolder>();
+
+        // GH-4570. The seam generated code calls to put a logical deduplication claim inside the Polecat
+        // session's transaction. Registered here, alongside the frame provider that emits the call, so an
+        // ancillary-only host gets it too.
+        services.TryAddSingleton<IPolecatDeduplicator, PolecatDeduplicator>();
 
         // GH-3109: lets the provider-agnostic [Storage(typeof(IMyStore))] attribute route a handler to
         // a Polecat ancillary store by resolving this provider from the store marker type. Registered

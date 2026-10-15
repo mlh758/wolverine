@@ -66,12 +66,10 @@ internal partial class OracleMessageStore
 
                 await tx.CommitAsync(cancellationToken);
 
-                // Stamp owning store on each row so downstream pipeline routes
-                // its writes back here. See GH-2576.
-                foreach (var envelope in envelopes)
-                {
-                    envelope.Store = this;
-                }
+                // Mirror onto the in-memory envelopes what the UPDATE above just did to their rows:
+                // owning store (GH-2576) and promoted status (GH-4673).
+                DatabasePersistence.MarkPromotedFromScheduled(envelopes, this,
+                    durabilitySettings.AssignedNodeNumber);
 
                 await runtime.EnqueueDirectlyAsync(envelopes);
             }
@@ -129,7 +127,7 @@ internal partial class OracleMessageStore
             clauses.Add($"(id = :id_{i} AND {DatabaseConstants.ReceivedAt} = :uri_{i})");
         }
 
-        return $"UPDATE {SchemaName}.{DatabaseConstants.IncomingTable} SET owner_id = :owner, status = '{EnvelopeStatus.Incoming}' " +
+        return $"UPDATE {SchemaName}.{DatabaseConstants.IncomingTable} SET owner_id = :owner, status = '{EnvelopeStatus.Incoming}'{restartIncomingStaleClock} " +
                $"WHERE status = '{EnvelopeStatus.Scheduled}' AND ({string.Join(" OR ", clauses)})";
     }
 }

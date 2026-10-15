@@ -3,11 +3,14 @@ using JasperFx;
 using JasperFx.CodeGeneration;
 using JasperFx.Core;
 using JasperFx.Core.Reflection;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Wolverine.Attributes;
 using Wolverine.Configuration;
 using Wolverine.ErrorHandling;
+using Wolverine.Persistence;
 using Wolverine.Persistence.Durability;
 using Wolverine.Persistence.Sagas;
 using Wolverine.Runtime.Agents;
@@ -63,6 +66,23 @@ public partial class WolverineRuntime
         Options.LightweightMode = true;
     }
 
+    // GH-4902. When nothing was set explicitly and every message store prefers the same envelope id layout --
+    // SQL Server-ordered ids when SQL Server is the only message storage -- use it
+    private void applyStorePreferredEnvelopeIdGeneration()
+    {
+        if (Options.EnvelopeIdGenerationIsExplicit) return;
+
+        var agreed = MessageStoreCollection.AgreedEnvelopeIdGeneration(_stores.Value.AllStores());
+        if (agreed is not { } generation || generation == Options.EnvelopeIdGeneration) return;
+
+        Options.UseStorePreferredEnvelopeIdGeneration(generation);
+        Envelope.IdGenerator = IdGeneratorFor(generation);
+
+        Logger.LogInformation(
+            "Every message store in this application prefers EnvelopeIdGeneration.{Generation}, so Wolverine is using it for envelope ids. Set WolverineOptions.EnvelopeIdGeneration explicitly to choose otherwise",
+            generation);
+    }
+
     public async Task StartAsync(CancellationToken cancellationToken)
     {
         // Make this idempotent because the AddResourceSetupOnStartup() can cause it to bootstrap twice
@@ -99,6 +119,9 @@ public partial class WolverineRuntime
 
             await _stores.Value.InitializeAsync();
 
+            // GH-4902. Before any listener or agent can create an envelope
+            applyStorePreferredEnvelopeIdGeneration();
+
             // AlwaysMakeScheduledMessagesDurable opts every non-durable scheduled send onto
             // the message store inbox; if no store is configured, we silently fall through
             // to in-process scheduling (lost on restart) — defeating the policy. Surface
@@ -112,12 +135,42 @@ public partial class WolverineRuntime
                     "Configure a message store (e.g. PersistMessagesWithPostgresql) to make the policy effective.");
             }
 
+            // GH-3959: capacity-aware assignment has no default load monitor, on purpose. A node that
+            // advertises nothing is treated by the leader as having unlimited headroom, so falling back
+            // to "no monitor" here would turn the feature on and then quietly make this node the
+            // cluster's preferred placement target -- the opposite of what was asked for. Refuse at
+            // startup instead, where the person can still do something about it.
+            if (Options.Durability.CapacityAwareAssignment && Options.Durability.NodeLoadMonitor == null)
+            {
+                throw new InvalidOperationException(
+                    $"{nameof(DurabilitySettings.CapacityAwareAssignment)} is enabled but no " +
+                    $"{nameof(DurabilitySettings.NodeLoadMonitor)} was supplied. Capacity-aware assignment " +
+                    "needs a way to sample this node's load, and there is no default because what 'load' " +
+                    $"means depends on the application. Assign an {nameof(INodeLoadMonitor)} -- " +
+                    $"{nameof(MemoryPressureLoadMonitor)} covers the memory case -- or set " +
+                    $"{nameof(DurabilitySettings.CapacityAwareAssignment)} back to false.");
+            }
+
+            // GH-4593: a monitor is not enough -- the reading has to survive the round trip through the
+            // message store, and before this every store but PostgreSQL dropped it on the floor. A node
+            // that advertises nothing counts as having unlimited headroom, so the feature does not merely
+            // fail to help there, it makes every node look equally idle. Warn rather than refuse: the
+            // cluster still works, just without the capacity input, and refusing would break an
+            // application that turned the flag on against a store that has since been implemented.
+            if (Options.Durability.CapacityAwareAssignment && !Storage.Nodes.AdvertisesNodeLoad)
+            {
+                Logger.LogWarning(
+                    "{Setting} is enabled and a {Monitor} is configured, but the message store in use ({Store}) does not persist a node's load reading. Every node will advertise nothing, which the leader reads as unlimited headroom, so agent placement will ignore capacity entirely. See {Issue}.",
+                    nameof(DurabilitySettings.CapacityAwareAssignment), nameof(INodeLoadMonitor),
+                    Storage.GetType().Name, "https://github.com/JasperFx/wolverine/issues/4593");
+            }
+
             if (Options.Schedules.Any())
             {
                 // "Silently never fires" is not a degradation, it is a refusal: these modes run no
                 // agents at all, so a registered schedule would be accepted and then simply never
                 // happen — the exact class of quiet failure the recurring feature exists to avoid.
-                if (Options.Durability.Mode is DurabilityMode.Serverless or DurabilityMode.MediatorOnly)
+                if (Options.Durability.Mode is DurabilityMode.Serverless or DurabilityMode.ServerlessWithOutbox or DurabilityMode.MediatorOnly)
                 {
                     var names = Options.Schedules.Select(x => x.Name).Join(", ");
                     throw new InvalidOperationException(
@@ -199,6 +252,12 @@ public partial class WolverineRuntime
             // listener starts.
             Handlers.AssertPreBuiltTypesExist(Options);
 
+            // GH-4527. Same intent as the line above: fail the deploy here, before storage migration or any
+            // transport connects, rather than one missing name at a time from inside whichever DI factory
+            // happens to be resolved first. A host with two missing Aspire references used to fail twice, on
+            // two deploys, each time after persistence had already migrated.
+            assertNamedConnectionStringsExist();
+
             // Pre-populate the message-type-name cache so the per-message ToMessageTypeName()
             // hot path inside Envelope construction never pays the first-occurrence reflection
             // cost (attribute reads, interface walks, generic-type pretty-printing).
@@ -223,26 +282,26 @@ public partial class WolverineRuntime
             _hasStarted = true; // Have to do this before you can use MessageBus
             await startAgentsAsync();
 
-            if (Options.Durability.AssignedNodeNumber == 0)
-            {
-                throw new InvalidOperationException(
-                    "This Wolverine node was not able to create a non-zero assigned node number");
-            }
-            else
-            {
-                Logger.LogInformation("Wolverine assigned node id for envelope persistence is {NodeNumber}", Options.Durability.AssignedNodeNumber);
-            }
-
             switch (Options.Durability.Mode)
             {
                 case DurabilityMode.Balanced:
                     await loadAgentRestrictionsAsync();
+
+                    // GH-4734. Claim the node row, and with it this node's real assigned node number, BEFORE
+                    // any listener can start stamping owner_id on inbox rows with it. Done after the
+                    // transports, a node starting on a queue backlog claimed that backlog under the
+                    // per-process default node number -- a number in no node table -- and the orphaned
+                    // message sweep then released it as belonging to a departed node and ran it again.
+                    await registerLocalNodeAsync();
+
                     await startMessagingTransportsAsync();
                     startInMemoryScheduledJobs();
                     await startNodeAgentWorkflowAsync();
                     _idleAgentCleanupLoop = Task.Run(executeIdleSendingAgentCleanup, Cancellation);
                     break;
                 case DurabilityMode.Solo:
+                    // Solo has always registered before the transports start, from inside startAgentsAsync
+                    // above -- see NodeAgentController.StartSoloModeAsync
                     await startMessagingTransportsAsync();
                     startInMemoryScheduledJobs();
                     _idleAgentCleanupLoop = Task.Run(executeIdleSendingAgentCleanup, Cancellation);
@@ -251,7 +310,39 @@ public partial class WolverineRuntime
                 case DurabilityMode.Serverless:
                     Options.Transports.RemoveLocal();
                     Options.Policies.DisableConventionalLocalRouting();
-                    Options.Policies.Add(new ServerlessEndpointsMustBeInlinePolicy());
+                    // Normally already registered by the WolverineRuntime constructor, ahead of resource setup
+                    var inlinePolicy = Options.Transports.EndpointPolicies.OfType<ServerlessEndpointsMustBeInlinePolicy>()
+                        .FirstOrDefault();
+                    if (inlinePolicy == null)
+                    {
+                        inlinePolicy = new ServerlessEndpointsMustBeInlinePolicy();
+                        Options.Policies.Add(inlinePolicy);
+                    }
+
+                    await startMessagingTransportsAsync();
+
+                    // GH-5016. Endpoint policies run lazily inside Endpoint.Compile(), so compile every
+                    // known endpoint now to collect every durable endpoint the policy downgraded, then say
+                    // so ONCE rather than once per endpoint
+                    foreach (var endpoint in Options.Transports.AllEndpoints()) endpoint.Compile(this);
+                    inlinePolicy.WarnAboutDowngradedDurableEndpoints(Logger);
+                    break;
+
+                case DurabilityMode.ServerlessWithOutbox:
+                    // GH-5046. Read what the application configured for local queues before they are removed
+                    var localTransport = Options.Transports.ForScheme(TransportConstants.Local) as LocalTransport;
+                    var routesHandledMessageTypes = !Options.LocalRoutingConventionDisabled;
+
+                    Options.Transports.RemoveLocal();
+                    Options.Policies.DisableConventionalLocalRouting();
+                    // Normally already registered by the WolverineRuntime constructor, ahead of resource setup
+                    if (!Options.Transports.EndpointPolicies.OfType<ServerlessWithOutboxEndpointsPolicy>().Any())
+                    {
+                        Options.Policies.Add(new ServerlessWithOutboxEndpointsPolicy());
+                    }
+
+                    // Before anything can route: locally handled and scheduled messages go to the inbox for a pass
+                    await startDurabilityPassInboxAsync(localTransport, routesHandledMessageTypes);
 
                     await startMessagingTransportsAsync();
                     break;
@@ -260,10 +351,24 @@ public partial class WolverineRuntime
                     break;
             }
 
+            // GH-4734: reported after the mode switch rather than before it. In Balanced mode the number this
+            // used to print was the per-process default, not the one the node had been assigned -- the
+            // registration that produces the real one had not run yet. Which is the bug this moved: the
+            // listeners had not run yet either, and they were about to stamp that same provisional number
+            // onto every inbox row they claimed.
+            if (Options.Durability.AssignedNodeNumber == 0)
+            {
+                throw new InvalidOperationException(
+                    "This Wolverine node was not able to create a non-zero assigned node number");
+            }
+
+            Logger.LogInformation("Wolverine assigned node id for envelope persistence is {NodeNumber}",
+                Options.Durability.AssignedNodeNumber);
+
             // Pre-populate the per-message-type router cache so the per-message
-            // RoutingFor() hot path never pays the first-occurrence
-            // CloseAndBuildAs over MessageRouter<T> / EmptyMessageRouter<T>.
-            // Must happen AFTER the messaging transports start (so external-
+            // RoutingFor() hot path never pays the first-occurrence router
+            // construction (a reflective generic close until GH-4848; a plain
+            // constructor call since). Must happen AFTER the messaging transports start (so external-
             // transport route sources can resolve their endpoints), but
             // before RuntimeIsFullyStarted observers run. AOT pillar follow-up
             // #2769 (Option A).
@@ -276,7 +381,7 @@ public partial class WolverineRuntime
             //     effect of building a route), violating the mode's "no
             //     transports" contract.
             //   - Serverless: RemoveLocal() above stripped the local transport,
-            //     but MessageRouterBase<T>'s ctor unconditionally calls
+            //     but MessageRouterBase's ctor unconditionally calls
             //     GetOrBuildSendingAgent(TransportConstants.DurableLocalUri)
             //     for scheduled-envelope fallback, which now throws
             //     UnknownTransportException. Skipping the pre-population avoids
@@ -285,10 +390,10 @@ public partial class WolverineRuntime
             //     either target external endpoints directly or never invoke
             //     routing for local-only types.
             //
-            // TODO: a follow-up could make MessageRouterBase<T>'s LocalDurableQueue
+            // TODO: a follow-up could make MessageRouterBase's LocalDurableQueue
             // lazy / nullable so Serverless apps reclaim the AOT cold-start win.
             var mode = Options.Durability.Mode;
-            if (mode != DurabilityMode.MediatorOnly && mode != DurabilityMode.Serverless)
+            if (mode is not (DurabilityMode.MediatorOnly or DurabilityMode.Serverless or DurabilityMode.ServerlessWithOutbox))
             {
                 PrepopulateRoutingCache(Handlers.AllMessageTypes());
             }
@@ -325,6 +430,43 @@ public partial class WolverineRuntime
     internal void OnApplicationStopping()
     {
         Logger.LogInformation("Application stopping signal received");
+    }
+
+    /// <summary>
+    /// GH-4527. Validate every connection string this application asked for by name in ONE pass, before
+    /// storage migration and before any transport connects, and throw once naming all of them.
+    ///
+    /// <para>
+    /// Previously each name was checked lazily inside the DI factory that consumed it, so the failure arrived
+    /// one name at a time -- after persistence had already migrated and any earlier transport had already
+    /// connected -- and the message named the key and nothing else. The dominant cause is Aspire wiring (a
+    /// resource never added in the AppHost, or added and never referenced from the project), which is what
+    /// the thrown message now spells out.
+    /// </para>
+    /// </summary>
+    private void assertNamedConnectionStringsExist()
+    {
+        if (!Options.NamedConfigurationDependencies.Any()) return;
+
+        // A host assembled without IConfiguration at all -- some test hosts, some embedded scenarios -- has
+        // nothing to validate against. The consuming factory still throws on its own in that case, so nothing
+        // is being let through silently here.
+        var configuration = Services.GetService<IConfiguration>();
+        if (configuration == null) return;
+
+        var missing = Options.NamedConfigurationDependencies
+            .Where(x => configuration.GetConnectionString(x.Name).IsEmpty())
+            .ToArray();
+
+        if (!missing.Any()) return;
+
+        // Keys only, never values -- a connection string is a credential.
+        var configured = configuration.GetSection("ConnectionStrings").GetChildren()
+            .Select(x => x.Key)
+            .OrderBy(x => x)
+            .ToArray();
+
+        throw new MissingNamedConnectionStringsException(missing, configured);
     }
 
     private bool _hasMigratedStorage;
@@ -582,6 +724,30 @@ public partial class WolverineRuntime
         Restrictions = state.Restrictions;
     }
 
+    /// <summary>
+    ///     GH-5046. Only under <see cref="DurabilityMode.ServerlessWithOutbox" />. Puts the inbox for the durability
+    ///     pass at the durable local queue's address, replacing a durable local queue that something built there
+    ///     before the local transport was removed (GH-5052), and drops every router built before it
+    /// </summary>
+    private async Task startDurabilityPassInboxAsync(LocalTransport? localTransport, bool routesHandledMessageTypes)
+    {
+        // GH-5052. A router built during resource setup, before the local transport was removed, builds a durable
+        // local queue that would otherwise stay in the active sending agents
+        foreach (var stale in Endpoints.ActiveSendingAgents().OfType<DurableLocalQueue>().ToArray())
+        {
+            await _endpoints.RemoveSendingAgentAsync(stale.Destination);
+            stale.SafeDispose();
+        }
+
+        var inbox = new DurabilityPassInbox(this, localTransport, routesHandledMessageTypes);
+        _endpoints.StoreSendingAgent(inbox);
+
+        PassInbox = inbox;
+
+        // Anything routed before this point was routed without it
+        clearAllRouting();
+    }
+
     private void startInMemoryScheduledJobs()
     {
         ScheduledJobs =
@@ -615,6 +781,8 @@ public partial class WolverineRuntime
                 topology.ResolveMessageTypeNames(knownMessageTypes);
             }
         }
+
+        Options.MessagePartitioning.AssertTopologyGroupingIsUnambiguous(Handlers.Chains.Select(x => x.MessageType));
 
         // Build message-type-to-ancillary-store mapping for durable inbox routing.
         // When a handler targets an ancillary store on a different database, incoming
@@ -652,7 +820,7 @@ public partial class WolverineRuntime
         }
 
         // No local queues if running in Serverless
-        if (Options.Durability.Mode == DurabilityMode.Serverless)
+        if (Options.Durability.Mode is DurabilityMode.Serverless or DurabilityMode.ServerlessWithOutbox)
         {
             Options.Transports.RemoveLocal();
         }
@@ -767,13 +935,14 @@ public partial class WolverineRuntime
     {
         if (markerTypes.Length == 0) return null;
 
-        // Cheap pre-filter: no marker anywhere in the dependency graph means there is nothing to infer,
-        // and the provider (which may build DbContexts to answer) never has to be consulted.
-        var dependencies = chain.ServiceDependencies(_container, Type.EmptyTypes).ToArray();
-        if (!markerTypes.Any(dependencies.Contains)) return null;
-
         try
         {
+            // Cheap pre-filter: no marker anywhere in the dependency graph means there is nothing to infer,
+            // and the provider (which may build DbContexts to answer) never has to be consulted. A load
+            // attribute reaches its store without appearing in that graph.
+            var dependencies = chain.ServiceDependencies(_container, Type.EmptyTypes).ToArray();
+            if (!markerTypes.Any(dependencies.Contains) && !chain.DeclarativelyLoadedEntityTypes().Any()) return null;
+
             var owner = Options.CodeGeneration.GetPersistenceProviders(chain, _container)
                 .TryDetermineTransactionOwnerType(chain, _container);
 
@@ -1082,7 +1251,9 @@ public partial class WolverineRuntime
             // The failure rule lives on the batch handler chain (the T[] handler), matching any exception:
             // retry the whole batch until it has failed `attempts` times, then re-run each member as its
             // own size-1 batch so only the failing one dead-letters.
-            var batchChain = Handlers.ChainFor(batch.Batcher.BatchMessageType);
+            // Includes a batch handler registered with AddMessageHandler, which would otherwise lose this rule
+            // without a word: it is not a discovered chain, but it is the chain the batch runs on.
+            var batchChain = Handlers.ChainOrRegisteredHandlerChainFor(batch.Batcher.BatchMessageType);
             if (batchChain == null)
             {
                 continue;

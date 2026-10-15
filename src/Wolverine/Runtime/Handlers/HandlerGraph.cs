@@ -113,7 +113,9 @@ public partial class HandlerGraph : ICodeFileCollectionWithServices, IWithFailur
     {
         if (_hasGrouped)
         {
-            throw new InvalidOperationException("This HandlerGraph has already been grouped/compiled");
+            // GH-4532: the cause is almost always configuration attempted after the host is up.
+            throw new InvalidOperationException(
+                "This HandlerGraph has already been grouped/compiled. Configure opts.Discovery inside UseWolverine(), not after the host has started.");
         }
     }
 
@@ -133,6 +135,28 @@ public partial class HandlerGraph : ICodeFileCollectionWithServices, IWithFailur
         if (_chains.TryFind(messageType, out var chain)) return chain;
 
         return null;
+    }
+
+    /// <summary>
+    ///     The chain that owns the handling of <paramref name="messageType" />: the discovered chain if there is
+    ///     one, otherwise the chain of a pre-canned <see cref="MessageHandler" /> registered with
+    ///     <see cref="WolverineOptions.AddMessageHandler(Type, IMessageHandler)" />. Returns null when neither
+    ///     exists.
+    /// </summary>
+    /// <remarks>
+    ///     <see cref="ChainFor(Type)" /> reads the discovered chains only. That is right for anything that needs
+    ///     generated code, and wrong for anything that only needs the chain's runtime settings -- batching, for
+    ///     one, which needs the batch type's chain for its failure rules and its envelope identity, and would
+    ///     otherwise refuse a batch handler that is perfectly able to run. Reads the pre-canned map directly
+    ///     rather than through <see cref="HandlerFor(Type)" />, so a miss is not memoized and an
+    ///     <see cref="IAgentCommand" /> type does not take the agent path.
+    /// </remarks>
+    internal HandlerChain? ChainOrRegisteredHandlerChainFor(Type messageType)
+    {
+        return ChainFor(messageType)
+               ?? (_handlers.TryFind(messageType, out var handler) && handler is MessageHandler { Chain: { } chain }
+                   ? chain
+                   : null);
     }
 
     public HandlerChain? ChainFor<T>()
@@ -475,6 +499,8 @@ public partial class HandlerGraph : ICodeFileCollectionWithServices, IWithFailur
             }
 
             methods = Discovery.FindCalls(options);
+
+            warnAboutNearMissHandlerTypes(logger);
         }
 
         var calls = methods.Select(x => new HandlerCall(x.Item1, x.Item2));
@@ -487,6 +513,23 @@ public partial class HandlerGraph : ICodeFileCollectionWithServices, IWithFailur
         else
         {
             AddRange(calls);
+        }
+    }
+
+    /// <summary>
+    /// GH-4702. Inside the scanning branch only, and after FindCalls has populated the conventional includes.
+    /// A plural-named class with handler-shaped methods is otherwise invisible: it never enters the handler
+    /// query, so nothing downstream can name it -- the one signal today is an Information-level "No routes
+    /// can be determined" long after startup, with no mention of the class.
+    /// </summary>
+    private void warnAboutNearMissHandlerTypes(ILogger logger)
+    {
+        foreach (var type in Discovery.FindNearMissHandlerTypes())
+        {
+            logger.LogWarning(
+                "Type {HandlerType} has handler-shaped methods but was not discovered: conventional discovery matches the '{HandlerSuffix}' / '{ConsumerSuffix}' suffix exactly. Rename it to {Suggestion}, mark it [WolverineHandler], or add it with opts.Discovery.IncludeType<{TypeName}>().",
+                type.FullNameInCode(), HandlerChain.HandlerSuffix, HandlerChain.ConsumerSuffix,
+                type.Name[..^1], type.Name);
         }
     }
 
@@ -697,9 +740,15 @@ public partial class HandlerGraph : ICodeFileCollectionWithServices, IWithFailur
     {
         lock (_messageTypesLock)
         {
-            if (_messageTypes.TryFind(messageAlias, out var type))
+            if (_messageTypes.TryFind(messageAlias, out var existing))
             {
-                throw new InvalidOperationException($"Cannot register type {type} with alias {messageAlias} because alias is already used");
+                // GH-4532: the old message interpolated the type it found in the map, not the one being
+                // registered, so it named the wrong half of the collision -- and said nothing about
+                // [MessageIdentity], which is how you resolve one.
+                throw new InvalidOperationException(
+                    $"Message types {existing.FullNameInCode()} and {messageType.FullNameInCode()} both resolve to the message alias '{messageAlias}'. " +
+                    "Aliases must be unique because the alias is what Wolverine writes on the wire to identify the message type. " +
+                    $"Give one of them a distinct alias with [{nameof(MessageIdentityAttribute).Replace("Attribute", "")}(\"...\")], or rename the type.");
             }
 
             _messageTypes = _messageTypes.AddOrUpdate(messageAlias, messageType);

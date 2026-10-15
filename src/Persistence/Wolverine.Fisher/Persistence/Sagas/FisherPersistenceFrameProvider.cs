@@ -12,6 +12,7 @@ using Wolverine.Configuration;
 using Wolverine.Fisher.Codegen;
 using Wolverine.Fisher.Requirements;
 using Wolverine.Persistence;
+using Wolverine.Persistence.Codegen;
 using Wolverine.Persistence.Sagas;
 using Wolverine.Runtime;
 
@@ -34,6 +35,50 @@ internal partial class FisherPersistenceFrameProvider : IPersistenceFrameProvide
     {
         var idProp = sagaType.GetProperty("Id", BindingFlags.Public | BindingFlags.Instance);
         return idProp?.PropertyType ?? typeof(Guid);
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    ///     GH-4571, the Fisher half of GH-4505. Wolverine's message store here is a second
+    ///     <c>SqliteConnection</c> to the same file the document store uses, so the claim is enlisted as an
+    ///     <c>ITransactionParticipant</c> — which is handed the live connection and transaction — rather than
+    ///     queued as a storage operation the way the Marten twin does. On SQLite that is a correctness
+    ///     requirement and not a preference: a write on a second connection blocks on the first one's write
+    ///     lock from inside its transaction, which hangs rather than failing.
+    ///     <para>
+    ///     Fisher has no database-per-tenant composition, so there is no tenancy branch to guard the way the
+    ///     Marten and Polecat twins do.
+    ///     </para>
+    /// </remarks>
+    public bool TryBuildTransactionalDeduplication(IChain chain, Variable deduplicationId,
+        DeduplicationRequirement requirement, IServiceContainer container,
+        [NotNullWhen(true)] out TransactionalDeduplication? deduplication)
+    {
+        deduplication = null;
+
+        // Not CanApply -- that answers "could this provider own the chain's transaction?", and a chain that
+        // merely takes an IDocumentSession satisfies it without ever committing one. Riding a transaction
+        // that is never committed writes no claim at all, so the endpoint silently loses deduplication
+        // entirely: every replay runs. Ask for the commit frame itself, which is the thing the claim has to
+        // ride. See the Marten and Polecat twins.
+        if (!chain.Middleware.OfType<CreateDocumentSessionFrame>().Any()) return false;
+        if (!chain.Postprocessors.OfType<DocumentSessionSaveChanges>().Any()) return false;
+
+        var marker = chain.DetermineAncillaryStoreType();
+        var check = new FisherDeduplicationClaimExistsFrame(deduplicationId, marker);
+
+        deduplication = new TransactionalDeduplication
+        {
+            Check = check,
+            IsDuplicate = check.Variable,
+            Claim = new QueueFisherDeduplicationClaimFrame(deduplicationId, check.Variable, marker,
+                requirement.Window),
+            CommitRaceWrapper = new RefuseDuplicateClaimAtCommitFrame(
+                FisherDeduplicationFailures.Classifier,
+                lost => chain.BuildDeduplicationStopCondition(lost, DeduplicationOutcome.Duplicate, requirement))
+        };
+
+        return true;
     }
 
     public void ApplyTransactionSupport(IChain chain, IServiceContainer container)
@@ -60,6 +105,15 @@ internal partial class FisherPersistenceFrameProvider : IPersistenceFrameProvide
     public void ApplyTransactionSupport(IChain chain, IServiceContainer container, Type entityType)
     {
         ApplyTransactionSupport(chain, container);
+    }
+
+    /// <summary>
+    /// GH-4631. Fisher is designated by one of its own store or session interfaces, which is also what an
+    /// ancillary store marker type (<c>AddFisherStore&lt;IMyStore&gt;()</c>) derives from.
+    /// </summary>
+    public bool OwnsStorageType(Type storageType, IServiceContainer container)
+    {
+        return storageType.CanBeCastTo<IDocumentStore>() || storageType.CanBeCastTo<IQuerySession>();
     }
 
     public bool CanApply(IChain chain, IServiceContainer container)
@@ -91,15 +145,27 @@ internal partial class FisherPersistenceFrameProvider : IPersistenceFrameProvide
         // vanished, with no exception.
         //
         // GH-3956: same hole on the DOCUMENT side. See MartenPersistenceFrameProvider.CanApply.
-        // IDocumentReadOperations is probed but NOT matched, exactly as IQuerySession has always been --
-        // a read-only parameter is not evidence that the chain writes anything.
-        return serviceDependencies.Any(x => x == typeof(IDocumentSession) || x == typeof(IDocumentOperations)
-                                            || x.Closes(typeof(IEventStream<>))
-                                            || x == typeof(global::JasperFx.Events.IEventOperations)
-                                            || x == typeof(global::JasperFx.Events.IEventStoreOperations)
-                                            || x == typeof(global::Fisher.Events.EventOperations)
-                                            || x == typeof(global::JasperFx.Events.Documents.IDocumentSessionOperations)
-                                            || x == typeof(global::JasperFx.Events.Documents.IDocumentWriteOperations));
+        // IDocumentReadOperations and IQuerySession are probed but not matched on their own -- a read-only
+        // parameter is not evidence that the chain writes anything.
+        if (serviceDependencies.Any(x => x == typeof(IDocumentSession) || x == typeof(IDocumentOperations)
+                                         || x.Closes(typeof(IEventStream<>))
+                                         || x == typeof(global::JasperFx.Events.IEventOperations)
+                                         || x == typeof(global::JasperFx.Events.IEventStoreOperations)
+                                         || x == typeof(global::Fisher.Events.EventOperations)
+                                         || x == typeof(global::JasperFx.Events.Documents.IDocumentSessionOperations)
+                                         || x == typeof(global::JasperFx.Events.Documents.IDocumentWriteOperations)))
+        {
+            return true;
+        }
+
+        // GH-4907: the IQuerySession permutation of GH-2941, as fixed for Marten in #4910. A read-only
+        // parameter is served by casting the outbox-enrolled IDocumentSession, so a chain that reads AND
+        // sends messages queues its envelopes on a session nothing commits: a scheduled message is never
+        // handled, and a durable local one only ever runs from memory. Reading alone still does not claim
+        // the chain; reading plus sending does.
+        return serviceDependencies.Any(x => x == typeof(IQuerySession)
+                                            || x == typeof(global::JasperFx.Events.Documents.IDocumentReadOperations))
+               && chain.CanSendMessages(container);
     }
 
     private static bool ChainHasFisherSessionAttributes(IChain chain)

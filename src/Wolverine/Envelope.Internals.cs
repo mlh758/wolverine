@@ -35,7 +35,15 @@ public partial class Envelope
     {
         Message = message;
         Sender = agent;
-        Serializer = message is ISerializable ? IntrinsicSerializer.Instance : agent.Endpoint.DefaultSerializer;
+        // GH-4720: this constructor, not MessageRoute, is what the agent control path goes through --
+        // IAgentRuntime.InvokeAsync sends via EndpointFor(controlUri), and DestinationEndpoint builds the
+        // envelope here. Compression is chosen by picking a serializer with its own content type, so the
+        // receiving node resolves the right reader from the envelope header rather than sniffing the payload.
+        Serializer = message is ISerializable
+            ? agent.Endpoint.CompressAgentCommands && message is Runtime.Agents.IAgentCommand
+                ? CompressedIntrinsicSerializer.Instance
+                : IntrinsicSerializer.Instance
+            : agent.Endpoint.DefaultSerializer;
         ContentType = Serializer!.ContentType;
         Destination = agent.Destination;
         ReplyUri = agent.ReplyUri?.MaybeCorrectScheme(agent.Destination.Scheme);
@@ -164,6 +172,13 @@ public partial class Envelope
 
     [JsonIgnore]
     internal bool HasBeenAcked { get; set; }
+
+    /// <summary>
+    /// Latches the failure acknowledgement so the sender gets at most one per envelope, however many
+    /// error handling paths try to send it
+    /// </summary>
+    [JsonIgnore]
+    internal bool HasSentFailureAcknowledgement { get; set; }
 
     /// <summary>
     /// GH-4012. Counts real attempts to settle (ack/nack) this delivery with its broker, shared by
@@ -638,6 +653,7 @@ public partial class Envelope
         BatchPendingSettled = false;
         BatchPipelineCounted = false;
         HasBeenAcked = false;
+        HasSentFailureAcknowledgement = false;
         AckAttempts = 0;
         WireTap = null;
         Store = null;

@@ -2,6 +2,7 @@ using JasperFx.Core;
 using Raven.Client;
 using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Queries;
+using Raven.Client.Documents.Session;
 using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Documents.Session;
 using Wolverine.Persistence.Durability;
@@ -13,14 +14,21 @@ public partial class RavenDbMessageStore : IMessageInbox
 {
     public async Task ScheduleExecutionAsync(Envelope envelope)
     {
+        // GH-4216: a Handled document is never resurrected by a late retry booking. It is the dedup window's
+        // record that the message completed; flipping it back to Scheduled with its body intact ran the
+        // message a second time. The check lives in the patch script rather than the query on purpose: a
+        // query on id() alone needs no index, while "and m.Status != $handled" made this an index query that
+        // CI's RavenDB refused with "Cannot perform bulk operation. Index is stale."
         var query = $@"
             from IncomingMessages as m
             where id() = $id
             update {{
-                this.ExecutionTime = $time;
-                this.Status = $status;
-                this.Attempts = $attempts;
-                this.OwnerId = 0;
+                if (this.Status !== $handled) {{
+                    this.ExecutionTime = $time;
+                    this.Status = $status;
+                    this.Attempts = $attempts;
+                    this.OwnerId = 0;
+                }}
             }}";
 
         var operation = new PatchByQueryOperation(new IndexQuery
@@ -32,12 +40,20 @@ public partial class RavenDbMessageStore : IMessageInbox
                 {"id", _identity(envelope)},
                 {"attempts", envelope.Attempts},
                 {"status", EnvelopeStatus.Scheduled},
+                {"handled", EnvelopeStatus.Handled},
                 {"time", envelope.ScheduledTime}
             }
         });
         
         var op = await _store.Operations.SendAsync(operation);
         await op.WaitForCompletionAsync();
+    }
+
+    public async Task DeleteIncomingEnvelopeAsync(Envelope envelope)
+    {
+        using var session = _store.OpenAsyncSession();
+        session.Delete(_identity(envelope));
+        await session.SaveChangesAsync();
     }
 
     public async Task MoveToDeadLetterStorageAsync(Envelope envelope, Exception? exception)
@@ -71,11 +87,9 @@ public partial class RavenDbMessageStore : IMessageInbox
         using var session = _store.OpenAsyncSession();
         session.Advanced.UseOptimisticConcurrency = true;
         
-        var incoming = new IncomingMessage(envelope, this);
-
         try
         {
-            await session.StoreAsync(incoming);
+            await StoreIncomingAsync(session, envelope);
             await session.SaveChangesAsync();
         }
         catch (ConcurrencyException)
@@ -93,8 +107,7 @@ public partial class RavenDbMessageStore : IMessageInbox
         {
             foreach (var envelope in envelopes)
             {
-                var incoming = new IncomingMessage(envelope, this);
-                await session.StoreAsync(incoming);
+                await StoreIncomingAsync(session, envelope);
             }
 
             await session.SaveChangesAsync();
@@ -111,6 +124,25 @@ public partial class RavenDbMessageStore : IMessageInbox
         {
             // At least one envelope is already in the inbox; same fallback contract.
             throw new DuplicateIncomingEnvelopeException(await findDuplicatesAsync(envelopes));
+        }
+    }
+
+    /// <summary>
+    /// GH-5036. A document stored already Handled, as the deduplication of a push receiver under
+    /// <see cref="DurabilityMode.ServerlessWithOutbox"/> does for every message, carries the same
+    /// <c>@expires</c> that <see cref="MarkIncomingEnvelopeAsHandledAsync(Envelope)"/> stamps, so RavenDb's
+    /// expiration feature removes it when that is turned on. A durability pass deletes it by
+    /// <see cref="IncomingMessage.KeepUntil"/> either way
+    /// </summary>
+    internal async Task StoreIncomingAsync(IAsyncDocumentSession session, Envelope envelope)
+    {
+        var incoming = new IncomingMessage(envelope, this);
+        await session.StoreAsync(incoming);
+
+        if (incoming.KeepUntil.HasValue)
+        {
+            session.Advanced.GetMetadataFor(incoming)[Constants.Documents.Metadata.Expires] =
+                incoming.KeepUntil.Value.UtcDateTime;
         }
     }
 
@@ -138,25 +170,57 @@ public partial class RavenDbMessageStore : IMessageInbox
         return (await session.LoadAsync<IncomingMessage>(identity, cancellation)) != null;
     }
 
-    public Task RescheduleExistingEnvelopeForRetryAsync(Envelope envelope)
+    // GH-5049. Same identity as ExistsAsync, but only a document the inbox has finished with counts
+    public async Task<bool> IsHandledAsync(Envelope envelope, CancellationToken cancellation)
+    {
+        using var session = _store.OpenAsyncSession();
+        var identity = IdentityFor(envelope);
+        var message = await session.LoadAsync<IncomingMessage>(identity, cancellation);
+        return message?.Status == EnvelopeStatus.Handled;
+    }
+
+    public async Task RescheduleExistingEnvelopeForRetryAsync(Envelope envelope)
     {
         envelope.Status = EnvelopeStatus.Scheduled;
         envelope.OwnerId = TransportConstants.AnyNode;
 
-        return StoreIncomingAsync(envelope);
+        // GH-4216. This was INSERT-only, so it threw DuplicateIncomingEnvelopeException whenever a document already
+        // existed for the identity -- which is the normal case this method exists for (GH-2462 / GH-2823 on the
+        // relational stores). Update first, insert only when nothing is there, and leave a Handled document
+        // alone: the message already completed, so a retry booked after the fact is discarded
+        using var session = _store.OpenAsyncSession();
+        var existing = await session.LoadAsync<IncomingMessage>(_identity(envelope));
+
+        if (existing == null)
+        {
+            await StoreIncomingAsync(envelope);
+            return;
+        }
+
+        if (existing.Status == EnvelopeStatus.Handled)
+        {
+            return;
+        }
+
+        await ScheduleExecutionAsync(envelope);
     }
 
     public async Task MarkIncomingEnvelopeAsHandledAsync(Envelope envelope)
     {
         var expirationTime = DateTimeOffset.UtcNow.Add(_options.Durability.KeepAfterMessageHandling);
         
+        // GH-4785: the owner goes with the status. A Handled document is kept only for idempotency and
+        // nothing recovers it, so it has no owner -- the same as a document inserted already Handled
+        // (Envelope.ForPersistedHandled). Safe because the agent's listener discovery now filters on
+        // Incoming as well; see RavenDbDurabilityAgent.findListenersWithRecoverableIncomingAsync.
         var query = $@"
             from IncomingMessages as m
             where id() = $id
             update {{
                 this[""@metadata""][""@expires""] = $expire;
+                this.KeepUntil = $expire;
                 this.Status = $status;
-                
+                this.OwnerId = $owner;
             }}";
 
 
@@ -168,7 +232,8 @@ public partial class RavenDbMessageStore : IMessageInbox
             {
                 {"id", _identity(envelope)},
                 {"expire", expirationTime},
-                {"status", EnvelopeStatus.Handled}
+                {"status", EnvelopeStatus.Handled},
+                {"owner", TransportConstants.AnyNode}
             }
         });
         
@@ -180,13 +245,15 @@ public partial class RavenDbMessageStore : IMessageInbox
     {
         var expirationTime = DateTimeOffset.UtcNow.Add(_options.Durability.KeepAfterMessageHandling);
         
+        // GH-4785: see the single-envelope overload above -- the batched patch has to release the owner too.
         var query = $@"
             from IncomingMessages as m
             where id() in ($ids)
             update {{
                 this[""@metadata""][""@expires""] = $expire;
+                this.KeepUntil = $expire;
                 this.Status = $status;
-                
+                this.OwnerId = $owner;
             }}";
 
 
@@ -199,7 +266,8 @@ public partial class RavenDbMessageStore : IMessageInbox
             {
                 {"ids", identities},
                 {"expire", expirationTime},
-                {"status", EnvelopeStatus.Handled}
+                {"status", EnvelopeStatus.Handled},
+                {"owner", TransportConstants.AnyNode}
             }
         });
         
@@ -212,7 +280,7 @@ public partial class RavenDbMessageStore : IMessageInbox
         using var session = _store.OpenAsyncSession();
         var command = $@"
 from IncomingMessages as m
-where m.OwnerId = $owner and m.Destination = $uri
+where m.OwnerId = $owner and m.ReceivedAt = $uri
 update
 {{
     m.OwnerId = 0
@@ -226,7 +294,8 @@ update
             QueryParameters = new Parameters()
             {
                 {"owner", ownerId},
-                {"uri", receivedAt}
+                // GH-4216: the document's property is ReceivedAt (there is no Destination), stored as the Uri's string
+                {"uri", receivedAt.ToString()}
             }
         };
 

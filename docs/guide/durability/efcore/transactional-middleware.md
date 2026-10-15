@@ -97,9 +97,10 @@ The `[NonTransactional]` attribute can be placed on individual handler methods o
 
 By default, the EF Core middleware will run in `Eager` mode meaning that Wolverine
 will call `DbContext.Database.BeginTransactionAsync()` before your message handler or HTTP
-endpoint handler. We do this so that bulk operations can succeed. If all you need to do is
-persist entities such that `DbContext.SaveChangesAsync()` gives you all the transactional integrity
-you need, you can opt into lightweight transaction code generation instead:
+endpoint handler. We do this so that set-based operations -- `ExecuteUpdateAsync`,
+`ExecuteDeleteAsync`, raw SQL, a stored procedure -- have a transaction to run inside of. If all
+you need to do is persist entities such that `DbContext.SaveChangesAsync()` gives you all the
+transactional integrity you need, you can opt into lightweight transaction code generation instead:
 
 <!-- snippet: sample_using_lightweight_ef_core_transactions -->
 <a id='snippet-sample_using_lightweight_ef_core_transactions'></a>
@@ -144,6 +145,177 @@ public class LightweightAttributeHandler
 <sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/EfCoreTests/transaction_middleware_mode_tests.cs#L270-L279' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_explicit_usage_of_transaction_middleware_mode' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
+## Lightweight Mode and the Outbox <Badge type="tip" text="6.41" />
+
+`Lightweight` mode skips the explicit `BeginTransactionAsync()`, but it does not skip the outbox. Wolverine
+enrolls your `DbContext` in the outbox either way, so the rows for any message you cascade or publish out of a
+handler are written by the very same `SaveChangesAsync()` call that saves your entities. Either both land or
+neither does.
+
+::: warning
+Before 6.41 that was only true in `Eager` mode and for HTTP endpoints. A message handler in `Lightweight` mode
+buffered its cascades in memory and then wrote them in a *second* database call, after `SaveChangesAsync()` had
+already committed. Nothing was ever sent early, so you would not have seen a duplicate or an out-of-order
+message -- but a failure in between left you with the entity row and no message to go with it, which is exactly
+what the outbox exists to prevent.
+:::
+
+Two more things follow from the enrollment, and both are worth knowing before you move a handler to
+`Lightweight`:
+
+* Your domain event scrapers run. See [Publishing Domain Events](/guide/durability/efcore/domain-events) --
+  `PublishDomainEventsFromEntityFrameworkCore()` was inert in `Lightweight` mode before 6.41, in all three of
+  its forms.
+* `AutoApplyTransactions(IdempotencyStyle.Eager)` really does check the inbox now. The insert behind that check
+  works perfectly well inside the implicit transaction `SaveChangesAsync()` opens, so there was never a reason
+  for `Lightweight` to opt out of it -- but before 6.41 it silently did, and you got no deduplication at all.
+
+::: tip
+The one thing `Lightweight` genuinely cannot give you is a rollback. There is no explicit transaction, so a
+handler that calls `SaveChangesAsync()` itself and then throws has already committed. What you get from
+`Lightweight` is atomicity between the entity write and the outgoing messages, not a handler-wide undo. If you
+want the undo, use `Eager`.
+:::
+
+### EnableRetryOnFailure and Eager mode <Badge type="tip" text="6.41" />
+
+EF Core's retrying execution strategy will not let you open your own transaction, and `Eager` mode opens one on
+your behalf before your handler runs. Put the two together and every single message through that handler fails,
+with an EF Core exception that never mentions Wolverine.
+
+Wolverine now catches that combination while it is building the handler, so you find out at startup instead of
+in production:
+
+```
+<handler> uses the EF Core transactional middleware in TransactionMiddlewareMode.Eager mode, but
+MyDbContext is registered with EnableRetryOnFailure(). EF Core's retrying execution strategy does not
+allow the explicit BeginTransactionAsync() that Eager mode emits, so this chain would throw on every
+message. Either switch to TransactionMiddlewareMode.Lightweight -- UseEntityFrameworkCoreTransactions(
+TransactionMiddlewareMode.Lightweight) for the whole application, or [Transactional(Mode =
+TransactionMiddlewareMode.Lightweight)] on just this handler -- or drop EnableRetryOnFailure() from the
+DbContext registration.
+```
+
+`Lightweight` is usually the answer. It never opens a transaction of its own, which is the whole reason it is
+compatible with a retrying execution strategy.
+
+## Set-Based Operations and EfCoreOps <Badge type="tip" text="6.41" />
+
+Sooner or later a handler has to archive ten thousand rows, call a stored procedure, or delete
+everything older than a cutoff date. `ExecuteUpdateAsync`, `ExecuteDeleteAsync` and
+`Database.ExecuteSqlAsync` each do that in a single statement, and not one of them goes anywhere
+near `SaveChangesAsync`. That is the whole difficulty. In `Lightweight` mode there is no
+transaction around the statement, so it commits by itself the moment it runs. If the rest of your
+handler then fails, the bulk write stays behind while the outbox rows that were supposed to travel
+with it roll back, and you are left with half the work done and no message to finish the other half.
+
+Up until now the answer was "remember to ask for `Eager` on this handler". You can say it in the
+return type instead:
+
+```cs
+public static EfCoreOp Handle(ArchiveOldOrders command)
+{
+    return EfCoreOps.ExecuteUpdate<Order>(x => x.PlacedAt < command.Before,
+        setters => setters.SetProperty(x => x.IsArchived, true));
+}
+```
+
+Wolverine sees the `EfCoreOp` coming back and puts that chain in `Eager` mode -- whatever the
+application default is, and whatever a `[Transactional]` attribute or a handler policy asked for.
+The statement runs inside the same transaction as the outbox rows, so either both land or neither does.
+
+Here is the family:
+
+| Operation | What you get |
+| --- | --- |
+| `EfCoreOps.ExecuteUpdate<T>(predicate, setters)` | One `UPDATE` covering every matching row |
+| `EfCoreOps.ExecuteDelete<T>(predicate)` | One `DELETE` covering every matching row |
+| `EfCoreOps.ExecuteSql(FormattableString)` | Raw SQL, with the interpolated values as parameters |
+| `EfCoreOps.ExecuteSqlRaw(sql, parameters)` | Raw SQL with positional parameters |
+| `EfCoreOps.InsertMany<T>(entities)` | One `AddRange` |
+
+`InsertMany` is the odd one out, on purpose. It writes through the same `SaveChangesAsync` as
+everything else the handler did, so it has no business overruling your `Lightweight` default, and
+it does not.
+
+The setters read exactly like EF Core's own, including the computed form
+`SetProperty(x => x.Tally, x => x.Tally + 1)`, but the type you are chaining calls on is Wolverine's
+`EfCoreSetters<T>` rather than EF's. That is what lets the same handler code compile against both
+EF Core 9 and EF Core 10, which spell their setter builders differently, and it is what lets
+Wolverine read back what an update is about to touch -- see the multi-tenancy rules below.
+
+::: tip
+Notice that the handler above never takes a `DbContext` at all. When your application registers
+exactly one, Wolverine knows which one the operation belongs to. When it registers several, say
+which with `[Storage(typeof(YourDbContext))]` or `[Transactional(typeof(YourDbContext))]` on the
+handler, exactly as you would for any other multi-`DbContext` chain.
+:::
+
+### When you keep calling EF Core yourself
+
+Returning an operation is not always what you want. A handler that already has the `DbContext` in
+hand for other reasons may as well call `ExecuteUpdateAsync` on it directly. Mark it, and you get
+the same guarantee:
+
+```cs
+[RequiresEagerTransaction]
+public static async Task Handle(ArchiveOldOrders command, OrdersDbContext db, CancellationToken token)
+{
+    await db.Orders.Where(x => x.PlacedAt < command.Before)
+        .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.IsArchived, true), token);
+}
+```
+
+::: warning
+An operation that forces `Eager` runs headlong into `EnableRetryOnFailure()`, for the reason
+described in [EnableRetryOnFailure and Eager mode](#enableretryonfailure-and-eager-mode) above.
+Wolverine catches the pairing here too, while it is building the handler, so a chain that returns
+an operation against a retrying `DbContext` fails at startup rather than on every message.
+:::
+
+### Set-based writes and conjoined multi-tenancy
+
+A set-based statement is the one write path that
+[conjoined multi-tenancy](/guide/durability/efcore/multi-tenancy#conjoined-multi-tenancy)'s tenant
+interceptor cannot see. That interceptor hooks `SavingChanges`, and there is no `SaveChanges` here
+to hook. So the operations carry the tenancy rules themselves: `ExecuteUpdate` and `ExecuteDelete`
+append the tenant predicate to whatever predicate you gave them, refuse a
+`SetProperty(x => x.TenantId, ...)` that would move rows into another tenant, refuse
+`IgnoreQueryFilters()` on an `ITenanted` entity, and check that the tenant has not been switched
+off. A refusal is a `CrossTenantWriteException`, the same exception you get from a cross-tenant
+write through change tracking.
+
+::: warning
+That protection belongs to the operations, not to `ExecuteUpdateAsync` itself. A raw
+`db.Set<T>().IgnoreQueryFilters().ExecuteDeleteAsync()` still reaches across tenants. In a
+conjoined multi-tenanted application, do your set-based writes through `EfCoreOps`.
+:::
+
+### Units of work in bulk
+
+`UnitOfWork<T>` is not part of the `EfCoreOps` family, but it gets faster here for a related
+reason. EF Core has no upsert statement, so `Store` has to ask the database whether each row
+already exists -- and that used to be a `FindAsync` round trip per entity. A unit of work of a
+thousand entities meant a thousand queries. It is now a single `WHERE key IN (...)` for the whole
+unit of work:
+
+```cs
+public static UnitOfWork<Order> Handle(ImportOrders command)
+{
+    var uow = new UnitOfWork<Order>();
+    foreach (var row in command.Rows)
+    {
+        uow.Store(ToOrder(row));
+    }
+
+    return uow;
+}
+```
+
+Nothing about the API changed, and a unit of work holding a single action still behaves exactly as
+it did. An entity with a composite primary key, or one whose key lives in a shadow property, falls
+back to the per-entity path because there is no single column to build an `IN` list from.
+
 ## Auto Apply Transactional Middleware
 
 You can opt into automatically applying the transactional middleware to any handler that depends on a `DbContext` type
@@ -184,7 +356,9 @@ which one owns the transaction and will fail fast at startup. See
 
 By default, the EF Core transactional middleware uses `TransactionMiddlewareMode.Eager`, which eagerly opens an
 explicit database transaction via `Database.BeginTransactionAsync()` before the handler executes. This is appropriate
-when you need explicit transaction control, such as when using EF Core bulk operations.
+when you need explicit transaction control, and it is required for any set-based operation -- see
+[Set-Based Operations and EfCoreOps](#set-based-operations-and-efcoreops), which makes that requirement declarative
+instead of something you have to remember.
 
 If you prefer to rely solely on `DbContext.SaveChangesAsync()` as your transactional boundary without opening an
 explicit database transaction, you can use `TransactionMiddlewareMode.Lightweight`:

@@ -13,6 +13,7 @@ using Microsoft.AspNetCore.Http.Metadata;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.AspNetCore.Routing.Patterns;
+using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.DependencyInjection;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq.Expressions;
@@ -213,6 +214,7 @@ public partial class HttpChain : Chain<HttpChain, ModifyHttpChainAttribute>, ICo
         // generated OpenAPI document. The status codes are known from the requirement alone, so they do
         // not need to wait for weaving.
         registerDeduplicationMetadata();
+        validateDeduplicatedWithResponse();
 
         applyMetadata();
     }
@@ -511,14 +513,15 @@ public partial class HttpChain : Chain<HttpChain, ModifyHttpChainAttribute>, ICo
 
     public override Frame? CreateSimpleValidationFrame(Variable variable)
     {
-        Metadata.Produces(400, contentType: "application/problem+json");
-        return new SimpleValidationHttpFrame(variable);
+        // Typed for the same reason as the problem-details branches of AddStopConditionIfNull below.
+        Metadata.Produces<ProblemDetails>(400, "application/problem+json");
+        return new SimpleValidationHttpFrame(variable, NextContinuationVariableIndex());
     }
 
     public override Frame? CreateRequirementResultFrame(Variable variable)
     {
-        Metadata.Produces(400, contentType: "application/problem+json");
-        return new RequirementResultHttpFrame(variable);
+        Metadata.Produces<ProblemDetails>(400, "application/problem+json");
+        return new RequirementResultHttpFrame(variable, NextContinuationVariableIndex());
     }
 
     public override Frame[] AddStopConditionIfNull(Variable variable)
@@ -566,6 +569,16 @@ public partial class HttpChain : Chain<HttpChain, ModifyHttpChainAttribute>, ICo
         ];
     }
 
+    /// <inheritdoc />
+    /// <remarks>
+    ///     GH-4501. An HTTP chain has a second failure mode the shared frame cannot see: a refusal that is
+    ///     a status code rather than an exception. Give the claim back on either.
+    /// </remarks>
+    public override Frame BuildDeduplicationReleaseFrame(Variable deduplicationId)
+    {
+        return new ReleaseDeduplicationIdOnHttpFailureFrame(deduplicationId, AncillaryStoreType);
+    }
+
     public override Frame[] AddStopConditionIfNull(Variable data, Variable? identity, IDataRequirement requirement)
     {
         // AddStopConditionIfNull declares the identity nullable, so an entity addressed by
@@ -580,11 +593,16 @@ public partial class HttpChain : Chain<HttpChain, ModifyHttpChainAttribute>, ICo
                 Metadata.Produces(404);
                 return [new SetStatusCodeAndReturnIfEntityIsNullFrame(data)];
                 
+            // Produces<ProblemDetails>, not Produces(..., contentType:). Without a response TYPE the content
+            // never reaches the generated OpenAPI document -- Swashbuckle emits the status with no content and
+            // Microsoft.AspNetCore.OpenApi an empty schema -- so a client generating from the spec cannot see
+            // that the miss carries a problem document. Covered by openapi_shape_tests and
+            // entity_miss_swashbuckle_document.
             case OnMissing.ProblemDetailsWith400:
-                Metadata.Produces(400, contentType: "application/problem+json");
+                Metadata.Produces<ProblemDetails>(400, "application/problem+json");
                 return [new WriteProblemDetailsIfNull(data, identity, message, 400)];
             case OnMissing.ProblemDetailsWith404:
-                Metadata.Produces(404, contentType: "application/problem+json");
+                Metadata.Produces<ProblemDetails>(404, "application/problem+json");
                 return [new WriteProblemDetailsIfNull(data, identity, message, 404)];
 
             case OnMissing.EmptyContentWith204:
@@ -796,7 +814,13 @@ public partial class HttpChain : Chain<HttpChain, ModifyHttpChainAttribute>, ICo
                 $"it is decorated with [AcceptsContentType(\"{declaredAccepts.ContentTypes.Join("\", \"")}\")]");
         }
 
-        if (HasRequestType && ReadsRequestBody)
+        if (StreamsMultipartBody)
+        {
+            assertNothingElseReadsTheMultipartBody();
+            assertCanReceiveARequestBody("it takes a MultipartReader, which streams the request body");
+            Metadata.Accepts(typeof(MultipartReader), false, "multipart/form-data");
+        }
+        else if (HasRequestType && ReadsRequestBody)
         {
             if (IsFormData)
             {
@@ -854,6 +878,21 @@ public partial class HttpChain : Chain<HttpChain, ModifyHttpChainAttribute>, ICo
             "takes a body (POST/PUT/PATCH), or bind from the query string, route, or headers instead.");
     }
 
+    private void assertNothingElseReadsTheMultipartBody()
+    {
+        var other = FileParameters.Any() ? $"the file parameter '{FileParameters[0].Name}'"
+            : IsFormData ? "a form binding"
+            : HasRequestType && ReadsRequestBody ? $"the request body type {RequestType.FullNameInCode()}"
+            : null;
+
+        if (other == null) return;
+
+        throw new InvalidOperationException(
+            $"HTTP endpoint {Method.HandlerType.FullNameInCode()}.{Method.Method.Name} takes a MultipartReader, " +
+            $"which streams the request body, but also reads the body through {other}. The body can only be read " +
+            "once: read every part from the MultipartReader instead.");
+    }
+
     private void applyAntiforgeryMetadata()
     {
         // Check for explicit opt-out via [DisableAntiforgery] on method or class
@@ -873,7 +912,7 @@ public partial class HttpChain : Chain<HttpChain, ModifyHttpChainAttribute>, ICo
         }
 
         // Auto-enable for form data and file upload endpoints when antiforgery is enabled
-        if (_parent.AutoAntiforgeryOnFormEndpoints && (IsFormData || FileParameters.Any()))
+        if (_parent.AutoAntiforgeryOnFormEndpoints && (IsFormData || FileParameters.Any() || StreamsMultipartBody))
         {
             Metadata.WithMetadata(WolverineAntiforgeryMetadata.Required);
         }
@@ -948,6 +987,10 @@ public partial class HttpChain : Chain<HttpChain, ModifyHttpChainAttribute>, ICo
             throw new InvalidOperationException(
                 $"The form value parameter '{key}' cannot be used for multiple target types");
         }
+
+        // GH-4742. Every one of the branches above keeps the variable and NOT its creating frame, so the
+        // arranger hoists the form read ahead of the middleware list. See BindsFormValues.
+        if (variable != null) BindsFormValues = true;
 
         return variable;
     }
@@ -1039,6 +1082,7 @@ public partial class HttpChain : Chain<HttpChain, ModifyHttpChainAttribute>, ICo
             if (RouteParameterStrategy.CanParse(inner))
             {
                 //variable = new ParsedNullableQueryStringValue(parameterType, parameterName).Variable;
+                _parent.WarnOnceAboutLenientQueryBinding();
                 variable = new ReadHttpFrame(BindingSource.QueryString, parameterType, key,
                     rejectUnparseableValue: _parent.RejectUnparseableQueryValues).Variable;
                 variable.Name = key;
@@ -1047,6 +1091,7 @@ public partial class HttpChain : Chain<HttpChain, ModifyHttpChainAttribute>, ICo
 
         if (parameterType.IsArray && RouteParameterStrategy.CanParse(parameterType.GetElementType()!))
         {
+            _parent.WarnOnceAboutLenientQueryBinding();
             variable = new ParsedArrayQueryStringValue(parameterType, key,
                 rejectUnparseableValue: _parent.RejectUnparseableQueryValues).Variable;
             variable.Name = key;
@@ -1054,6 +1099,7 @@ public partial class HttpChain : Chain<HttpChain, ModifyHttpChainAttribute>, ICo
 
         if (ParsedCollectionQueryStringValue.CanParse(parameterType))
         {
+            _parent.WarnOnceAboutLenientQueryBinding();
             variable = new ParsedCollectionQueryStringValue(parameterType, key,
                 rejectUnparseableValue: _parent.RejectUnparseableQueryValues).Variable;
             variable.Name = key;
@@ -1062,6 +1108,7 @@ public partial class HttpChain : Chain<HttpChain, ModifyHttpChainAttribute>, ICo
         if (RouteParameterStrategy.CanParse(parameterType))
         {
             //variable = new ParsedQueryStringValue(parameterType, parameterName).Variable;
+            _parent.WarnOnceAboutLenientQueryBinding();
             variable = new ReadHttpFrame(BindingSource.QueryString, parameterType, parameterName,
                 rejectUnparseableValue: _parent.RejectUnparseableQueryValues).Variable;
             variable.Name = key;
@@ -1228,6 +1275,30 @@ public partial class HttpChain : Chain<HttpChain, ModifyHttpChainAttribute>, ICo
     public bool HasRequestType => RequestType != null && RequestType != typeof(void);
 
     public bool IsFormData { get; internal set; }
+
+    /// <summary>
+    ///     GH-4742. True when this chain binds a form <em>value</em> — <c>[FromForm]</c> on a parameter, on a
+    ///     bound form type, or on a member of an <c>[AsParameters]</c> type. Deliberately narrower than
+    ///     <see cref="IsFormData" />, which is also true for a file upload and for an
+    ///     <see cref="IFormCollection" /> parameter.
+    ///     <para>
+    ///     The distinction is about <em>where the read is emitted</em>. A file binding
+    ///     (<c>FromFileStrategy</c>) and the multipart reader put their frames in
+    ///     <see cref="IChain.Middleware" />, so anything already at <c>Middleware[0]</c> is emitted ahead of
+    ///     them; an <see cref="IFormCollection" /> parameter is a bare <c>httpContext.Request.Form</c> usage
+    ///     evaluated at the call site. Form <em>values</em>, by contrast, are kept only as variables
+    ///     (<see cref="TryFindOrCreateFormValue(Type,string,string)" />, <c>FormBindingFrame</c>,
+    ///     <c>AsParametersBindingFrame</c>) and their creator frames are therefore hoisted to the very front
+    ///     of the method by JasperFx's <c>MethodFrameArranger</c> — ahead of anything a policy inserted.
+    ///     </para>
+    /// </summary>
+    internal bool BindsFormValues { get; set; }
+
+    /// <summary>
+    ///     True when the endpoint takes a <see cref="MultipartReader" /> and
+    ///     streams the multipart body itself, so nothing else on the chain may read the body.
+    /// </summary>
+    public bool StreamsMultipartBody { get; internal set; }
 
     /// <summary>
     ///     True when this chain actually reads a request body — a JSON body, a form, or uploaded files.

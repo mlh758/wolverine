@@ -53,6 +53,7 @@ internal class AsParamatersAttributeUsage : IParameterStrategy
             DescribeAsParametersBinding(parameter.ParameterType, out var hasForm, out var hasBody);
             chain.IsFormData = hasForm;
             chain.ReadsRequestBody = hasForm || hasBody;
+            if (hasForm) chain.BindsFormValues = true; // GH-4742
 
             var bindingFrame = new AsParametersBindingFrame(parameter.ParameterType, chain, container);
             chain.AsParametersVariable = bindingFrame.Variable;
@@ -229,6 +230,7 @@ internal class AsParametersBindingFrame : SyncFrame
         // 404'd. See GH-3630.
         chain.IsFormData = _hasForms;
         chain.ReadsRequestBody = _hasForms || _hasJsonBody;
+        if (_hasForms) chain.BindsFormValues = true; // GH-4742
     }
     
     /// <summary>
@@ -404,7 +406,7 @@ internal class AsParametersBindingFrame : SyncFrame
     // A member is nullable when it's a Nullable<T> value type or a reference type whose nullable
     // annotation context marks it nullable. A fresh NullabilityInfoContext per call keeps this
     // thread-safe across concurrent chain compilation.
-    private static bool IsNullableMember(ParameterInfo parameter)
+    internal static bool IsNullableMember(ParameterInfo parameter)
     {
         if (parameter.ParameterType.IsValueType)
         {
@@ -414,7 +416,7 @@ internal class AsParametersBindingFrame : SyncFrame
         return new NullabilityInfoContext().Create(parameter).WriteState == NullabilityState.Nullable;
     }
 
-    private static bool IsNullableMember(PropertyInfo property)
+    internal static bool IsNullableMember(PropertyInfo property)
     {
         if (property.PropertyType.IsValueType)
         {

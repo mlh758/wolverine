@@ -14,6 +14,8 @@ public class OutboxedSessionFactory
     private readonly IDocumentStore _store;
     private readonly bool _shouldPublishEvents;
     private readonly bool _shouldTrackAppends;
+    private readonly IWolverineRuntime _runtime;
+    private IMessageStore? _messageStore;
 
     public OutboxedSessionFactory(ISessionFactory factory, IWolverineRuntime runtime, IDocumentStore store)
     {
@@ -23,10 +25,33 @@ public class OutboxedSessionFactory
         _shouldPublishEvents = runtime.TryFindExtension<FisherIntegration>()?.UseFastEventForwarding ?? false;
         _shouldTrackAppends = runtime.Options.Tracking.EnableEventAppendTracking;
 
-        MessageStore = runtime.Storage;
+        _runtime = runtime;
     }
 
-    internal IMessageStore MessageStore { get; set; }
+    /// <summary>
+    /// The message store this factory enlists sessions in. Defaults to the runtime's <b>Main</b> store,
+    /// resolved on every read rather than captured in the constructor; an ancillary-store subclass
+    /// (<c>OutboxedSessionFactory&lt;T&gt;</c>) assigns a fixed store and that assignment wins.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ <b>GH-4130 / GH-4633. Do not go back to <c>MessageStore = runtime.Storage</c> in the constructor.</b>
+    /// <c>IWolverineRuntime.Storage</c> is <c>Stores.Main</c>, which is the placeholder
+    /// <see cref="NullMessageStore"/> until <c>MessageStoreCollection.InitializeAsync()</c> assigns the
+    /// real one — and that assignment is deferred whenever more than one store claims
+    /// <see cref="MessageStoreRole.Main"/> and <c>DurabilitySettings.ResolveMainStoreOnConflict</c> has to
+    /// reconcile them (GH-3226). Fisher reaches that shape too: a SQLite file IS a database, so
+    /// <c>UseSqlitePersistenceAndTransport</c> against one file plus an integrated Fisher store on another
+    /// is two Main claimants with two distinct store Uris. Capturing early left this factory holding the
+    /// placeholder for the life of the process while <c>Stores.Main</c> read perfectly correct afterwards,
+    /// so the host booted and listened cleanly and then failed EVERY message and HTTP request with
+    /// "Wolverine.Fisher requires a SQLite-backed message store … was NullMessageStore". Nothing pointed at
+    /// the store roles, which were right the whole time.
+    /// </remarks>
+    internal IMessageStore MessageStore
+    {
+        get => _messageStore ?? _runtime.Storage;
+        set => _messageStore = value;
+    }
 
     /// <summary>Build new instances of IQuerySession on demand</summary>
     public IQuerySession QuerySession(MessageContext context)
@@ -92,20 +117,29 @@ public class OutboxedSessionFactory
             options.Listeners.Add(new PublishIncomingEventsBeforeCommit(context));
         }
 
-        if (_shouldTrackAppends)
+        // GH-4931: a tracked session hears what this session appends, whether or not the observer does
+        if (_shouldTrackAppends || _runtime is WolverineRuntime { ActiveSession: not null })
         {
-            options.Listeners.Add(new NotifyObserverOfAppendedEvents(context));
+            options.Listeners.Add(new NotifyObserverOfAppendedEvents(context, (_store as JasperFx.Events.IEventStore)?.Identity));
+        }
+
+        // GH-4940: the concurrent-append test hook, only while a tracked session is running
+        if (_runtime is WolverineRuntime { ActiveSession: not null })
+        {
+            options.Listeners.Add(new FireConcurrentAppendBeforeSave(context));
         }
 
         // The FlushOutgoingMessagesOnCommit listener needs the SQLite
         // message store so it can mark the incoming envelope as Handled in
         // the same transaction as the document changes. The factory's
-        // MessageStore property carries this from runtime.Storage at ctor
-        // time — earlier code passed `null!` here with a comment claiming a
-        // post-construction setter would fill it in, but no such setter
-        // exists on the listener (the field is readonly), and the result
-        // was a NullReferenceException the first time the listener tried
-        // to read messageStore.Role. See GH-2668.
+        // MessageStore property reads runtime.Storage lazily, HERE, at the
+        // moment the session is opened — never at ctor time, which is the
+        // GH-4130 / GH-4633 trap documented on that property. Earlier code
+        // passed `null!` here with a comment claiming a post-construction
+        // setter would fill it in, but no such setter exists on the listener
+        // (the field is readonly), and the result was a
+        // NullReferenceException the first time the listener tried to read
+        // messageStore.Role. See GH-2668.
         options.Listeners.Add(new FlushOutgoingMessagesOnCommit(
             context,
             resolveSqliteMessageStore()));
@@ -141,7 +175,16 @@ public class OutboxedSessionFactory
     {
         context.OverrideStorage(MessageStore);
 
-        if (context.ConversationId != Guid.Empty)
+        // A per-message CausationId override supplied via DeliveryOptions.CausationId (envelope header
+        // "causation-id") takes precedence over the default ConversationId-based causation chain, as it does
+        // for Marten (GH-4931: the same causation on every store, so events can be traced to what caused them)
+        if (context.Envelope is { } env
+            && env.Headers.TryGetValue(EnvelopeConstants.CausationIdKey, out var headerCausationId)
+            && !string.IsNullOrEmpty(headerCausationId))
+        {
+            session.CausationId = headerCausationId;
+        }
+        else if (context.ConversationId != Guid.Empty)
         {
             session.CausationId = context.ConversationId.ToString();
         }

@@ -2,11 +2,15 @@ using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using ImTools;
 using JasperFx.Core;
+using JasperFx.Events;
+using JasperFx.Events.Tags;
 using JasperFx.Core.Reflection;
 using Microsoft.Extensions.Logging;
+using Wolverine.Configuration;
 using Wolverine.Logging;
 using Wolverine.Runtime.Metrics;
 using Wolverine.Tracking;
+using Wolverine.Transports;
 
 namespace Wolverine.Runtime;
 
@@ -60,6 +64,29 @@ public sealed partial class WolverineRuntime : IMessageTracker
     }
 
     internal TrackedSession? ActiveSession { get; set; }
+
+    /// <summary>
+    ///     GH-4931. Record one event-store session's committed streams against the active tracked session, if
+    ///     there is one, attributed to the message <paramref name="context" /> was handling.
+    /// </summary>
+    /// <param name="store">GH-4977: the event store the session belongs to, when the integration can say.</param>
+    internal void RecordAppendedEvents(MessageContext context, IReadOnlyList<StreamAction> streams,
+        JasperFx.Events.EventStoreIdentity? store = null)
+    {
+        if (streams.Count == 0) return;
+        ActiveSession?.RecordAppendedEvents(new AppendedEvents(context.Envelope, _serviceName, streams)
+        {
+            Store = store,
+            TenantId = context.TenantId
+        });
+    }
+
+    /// <summary>
+    ///     GH-4940. Record one Dynamic Consistency Boundary load against the active tracked session, if there is
+    ///     one, attributed to the message <paramref name="context" /> was handling.
+    /// </summary>
+    internal void RecordLoadedBoundary(MessageContext context, Type modelType, EventTagQuery query)
+        => ActiveSession?.RecordLoadedBoundary(new LoadedBoundary(context.Envelope, _serviceName, modelType, query));
 
     /// <summary>
     /// Build the metric tag set for an envelope: the standard tags (message.type + message.destination +
@@ -273,7 +300,7 @@ public sealed partial class WolverineRuntime : IMessageTracker
     public void LogException(Exception ex, object? correlationId = null,
         string message = "Exception detected:")
     {
-        ActiveSession?.LogException(ex, _serviceName);
+        ActiveSession?.LogException(ex, _serviceName, correlationId);
         Logger.LogError(ex, message);
     }
 
@@ -313,7 +340,9 @@ public sealed partial class WolverineRuntime : IMessageTracker
     // check with a full ToString() substring scan, the external check with two case-insensitive
     // scheme compares, 2-4x per message between them. One lock-free trie probe answers both; a
     // lost racing update just recomputes the same value next time.
-    private static ImHashMap<Uri, DestinationClassification> _destinationClassifications =
+    // GH-4665: instance-scoped, because the System half now asks the endpoint what role it plays and
+    // that answer belongs to one runtime's configuration, not to the process.
+    private ImHashMap<Uri, DestinationClassification> _destinationClassifications =
         ImHashMap<Uri, DestinationClassification>.Empty;
 
     [Flags]
@@ -324,16 +353,16 @@ public sealed partial class WolverineRuntime : IMessageTracker
         External = 2
     }
 
-    private static DestinationClassification classifyDestination(Uri destination)
+    private DestinationClassification classifyDestination(Uri destination)
     {
         if (_destinationClassifications.TryFind(destination, out var classification))
         {
             return classification;
         }
 
-        var isLocal = destination.Scheme.EqualsIgnoreCase("local");
+        var isLocal = destination.Scheme.EqualsIgnoreCase(TransportConstants.Local);
 
-        if (isLocal || destination.ToString().Contains("wolverine.response", StringComparison.OrdinalIgnoreCase))
+        if (isSystemTraffic(destination, isLocal))
         {
             classification |= DestinationClassification.System;
         }
@@ -348,11 +377,42 @@ public sealed partial class WolverineRuntime : IMessageTracker
     }
 
     /// <summary>
-    /// Returns true if the destination URI belongs to a Wolverine system endpoint
-    /// (e.g. wolverine.response reply queues or local:// queues) that should not
-    /// have metrics tracked in the CritterWatch accumulation pipeline.
+    /// GH-4665. The question this answers is "is this Wolverine's own plumbing", and
+    /// <see cref="EndpointRole" /> is what actually records that — it is already the discriminator
+    /// <c>MessageTrackingFor</c> and <c>ExecutorFactory.trackerFor</c> use. This used to test the
+    /// <c>local</c> scheme instead, which swept in every user queue: <see cref="LocalTransport" /> marks
+    /// only <c>scheduled</c>, <c>durable</c> and <c>agents</c> as <see cref="EndpointRole.System" />, so a
+    /// handler on an ordinary local queue had its dead letters silently dropped from the per-type and
+    /// per-tenant metrics while its executions and failures were counted.
     /// </summary>
-    internal static bool IsSystemEndpoint(Uri? destination)
+    private bool isSystemTraffic(Uri destination, bool isLocal)
+    {
+        // Per-node broker reply queues: named rather than registered as role-System everywhere, and the
+        // token survives an Azure Service Bus application prefix, so this stays a Contains().
+        if (destination.ToString().Contains("wolverine.response", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        // The local reply queue is the same plumbing as those, but LocalTransport leaves it Application.
+        if (isLocal && destination == TransportConstants.RepliesUri)
+        {
+            return true;
+        }
+
+        // One linear scan per distinct destination Uri, then never again -- the caller caches. Same shape
+        // as EndpointCollection.IsSingleNodeListener. An unregistered destination is not system traffic:
+        // counting a stray is far better than silently dropping a user's dead letters, which is the bug.
+        return Endpoints.EndpointFor(destination)?.Role == EndpointRole.System;
+    }
+
+    /// <summary>
+    /// Returns true if the destination URI belongs to Wolverine's own plumbing — a
+    /// <c>wolverine.response</c> reply queue, or an endpoint whose <see cref="EndpointRole" /> is
+    /// <see cref="EndpointRole.System" /> — which should not be tracked in the CritterWatch
+    /// accumulation pipeline. A user's local queue is NOT system traffic.
+    /// </summary>
+    internal bool IsSystemEndpoint(Uri? destination)
     {
         return destination != null &&
                (classifyDestination(destination) & DestinationClassification.System) != 0;
@@ -363,7 +423,7 @@ public sealed partial class WolverineRuntime : IMessageTracker
     /// i.e. anything other than a local queue or a stub — the gate for the external
     /// send/receive counters.
     /// </summary>
-    internal static bool IsExternalDestination(Uri? destination)
+    internal bool IsExternalDestination(Uri? destination)
     {
         return destination != null &&
                (classifyDestination(destination) & DestinationClassification.External) != 0;

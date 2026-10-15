@@ -23,8 +23,15 @@ public interface IStorageAction<T> : ISideEffectAware
         if (rules.TryFindPersistenceFrameProvider(container, typeof(T), out var provider))
         {
             provider.ApplyTransactionSupport(chain, container, typeof(T));
-            var value = new EntityVariable(variable);
-            return provider.DetermineStorageActionFrame(typeof(T), value, container).WrapIfNotNull(variable);
+
+            // GH-4613: DetermineStorageActionFrame wants the ACTION -- it becomes the
+            // IStorageAction<T> argument of the provider's applier -- so pass the variable itself. An
+            // EntityVariable here rewrites the usage to "x.Entity" and the type to T, which does not
+            // compile. Unreachable for Wolverine's own Insert<T>/Update<T>/Store<T>/Delete<T> (each
+            // declares its own BuildFrame) and for a variable typed exactly IStorageAction<T> (Storage
+            // .TryApply handles that one), but a user-defined type implementing IStorageAction<T> lands
+            // here.
+            return provider.DetermineStorageActionFrame(typeof(T), variable, container).WrapIfNotNull(variable);
         }
 
         throw new NoMatchingPersistenceProviderException(typeof(T));
@@ -92,6 +99,15 @@ public class UnitOfWork<T> : List<IStorageAction<T>>, ISideEffectAware
         if (rules.TryFindPersistenceFrameProvider(container, typeof(T), out var provider))
         {
             provider.ApplyTransactionSupport(chain, container, typeof(T));
+
+            // GH-4629: let a provider apply the whole unit of work at once when it can beat the
+            // per-action loop below -- EF Core batches the Store existence checks into one query
+            // rather than one FindAsync per entity.
+            if (provider.TryBuildUnitOfWorkFrame(typeof(T), variable, container, out var bulk))
+            {
+                return bulk.WrapIfNotNull(variable);
+            }
+
             var element = new Variable(typeof(T), "item_of_" + variable.Usage);
             var inner = provider.DetermineStorageActionFrame(typeof(T), element, container);
 

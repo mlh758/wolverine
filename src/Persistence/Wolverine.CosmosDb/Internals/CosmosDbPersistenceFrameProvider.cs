@@ -26,7 +26,7 @@ public class CosmosDbPersistenceFrameProvider : IPersistenceFrameProvider
 
             if (chain is not SagaChain)
             {
-                chain.Postprocessors.Add(new FlushOutgoingMessages());
+                chain.Postprocessors.Add(CosmosDbOutboxFlushing.BuildFrame());
             }
         }
     }
@@ -34,6 +34,21 @@ public class CosmosDbPersistenceFrameProvider : IPersistenceFrameProvider
     public void ApplyTransactionSupport(IChain chain, IServiceContainer container, Type entityType)
     {
         ApplyTransactionSupport(chain, container);
+    }
+
+    /// <summary>
+    /// GH-4631. Cosmos DB claims ORDINARY chains — a <see cref="Container"/> dependency or an
+    /// <c>ICosmosDbOp</c> return — so it genuinely co-applies with EF Core on a handler that takes both,
+    /// and a designation has to be able to resolve here or that handler could not be built at all.
+    /// Cosmos DB has no session interface; the thing a handler depends on, and therefore the thing a
+    /// designation names, is the SDK's own <see cref="Container"/> / <see cref="Database"/> /
+    /// <see cref="CosmosClient"/>.
+    /// </summary>
+    public bool OwnsStorageType(Type storageType, IServiceContainer container)
+    {
+        return storageType.CanBeCastTo<Container>()
+               || storageType.CanBeCastTo<Database>()
+               || storageType.CanBeCastTo<CosmosClient>();
     }
 
     public bool CanApply(IChain chain, IServiceContainer container)
@@ -90,7 +105,7 @@ public class CosmosDbPersistenceFrameProvider : IPersistenceFrameProvider
     public Frame CommitUnitOfWorkFrame(Variable saga, IServiceContainer container)
     {
         // CosmosDB operations are immediate, but we still flush outgoing messages
-        return new FlushOutgoingMessages();
+        return CosmosDbOutboxFlushing.BuildFrame();
     }
 
     public Frame DetermineUpdateFrame(Variable saga, IServiceContainer container)

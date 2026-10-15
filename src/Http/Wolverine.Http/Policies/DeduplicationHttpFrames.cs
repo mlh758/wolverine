@@ -3,6 +3,7 @@ using JasperFx.CodeGeneration.Frames;
 using JasperFx.CodeGeneration.Model;
 using JasperFx.Core.Reflection;
 using Microsoft.AspNetCore.Http;
+using Wolverine.Persistence.Codegen;
 
 namespace Wolverine.Http.Policies;
 
@@ -55,6 +56,69 @@ internal class DeduplicationProblemDetailsFrame : AsyncFrame
 
     public override IEnumerable<Variable> FindVariables(IMethodVariables chain)
     {
+        _httpContext = chain.FindVariable(typeof(HttpContext));
+        yield return _httpContext;
+    }
+}
+
+/// <summary>
+/// GH-4501. The HTTP failure path for a logical deduplication claim.
+///
+/// <para>
+/// An idempotency key is supposed to mean "this succeeded once", not "this was attempted once". A
+/// message handler or a gRPC method only fails by throwing, which the base frame's catch block already
+/// compensates for — but an HTTP chain also stops on an error status without throwing: a
+/// FluentValidation 400, a <c>ProblemDetails</c> 409 from a <c>Validate</c> method, a
+/// <c>[WriteAggregate]</c> 404 on a missing stream. The handler never ran and nothing was written, yet
+/// the claim outlived the request; the caller that never saw the failure and retried under the same key
+/// was then told "already done" for work that never happened.
+/// </para>
+///
+/// <para>
+/// 400 and up, rather than "not 2xx": a 3xx is an answer, not a refusal, and a POST that redirects to
+/// the resource it just created has succeeded exactly once and must keep its claim.
+/// </para>
+/// </summary>
+internal class ReleaseDeduplicationIdOnHttpFailureFrame : ReleaseDeduplicationIdOnFailureFrame
+{
+    private Variable? _httpResponse;
+    private Variable? _httpContext;
+
+    // Not the request's token: a caller that hung up on a failure is the one that will retry, and a cancelled
+    // release would leave its claim in place.
+    public ReleaseDeduplicationIdOnHttpFailureFrame(Variable deduplicationId, Type? ancillaryStoreMarker)
+        : base(deduplicationId, ancillaryStoreMarker,
+            cancellationUsage: $"{typeof(CancellationToken).FullNameInCode()}.{nameof(CancellationToken.None)}")
+    {
+    }
+
+    // Or the endpoint never ran: middleware ended the request early, even with a success code.
+    protected override string BuildReleaseCondition()
+    {
+        var ran = $"{typeof(HttpHandler).FullNameInCode()}.{nameof(HttpHandler.DeduplicatedEndpointRan)}({_httpContext!.Usage})";
+        return $"({ThrewFlag} || {_httpResponse!.Usage}.{nameof(HttpResponse.StatusCode)} >= 400 || !{ran})";
+    }
+
+    /// <summary>
+    /// GH-4547. The finally alone is too late: WriteProblems flushes the failure response and only then
+    /// does the finally run the DELETE, so a prompt retry under the same key can beat the release and be
+    /// refused as a duplicate for work that never happened. Registering an OnStarting callback here --
+    /// before the try, so the claim already exists -- closes the window, because those callbacks are
+    /// awaited before the response headers go out. The finally stays for the paths where no response ever
+    /// starts.
+    /// </summary>
+    protected override void writeBeforeTry(ISourceWriter writer)
+    {
+        writer.WriteComment("GH-4547: release the claim BEFORE a failure response is flushed to the caller");
+        writer.Write(
+            $"{typeof(HttpHandler).FullNameInCode()}.{nameof(HttpHandler.ReleaseDeduplicationClaimBeforeFailureResponse)}({_httpContext!.Usage}, {DeduplicatorUsage}, {DeduplicationId.Usage}, {AncillaryStoreMarkerUsage});");
+    }
+
+    protected override IEnumerable<Variable> FindAdditionalVariables(IMethodVariables chain)
+    {
+        _httpResponse = chain.FindVariable(typeof(HttpResponse));
+        yield return _httpResponse;
+
         _httpContext = chain.FindVariable(typeof(HttpContext));
         yield return _httpContext;
     }

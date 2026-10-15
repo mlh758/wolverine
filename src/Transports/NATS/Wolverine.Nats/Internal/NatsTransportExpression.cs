@@ -1,6 +1,9 @@
+using NATS.Client.Core;
 using Wolverine.Nats.Configuration;
 using Wolverine.Transports;
 using Wolverine.Transports.Sending;
+
+using NATS.Client.JetStream;
 
 namespace Wolverine.Nats.Internal;
 
@@ -36,6 +39,32 @@ public class NatsTransportExpression
     public NatsTransportExpression DeduplicateUsing(Func<Envelope, string> msgIdSource)
     {
         Transport.Configuration.MsgIdSource = msgIdSource;
+        return this;
+    }
+
+    /// <summary>
+    /// Customize the NATS.Net publish options of every JetStream publish, for options Wolverine does not surface
+    /// itself: the <c>Nats-Expected-*</c> checks, a per-publish timeout. The callback receives the envelope and
+    /// the options Wolverine built, <c>Nats-Msg-Id</c> included, and the publish uses what it returns, e.g.
+    /// <c>(envelope, opts) => opts with { ExpectedStream = "ORDERS" }</c>.
+    /// </summary>
+    public NatsTransportExpression ConfigureJetStreamPublish(Func<Envelope, NatsJSPubOpts, NatsJSPubOpts> configure)
+    {
+        Transport.Configuration.ConfigureJetStreamPublish = configure;
+        return this;
+    }
+
+    /// <summary>
+    /// Customize the NATS.Net client options of the transport's connections -- the shared connection and every
+    /// tenant's dedicated connection -- for settings Wolverine does not surface itself, e.g. the subscription
+    /// pending channel or the ping interval. The function receives the <see cref="NatsOpts"/> Wolverine built,
+    /// connection already named, and the connection uses whatever it returns:
+    /// <c>ConfigureNatsOpts(o =&gt; o with { SubPendingChannelFullMode = BoundedChannelFullMode.Wait })</c>.
+    /// </summary>
+    public NatsTransportExpression ConfigureNatsOpts(Func<NatsOpts, NatsOpts> configure)
+    {
+        ArgumentNullException.ThrowIfNull(configure);
+        Transport.Configuration.ConfigureNatsOpts = configure;
         return this;
     }
 
@@ -124,7 +153,9 @@ public class NatsTransportExpression
     }
 
     /// <summary>
-    /// Define a work queue stream (retention by interest)
+    /// Define a stream with interest retention (see <see cref="StreamConfiguration.AsWorkQueue"/>) -- despite
+    /// the name, not JetStream's work-queue retention: a message published while no consumer is bound is
+    /// discarded on arrival.
     /// </summary>
     public NatsTransportExpression DefineWorkQueueStream(
         string streamName,
@@ -135,7 +166,8 @@ public class NatsTransportExpression
     }
 
     /// <summary>
-    /// Define a work queue stream (retention by interest) with additional configuration
+    /// Define a stream with interest retention (see <see cref="StreamConfiguration.AsWorkQueue"/>) with
+    /// additional configuration -- despite the name, not JetStream's work-queue retention
     /// </summary>
     public NatsTransportExpression DefineWorkQueueStream(
         string streamName,
@@ -190,6 +222,19 @@ public class NatsTransportExpression
     }
 
     /// <summary>
+    /// Choose what startup does with declared JetStream streams and the named consumers of JetStream listeners
+    /// that already exist on the server: leave them alone (<see cref="NatsProvisioning.CreateOnly"/>), bring them
+    /// in line with the configuration (<see cref="NatsProvisioning.CreateOrUpdate"/>), or fail the start on any
+    /// deviation (<see cref="NatsProvisioning.Verify"/>). Without this call existing streams are left alone and
+    /// named consumers are brought in line.
+    /// </summary>
+    public NatsTransportExpression Provisioning(NatsProvisioning provisioning)
+    {
+        Transport.Configuration.Provisioning = provisioning;
+        return this;
+    }
+
+    /// <summary>
     /// Configure multi-tenancy support
     /// </summary>
     public NatsTransportExpression ConfigureMultiTenancy(
@@ -234,9 +279,12 @@ public class NatsTransportExpression
 
     /// <summary>
     /// Add a tenant that uses its own dedicated NATS connection, configured with the full connection / auth /
-    /// TLS surface. The action receives a configuration seeded from the transport's own settings, so you only
-    /// override what differs for this tenant — e.g. a different server or account, a token, JWT / NKey creds,
-    /// a credentials file, or a client certificate.
+    /// TLS surface. The action runs when the transport connects, against a copy of the transport's configuration
+    /// as it is then, so you only override what differs for this tenant — e.g. a different server or account, a
+    /// token, JWT / NKey creds, a credentials file, or a client certificate. The connection settings, the client
+    /// options hook, the JetStream domain or API prefix, and the declared streams with their provisioning settings
+    /// apply to the tenant's connection; everything else stays transport-wide, and startup warns when the action
+    /// changes it.
     /// </summary>
     public NatsTransportExpression AddTenant(
         string tenantId,
@@ -258,77 +306,12 @@ public class NatsTransportExpression
     {
         ArgumentNullException.ThrowIfNull(configureConnection);
 
-        var configuration = cloneConnectionConfiguration();
-        configureConnection(configuration);
-
         Transport.Tenants[tenantId] = new NatsTenant(tenantId)
         {
             SubjectMapper = mapper,
-            ConnectionConfiguration = configuration
+            ConfigureConnection = configureConnection
         };
         return this;
-    }
-
-    // Seed a tenant connection configuration from the transport's own settings so a tenant only needs to
-    // override what differs (mirrors RabbitMqTenant.Compile copying the parent's connection settings).
-    private NatsTransportConfiguration cloneConnectionConfiguration()
-    {
-        var source = Transport.Configuration;
-
-        var clone = new NatsTransportConfiguration();
-        foreach (var property in typeof(NatsTransportConfiguration).GetProperties())
-        {
-            if (property is { CanRead: true, CanWrite: true })
-            {
-                property.SetValue(clone, property.GetValue(source));
-            }
-        }
-
-        // The reflective copy above aliases the two mutable reference members by reference, so a tenant action
-        // that mutates them in place (e.g. cfg.JetStreamDefaults.DuplicateWindow = ... or cfg.Streams[...] = ...)
-        // would leak into the shared transport config and every other tenant. Give each tenant its own copy.
-        clone.JetStreamDefaults = cloneJetStreamDefaults(source.JetStreamDefaults);
-        clone.Streams = source.Streams.ToDictionary(pair => pair.Key, pair => cloneStream(pair.Value));
-
-        return clone;
-    }
-
-    private static JetStreamDefaults cloneJetStreamDefaults(JetStreamDefaults source)
-    {
-        return new JetStreamDefaults
-        {
-            MaxAge = source.MaxAge,
-            MaxMessages = source.MaxMessages,
-            MaxBytes = source.MaxBytes,
-            Replicas = source.Replicas,
-            AckWait = source.AckWait,
-            MaxDeliver = source.MaxDeliver,
-            DuplicateWindow = source.DuplicateWindow,
-            DeliverPolicy = source.DeliverPolicy
-        };
-    }
-
-    private static StreamConfiguration cloneStream(StreamConfiguration source)
-    {
-        return new StreamConfiguration
-        {
-            Name = source.Name,
-            Subjects = new List<string>(source.Subjects),
-            Retention = source.Retention,
-            Storage = source.Storage,
-            MaxMessages = source.MaxMessages,
-            MaxBytes = source.MaxBytes,
-            MaxAge = source.MaxAge,
-            MaxMessagesPerSubject = source.MaxMessagesPerSubject,
-            DiscardPolicy = source.DiscardPolicy,
-            Replicas = source.Replicas,
-            AllowRollup = source.AllowRollup,
-            AllowDirect = source.AllowDirect,
-            DenyDelete = source.DenyDelete,
-            DenyPurge = source.DenyPurge,
-            DuplicateWindow = source.DuplicateWindow,
-            AllowMsgSchedules = source.AllowMsgSchedules
-        };
     }
 
     protected override NatsListenerConfiguration createListenerExpression(

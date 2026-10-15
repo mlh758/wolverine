@@ -29,6 +29,19 @@ public class TrackedSessionConfiguration
     }
 
     /// <summary>
+    ///     GH-4931. Run the tracked work under this correlation id, which every message it causes carries on,
+    ///     and which an event store with correlation ids enabled records on every event they append — so a
+    ///     test can find what its act caused even across an asynchronous boundary the session does not see,
+    ///     such as an event subscription.
+    /// </summary>
+    public TrackedSessionConfiguration WithCorrelationId(string correlationId)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(correlationId);
+        Session.CorrelationId = correlationId;
+        return this;
+    }
+
+    /// <summary>
     /// Do not track any messages of this type
     /// Helpful for polling operations that maybe happening during your testing
     /// </summary>
@@ -83,6 +96,62 @@ public class TrackedSessionConfiguration
     public TrackedSessionConfiguration IgnoreMessagesMatchingType(Func<Type, bool> filter)
     {
         Session.IgnoreMessageTypes(filter);
+        return this;
+    }
+
+    /// <summary>
+    /// GH-4704. Do not track any envelope matching this filter. The envelope-level twin of
+    /// <see cref="IgnoreMessagesMatchingType"/>, for when the message type alone cannot tell the traffic
+    /// apart -- a shared host running background subscriptions or another test's tail alongside the flow
+    /// under test, where the same message type is legitimately in flight for more than one reason at once.
+    /// The predicate sees the whole <see cref="Envelope"/>, so it can filter on destination, tenant id,
+    /// correlation id, headers, or anything else the caller stamped.
+    /// </summary>
+    /// <remarks>
+    /// Two things worth knowing before reaching for this. It narrows what gets <em>recorded</em>, not what
+    /// completion requires: a session can still time out waiting on a message it deliberately never
+    /// consumes. And acknowledgements are never ignored regardless of the filter, because the session's own
+    /// acknowledgement APIs depend on them being recorded.
+    /// </remarks>
+    /// <param name="filter">Return true for an envelope this session should not track</param>
+    public TrackedSessionConfiguration IgnoreEnvelopes(Func<Envelope, bool> filter)
+    {
+        Session.IgnoreEnvelopes(filter);
+        return this;
+    }
+
+    /// <summary>
+    /// Do not track any message whose type is declared in <paramref name="assembly" />, a batch of them
+    /// included. The per-session twin of <see cref="TrackingOptions.IgnoreMessagesFromAssembly" />, which
+    /// applies to every tracked session against the host.
+    /// </summary>
+    public TrackedSessionConfiguration IgnoreMessagesFromAssembly(System.Reflection.Assembly assembly)
+    {
+        Session.IgnoreMessageTypes(TrackingIgnoreRules.FromAssembly(assembly));
+        return this;
+    }
+
+    /// <summary>
+    /// Do not track traffic to or through the endpoint at <paramref name="endpointUri" />: any envelope whose
+    /// destination is that endpoint, sent there or received by its listener. The per-session twin of
+    /// <see cref="TrackingOptions.IgnoreEndpoint" />.
+    /// </summary>
+    public TrackedSessionConfiguration IgnoreEndpoint(Uri endpointUri)
+    {
+        Session.IgnoreEnvelopes(TrackingIgnoreRules.ForEndpoint(endpointUri));
+        return this;
+    }
+
+    /// <summary>
+    /// Track, for this session only, the traffic that the host-wide ignore rules configured through
+    /// <see cref="WolverineOptions.Tracking" /> (<see cref="TrackingOptions.IgnoreMessagesFromAssembly" />,
+    /// <see cref="TrackingOptions.IgnoreEndpoint" /> and their siblings) would otherwise ignore. Use it for a
+    /// test that asserts on that traffic, such as an extension's own tests of the messages it marks
+    /// ignored. This session's own ignore rules, and the default ignoring of system commands, still apply.
+    /// </summary>
+    public TrackedSessionConfiguration IncludeHostIgnoredTraffic()
+    {
+        Session.IncludeHostIgnoredTraffic();
         return this;
     }
 

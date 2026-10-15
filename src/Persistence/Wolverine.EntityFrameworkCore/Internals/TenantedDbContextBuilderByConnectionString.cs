@@ -15,6 +15,7 @@ using Wolverine.EntityFrameworkCore.Internals.Migrations;
 using Wolverine.Persistence.Durability;
 using Wolverine.RDBMS;
 using Wolverine.Runtime;
+using Weasel.EntityFrameworkCore.Batching;
 
 namespace Wolverine.EntityFrameworkCore.Internals;
 
@@ -69,13 +70,15 @@ public class TenantedDbContextBuilderByConnectionString<T> : IDbContextBuilder<T
     public async ValueTask<T> BuildAndEnrollAsync(MessageContext messaging, CancellationToken cancellationToken)
     {
         var connectionString = await findConnectionString(messaging.TenantId);
-        if (connectionString.IsEmpty())
-            throw new InvalidOperationException(
-                $"Unable to find a database connection string for tenant '{messaging.TenantId}'");
 
         var builder = new DbContextOptionsBuilder<T>();
 
         builder.UseApplicationServiceProvider(_serviceProvider);
+        // GH-4624 / weasel#621: this builder constructs its own DbContextOptionsBuilder, so it never
+        // passes through the registration in AddDbContextWithWolverineIntegration. Without the
+        // interceptor here, batched query plans still return correct results but each takes its own
+        // round trip -- the batching is silently lost on every tenanted DbContext.
+        builder.UseWeaselBatchedQueries();
         
         builder.ReplaceService<IModelCustomizer, WolverineModelCustomizer>();
         // Cache models per (context type, wolverine schema) -- GH-3497
@@ -168,6 +171,7 @@ public class TenantedDbContextBuilderByConnectionString<T> : IDbContextBuilder<T
         var connectionString = await findConnectionString(tenantId);
         var builder = new DbContextOptionsBuilder<T>();
         builder.UseApplicationServiceProvider(_serviceProvider);
+        builder.UseWeaselBatchedQueries();
         builder.ReplaceService<IModelCustomizer, WolverineModelCustomizer>();
         // Cache models per (context type, wolverine schema) -- GH-3497
         builder.ReplaceService<IModelCacheKeyFactory, WolverineModelCacheKeyFactory>();
@@ -197,9 +201,15 @@ public class TenantedDbContextBuilderByConnectionString<T> : IDbContextBuilder<T
             connectionString = databaseSettings.ConnectionString ?? databaseSettings.DataSource?.ConnectionString;
         }
 
-        _connectionStrings = _connectionStrings.AddOrUpdate(tenantId, connectionString!);
+        if (connectionString.IsEmpty())
+        {
+            throw new InvalidOperationException(
+                $"Unable to find a database connection string for tenant '{tenantId}'");
+        }
 
-        return connectionString!;
+        _connectionStrings = _connectionStrings.AddOrUpdate(tenantId, connectionString);
+
+        return connectionString;
     }
 
     public DbContext BuildForMain()
@@ -213,6 +223,7 @@ public class TenantedDbContextBuilderByConnectionString<T> : IDbContextBuilder<T
         var connectionString = _store.Main.As<IMessageDatabase>().Settings.ConnectionString;
         var builder = new DbContextOptionsBuilder<T>();
         builder.UseApplicationServiceProvider(_serviceProvider);
+        builder.UseWeaselBatchedQueries();
         builder.ReplaceService<IModelCustomizer, WolverineModelCustomizer>();
         // Cache models per (context type, wolverine schema) -- GH-3497
         builder.ReplaceService<IModelCacheKeyFactory, WolverineModelCacheKeyFactory>();

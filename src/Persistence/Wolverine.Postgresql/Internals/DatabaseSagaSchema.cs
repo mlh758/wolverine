@@ -1,0 +1,155 @@
+using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
+using System.Text.Json;
+using JasperFx;
+using JasperFx.Core.Reflection;
+using Npgsql;
+using NpgsqlTypes;
+using Weasel.Core;
+using Weasel.Postgresql;
+using Weasel.Postgresql.Tables;
+using Wolverine;
+using Wolverine.Postgresql;
+using Wolverine.RDBMS;
+using Wolverine.RDBMS.Sagas;
+
+namespace Wolverine.Postgresql.Internals;
+// GH-4805. "Publinternal": technically public, not part of the supported surface. It is public only
+// because generated saga code has to name the closed type to construct it -- a typeof() in generated
+// code cannot see an internal type -- and it lives under Internals/ to say so. Do not build an
+// application against it.
+//
+// It used to sit in the GLOBAL namespace (no declaration at all). The Postgresql twin had NO namespace declaration at all, which put a public
+// type called DatabaseSagaSchema in the GLOBAL namespace of a shipped package: visible unqualified in
+// every file of every consuming project, and colliding by name with the four sibling stores' versions
+// of it. All five moved together so the shape is uniform rather than only the broken one fixed.
+
+
+// AOT note (#2746): Reflection-based STJ over runtime saga state type T.
+// Same chunk D / chunk Z (RavenDb) pattern: AOT consumers using lightweight
+// Postgres saga storage supply a JsonSerializerContext for their saga state
+// types or preserve via TrimmerRootDescriptor. T is statically rooted via
+// the saga registration (SagaTableDefinition).
+[UnconditionalSuppressMessage("Trimming", "IL2026",
+    Justification = "Reflection-based STJ over runtime saga state type; AOT consumers supply a JsonSerializerContext. See AOT guide.")]
+[UnconditionalSuppressMessage("AOT", "IL3050",
+    Justification = "Reflection-based STJ over runtime saga state type; AOT consumers supply a JsonSerializerContext. See AOT guide.")]
+public class DatabaseSagaSchema<T, TId> : IDatabaseSagaSchema<TId, T> where T : Saga
+{
+    private readonly DatabaseSettings _settings;
+    private readonly string _insertSql;
+    private readonly string _updateSql;
+    private readonly string _deleteSql;
+    private readonly string _loadSql;
+
+    public DatabaseSagaSchema(SagaTableDefinition definition, DatabaseSettings settings)
+    {
+        _settings = settings;
+        IdSource = LambdaBuilder.Getter<T, TId>(definition.IdMember);
+
+        var quotedSchema = settings.SchemaName.QuoteIdentifier();
+        _insertSql = $"insert into {quotedSchema}.{definition.TableName} ({DatabaseConstants.Id}, {DatabaseConstants.Body}, {DatabaseConstants.Version}) values (@id, @body, 1)";
+        _updateSql =
+            $"update {quotedSchema}.{definition.TableName} set {DatabaseConstants.Body} = @body, {DatabaseConstants.Version} = @version + 1, last_modified = now() where {DatabaseConstants.Id} = @id and {DatabaseConstants.Version} = @version";
+        _loadSql = $"select body, version from {quotedSchema}.{definition.TableName} where {DatabaseConstants.Id} = @id";
+
+        _deleteSql = $"delete from {quotedSchema}.{definition.TableName} where id = @id";
+        
+        var table = new Table(new DbObjectName(settings.SchemaName!, definition.TableName));
+        table.AddColumn<TId>("id").AsPrimaryKey();
+        table.AddColumn(DatabaseConstants.Body, "jsonb").NotNull();
+        table.AddColumn(DatabaseConstants.Version, "int").DefaultValue(1).NotNull();
+        table.AddColumn<DateTimeOffset>("created").DefaultValueByExpression("now()").NotNull();
+        table.AddColumn<DateTimeOffset>("last_modified").DefaultValueByExpression("now()").NotNull();
+
+        Table = table;
+    }
+
+    public void MarkAsChecked() => HasChecked = true;
+
+    public bool HasChecked { get; private set; }
+    
+    public async Task EnsureStorageExistsAsync(CancellationToken cancellationToken)
+    {
+        if (HasChecked || _settings.AutoCreate == AutoCreate.None) return;
+
+        await using var conn = _settings.DataSource?.CreateConnection() ?? new NpgsqlConnection(_settings.ConnectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        var migration = await SchemaMigration.DetermineAsync(conn, cancellationToken, Table);
+
+        if (migration.Difference != SchemaPatchDifference.None)
+        {
+            await new PostgresqlMigrator().ApplyAllAsync(conn, migration, _settings.AutoCreate, ct: cancellationToken);
+        }
+
+        HasChecked = true;
+    }
+
+    public ISchemaObject Table { get; }
+
+    public Func<T,TId> IdSource { get; }
+
+    public async Task InsertAsync(T saga, DbTransaction transaction, CancellationToken cancellationToken)
+    {
+        var id = IdSource(saga);
+        if (id == null || id.Equals(default(TId))) throw new ArgumentOutOfRangeException(nameof(saga), "You must define the saga id when using the lightweight saga storage");
+        
+        await EnsureStorageExistsAsync(cancellationToken);
+        await transaction.CreateCommand(_insertSql).As<NpgsqlCommand>()
+            .With("id", id!)
+            .With("body", JsonSerializer.SerializeToUtf8Bytes(saga, _settings.SagaSerializerOptions), NpgsqlDbType.Jsonb)
+            .ExecuteNonQueryAsync(cancellationToken);
+
+        saga.Version = 1;
+    }
+
+    public async Task UpdateAsync(T saga, DbTransaction transaction, CancellationToken cancellationToken)
+    {
+        await EnsureStorageExistsAsync(cancellationToken);
+
+        var id = IdSource(saga);
+        var count = await transaction.CreateCommand(_updateSql).As<NpgsqlCommand>()
+            .With("body", JsonSerializer.SerializeToUtf8Bytes(saga, _settings.SagaSerializerOptions), NpgsqlDbType.Jsonb)
+            .With("id", id!)
+            .With("version", saga.Version)
+            .ExecuteNonQueryAsync(cancellationToken);
+
+        if (count == 0)
+            throw new SagaConcurrencyException(
+                $"Saga of type {saga.GetType().FullNameInCode()} and id {id} cannot be updated because of optimistic concurrency violations");
+        
+        saga.Version++;
+    }
+
+    public async Task DeleteAsync(T saga, DbTransaction transaction, CancellationToken cancellationToken)
+    {
+        await EnsureStorageExistsAsync(cancellationToken);
+        await transaction
+            .CreateCommand(_deleteSql)
+            .With("id", IdSource(saga)!)
+            .ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<T?> LoadAsync(TId id, DbTransaction tx, CancellationToken cancellationToken)
+    {
+        await EnsureStorageExistsAsync(cancellationToken);
+        await using var reader = await tx.CreateCommand(_loadSql)
+            .With("id", id!)
+            .ExecuteReaderAsync(cancellationToken);
+
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        var body = await reader.GetFieldValueAsync<byte[]>(0, cancellationToken);
+        var saga = JsonSerializer.Deserialize<T>(body, _settings.SagaSerializerOptions);
+        saga!.Version = await reader.GetFieldValueAsync<int>(1, cancellationToken);
+
+        await reader.CloseAsync();
+
+        return saga;
+
+    }
+}

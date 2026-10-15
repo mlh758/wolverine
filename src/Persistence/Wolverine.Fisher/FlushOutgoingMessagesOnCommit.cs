@@ -46,7 +46,12 @@ internal class FlushOutgoingMessagesOnCommit : IDocumentSessionListener
         {
             if (_context.Envelope.WasPersistedInInbox)
             {
-                if (_context.Envelope.Store == null && _messageStore.Role == MessageStoreRole.Ancillary)
+                // GH-5045: only when THIS store's database holds the row. Checking for a null Envelope.Store let
+                // an envelope persisted in the main store (a handler registered with AddMessageHandler is not
+                // in the ancillary map) be marked in the ancillary database, matching no rows, and the Handled
+                // status flipped in AfterCommitAsync then made DurableReceiver skip the mark that would have
+                // found it. Leave it to DurableReceiver, which marks it in the envelope's own store
+                if (!_context.Envelope.InboxRowIsIn(_messageStore, _context.Runtime.Storage))
                 {
                     return Task.CompletedTask;
                 }
@@ -54,7 +59,7 @@ internal class FlushOutgoingMessagesOnCommit : IDocumentSessionListener
                 var keepUntil = DateTimeOffset.UtcNow.Add(_context.Runtime.Options.Durability.KeepAfterMessageHandling);
                 // Use ITransactionParticipant to execute the SQL in the same transaction
                 session.AddTransactionParticipant(new MarkIncomingAsHandledParticipant(
-                    _messageStore.IncomingFullName, _context.Envelope.Id, keepUntil));
+                    _messageStore, _context.Envelope, keepUntil));
 
                 // Defer the in-memory status flip to AfterCommitAsync — the UPDATE
                 // above is only durable if this batch commits. See _queuedHandledUpdate.
@@ -72,6 +77,14 @@ internal class FlushOutgoingMessagesOnCommit : IDocumentSessionListener
         if (_queuedHandledUpdate && _context.Envelope != null)
         {
             _context.Envelope.Status = EnvelopeStatus.Handled;
+        }
+
+        // GH-5016: nothing can be trusted to run after a serverless request completes, so the messages are
+        // sent right now and their outbox rows deleted in one batch. A failed send stays in the outbox
+        // for the next durability pass
+        if (_context.Runtime.Options.Durability.Mode == DurabilityMode.ServerlessWithOutbox)
+        {
+            return _context.SendAllOutgoingMessagesInlineAsync();
         }
 
         return _context.FlushOutgoingMessagesAsync();
@@ -98,18 +111,24 @@ internal class FlushOutgoingMessagesParticipant : ITransactionParticipant
         // Mark incoming as handled if needed
         if (_context.Envelope?.Destination != null && _context.Envelope.WasPersistedInInbox)
         {
-            if (_context.Envelope.Store == null && _messageStore.Role == MessageStoreRole.Ancillary)
+            // GH-5045: see FlushOutgoingMessagesOnCommit
+            if (!_context.Envelope.InboxRowIsIn(_messageStore, _context.Runtime.Storage))
             {
                 return;
             }
 
             var keepUntil = DateTimeOffset.UtcNow.Add(_context.Runtime.Options.Durability.KeepAfterMessageHandling);
+
+            // GH-4705: same statement the store runs itself, so it matches id AND received_at.
+            var markHandled =
+                _messageStore.BuildMarkIncomingAsHandled(_context.Envelope, keepUntil, "@id", "@uri", "@keepUntil");
+
             await using var cmd = connection.CreateCommand();
             cmd.Transaction = transaction;
-            cmd.CommandText =
-                $"update {_messageStore.IncomingFullName} set {DatabaseConstants.Status} = '{EnvelopeStatus.Handled}', {DatabaseConstants.KeepUntil} = @keepUntil where id = @id";
+            cmd.CommandText = markHandled.Sql;
             cmd.Parameters.AddWithValue("@keepUntil", keepUntil);
             cmd.Parameters.AddWithValue("@id", _context.Envelope.Id);
+            cmd.Parameters.AddWithValue("@uri", _context.Envelope.Destination!.ToString());
             await cmd.ExecuteNonQueryAsync(token);
 
             // Deliberately do NOT flip _context.Envelope.Status to Handled here: this
@@ -125,25 +144,30 @@ internal class FlushOutgoingMessagesParticipant : ITransactionParticipant
 
 internal class MarkIncomingAsHandledParticipant : ITransactionParticipant
 {
-    private readonly string _incomingFullName;
-    private readonly Guid _envelopeId;
+    private readonly SqliteMessageStore _messageStore;
+    private readonly Envelope _envelope;
     private readonly DateTimeOffset _keepUntil;
 
-    public MarkIncomingAsHandledParticipant(string incomingFullName, Guid envelopeId, DateTimeOffset keepUntil)
+    public MarkIncomingAsHandledParticipant(SqliteMessageStore messageStore, Envelope envelope, DateTimeOffset keepUntil)
     {
-        _incomingFullName = incomingFullName;
-        _envelopeId = envelopeId;
+        _messageStore = messageStore;
+        _envelope = envelope;
         _keepUntil = keepUntil;
     }
 
     public async Task BeforeCommitAsync(SqliteConnection connection, SqliteTransaction transaction, CancellationToken token)
     {
+        // GH-4705: the statement comes from the message store rather than being written here, so it matches
+        // the whole inbox identity -- received_at as well as id -- and cannot drift from the one the store
+        // runs itself. Binding is by name, so the Arguments the store hands back are not needed.
+        var markHandled = _messageStore.BuildMarkIncomingAsHandled(_envelope, _keepUntil, "@id", "@uri", "@keepUntil");
+
         await using var cmd = connection.CreateCommand();
         cmd.Transaction = transaction;
-        cmd.CommandText =
-            $"update {_incomingFullName} set {DatabaseConstants.Status} = '{EnvelopeStatus.Handled}', {DatabaseConstants.KeepUntil} = @keepUntil where id = @id";
+        cmd.CommandText = markHandled.Sql;
         cmd.Parameters.AddWithValue("@keepUntil", _keepUntil);
-        cmd.Parameters.AddWithValue("@id", _envelopeId);
+        cmd.Parameters.AddWithValue("@id", _envelope.Id);
+        cmd.Parameters.AddWithValue("@uri", _envelope.Destination!.ToString());
         await cmd.ExecuteNonQueryAsync(token);
     }
 }

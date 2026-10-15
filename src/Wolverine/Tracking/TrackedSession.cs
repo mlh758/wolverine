@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using JasperFx.CommandLine.TextualDisplays;
 using JasperFx.Core;
@@ -24,6 +25,13 @@ internal partial class TrackedSession : ITrackedSession
 
     private readonly IList<Exception> _exceptions = new List<Exception>();
 
+    // GH-4931: committed from handler threads too, so locked like _statuses
+    private readonly List<AppendedEvents> _appended = new();
+    private readonly List<ConcurrentAppendRecord> _concurrentAppends = new();
+
+    // GH-4940: loaded from handler threads too, so locked the same way
+    private readonly List<LoadedBoundary> _boundaries = new();
+
     private readonly IList<WolverineRuntime> _otherHosts = new List<WolverineRuntime>();
     private readonly IHost _primaryHost;
     private readonly WolverineRuntime _primaryLogger;
@@ -38,6 +46,21 @@ internal partial class TrackedSession : ITrackedSession
     // filtering is handled directly in isIgnoredMessageType so the system-command rule can be
     // toggled off by IncludeSystemCommands().
     private readonly List<Func<Type, bool>> _ignoreMessageRules = [];
+
+    // GH-4704. Test-supplied ignore rules that see the whole envelope rather than just its message type,
+    // for when the same message type is legitimately in flight for more than one reason at once.
+    private readonly List<Func<Envelope, bool>> _ignoreEnvelopeRules = [];
+
+    // Host-wide ignore rules from WolverineOptions.Tracking, one set per host this session watches. Applied
+    // unless a session opts back in with IncludeHostIgnoredTraffic().
+    private readonly List<TrackingIgnoreRules> _hostRules = [];
+    private bool _applyHostRules = true;
+
+    // The ids of envelopes an ignore rule matched, so an exception reported against one of them by id alone
+    // (IMessageTracker.LogException) is not attributed to the session either
+    private readonly ConcurrentDictionary<Guid, byte> _ignoredEnvelopeIds = new();
+    private int _ignoredRecordCount;
+
     private bool _ignoreSystemCommands = true;
     private CancellationTokenSource _cancellation = new();
 
@@ -58,6 +81,19 @@ internal partial class TrackedSession : ITrackedSession
             return false;
         }
 
+        if (matchesIgnoredMessageType(messageType))
+        {
+            return true;
+        }
+
+        // A batch travels as an array of the batched message type, so a batch of ignored messages -- of
+        // system commands, or from an ignored assembly -- is ignored too
+        var elementType = messageType.IsArray ? messageType.GetElementType() : null;
+        return elementType != null && matchesIgnoredMessageType(elementType);
+    }
+
+    private bool matchesIgnoredMessageType(Type messageType)
+    {
         // Wolverine's own agent commands are framework chatter, never test-relevant activity.
         if (messageType.CanBeCastTo<IAgentCommand>())
         {
@@ -75,7 +111,57 @@ internal partial class TrackedSession : ITrackedSession
             return true;
         }
 
-        return _ignoreMessageRules.Any(x => x(messageType));
+        if (_ignoreMessageRules.Any(x => x(messageType)))
+        {
+            return true;
+        }
+
+        return _applyHostRules && _hostRules.Any(rules => rules.MessageTypeRules.Any(x => x(messageType)));
+    }
+
+    /// <summary>
+    /// GH-4704. The whole ignore decision for one envelope: the message-type rules above, then any
+    /// envelope-level rules. Acknowledgements are checked first and never ignored, for the same reason
+    /// <see cref="isIgnoredMessageType"/> exempts them -- the session's acknowledgement APIs depend on
+    /// them being recorded, and an envelope predicate is far more likely to sweep one up by accident than
+    /// a message-type predicate is.
+    /// </summary>
+    private bool isIgnored(Envelope envelope)
+    {
+        var messageType = envelope.Message?.GetType();
+
+        if (messageType == typeof(Acknowledgement) || messageType == typeof(FailureAcknowledgement))
+        {
+            return false;
+        }
+
+        if (isIgnoredMessageType(messageType) || _ignoreEnvelopeRules.Any(x => x(envelope)) ||
+            (_applyHostRules && _hostRules.Any(rules => rules.EnvelopeRules.Any(x => x(envelope)))))
+        {
+            _ignoredEnvelopeIds.TryAdd(envelope.Id, 0);
+            Interlocked.Increment(ref _ignoredRecordCount);
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Track the traffic the host-wide rules in <see cref="WolverineOptions.Tracking" /> would otherwise
+    /// ignore, for this session only. The session's own ignore rules still apply.
+    /// </summary>
+    public void IncludeHostIgnoredTraffic()
+    {
+        _applyHostRules = false;
+    }
+
+    private void addHostRules(WolverineRuntime runtime)
+    {
+        var rules = runtime.Options.Tracking.IgnoreRules;
+        if (!rules.IsEmpty && !_hostRules.Contains(rules))
+        {
+            _hostRules.Add(rules);
+        }
     }
 
     /// <summary>
@@ -91,6 +177,7 @@ internal partial class TrackedSession : ITrackedSession
         _primaryHost = host ?? throw new ArgumentNullException(nameof(host));
         _source = new TaskCompletionSource<TrackingStatus>(TaskCreationOptions.RunContinuationsAsynchronously);
         _primaryLogger = host.GetRuntime();
+        addHostRules(_primaryLogger);
     }
 
     public TrackedSession(IServiceProvider services) : this(new HostWrapper(services))
@@ -106,6 +193,9 @@ internal partial class TrackedSession : ITrackedSession
     public Queue<ISecondStateExecution> SecondaryStages { get; } = new();
 
     public TimeSpan Timeout { get; set; } = 5.Seconds();
+
+    /// <summary>GH-4931. The correlation id the tracked work runs under, when one was given (GH-4939: exposed on <see cref="ITrackedSession" />).</summary>
+    public string? CorrelationId { get; set; }
 
     public bool AssertNoExceptions { get; set; } = true;
 
@@ -346,7 +436,9 @@ internal partial class TrackedSession : ITrackedSession
             return;
         }
 
-        _otherHosts.Add(host.GetRuntime());
+        var runtime = host.GetRuntime();
+        _otherHosts.Add(runtime);
+        addHostRules(runtime);
     }
 
     public void WatchOther(IServiceProvider services)
@@ -356,7 +448,9 @@ internal partial class TrackedSession : ITrackedSession
             return;
         }
         
-        _otherHosts.Add((WolverineRuntime)services.GetRequiredService<IWolverineRuntime>());
+        var runtime = (WolverineRuntime)services.GetRequiredService<IWolverineRuntime>();
+        _otherHosts.Add(runtime);
+        addHostRules(runtime);
     }
     
     public void AssertNoExceptionsWereThrown()
@@ -418,6 +512,12 @@ internal partial class TrackedSession : ITrackedSession
                 records = records[^ActivityGridRowLimit..];
             }
             writeGrid(grid, records, writer);
+        }
+
+        var ignored = Volatile.Read(ref _ignoredRecordCount);
+        if (ignored > 0)
+        {
+            writer.WriteLine($"({ignored} envelope event(s) matched an ignore rule and are not shown or waited on)");
         }
 
         if (_conditions.Any())
@@ -519,8 +619,7 @@ internal partial class TrackedSession : ITrackedSession
         }
 
         // Ignore these
-        var messageType = envelope.Message?.GetType();
-        if (isIgnoredMessageType(messageType))
+        if (isIgnored(envelope))
         {
             return;
         }
@@ -540,8 +639,7 @@ internal partial class TrackedSession : ITrackedSession
         Exception? ex = null)
     {
         // Ignore these
-        var messageType = envelope.Message?.GetType();
-        if (isIgnoredMessageType(messageType))
+        if (isIgnored(envelope))
         {
             return;
         }
@@ -625,8 +723,15 @@ internal partial class TrackedSession : ITrackedSession
         return _envelopes.All(x => x.IsComplete());
     }
 
-    public void LogException(Exception exception, string? serviceName)
+    public void LogException(Exception exception, string? serviceName, object? correlationId = null)
     {
+        // The pipeline reports an exception it could not otherwise attribute by the envelope's id alone. If
+        // an ignore rule already matched that envelope, the exception belongs to ignored traffic too.
+        if (correlationId is Guid envelopeId && _ignoredEnvelopeIds.ContainsKey(envelopeId))
+        {
+            return;
+        }
+
         Debug.WriteLine($"Exception Occurred in {serviceName}: {exception}");
         lock (_exceptions)
         {
@@ -652,6 +757,72 @@ internal partial class TrackedSession : ITrackedSession
     public void IgnoreMessageTypes(Func<Type, bool> filter)
     {
         _ignoreMessageRules.Add(filter);
+    }
+
+    public void IgnoreEnvelopes(Func<Envelope, bool> filter)
+    {
+        _ignoreEnvelopeRules.Add(filter);
+    }
+
+    public IReadOnlyList<AppendedEvents> AppendedEvents
+    {
+        get
+        {
+            lock (_appended)
+            {
+                return _appended.ToArray();
+            }
+        }
+    }
+
+    public IReadOnlyList<ConcurrentAppendRecord> ConcurrentAppends
+    {
+        get
+        {
+            lock (_concurrentAppends)
+            {
+                return _concurrentAppends.ToArray();
+            }
+        }
+    }
+
+    internal void RecordConcurrentAppend(ConcurrentAppendRecord record)
+    {
+        lock (_concurrentAppends)
+        {
+            _concurrentAppends.Add(record);
+        }
+    }
+
+    internal void RecordAppendedEvents(AppendedEvents appended)
+    {
+        if (appended.Envelope is not null && isIgnored(appended.Envelope)) return;
+
+        lock (_appended)
+        {
+            _appended.Add(appended);
+        }
+    }
+
+    public IReadOnlyList<LoadedBoundary> LoadedBoundaries
+    {
+        get
+        {
+            lock (_boundaries)
+            {
+                return _boundaries.ToArray();
+            }
+        }
+    }
+
+    internal void RecordLoadedBoundary(LoadedBoundary boundary)
+    {
+        if (boundary.Envelope is not null && isIgnored(boundary.Envelope)) return;
+
+        lock (_boundaries)
+        {
+            _boundaries.Add(boundary);
+        }
     }
 
     public void LogStatus(string message)

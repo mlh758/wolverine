@@ -322,11 +322,44 @@ The `event-model` command writes that whole picture — Wolverine's derived slic
 [overlay](https://github.com/JasperFx/jasperfx/issues/687) the application registered with
 `services.AddEventModel(...)` — as one JSON `EventModelDescriptor`, **without a running fleet**:
 
+To read the model rather than export it, `describe-event-model` (GH-4917) prints it by domain and chapter: each
+slice's trigger, command, aggregate (and whether it came from a `ForAggregate` default, `NoAggregate()` or a DCB
+decider), the events it emits, what it publishes, reads and produces, the code behind it, its specifications and
+its hotspots, with a summary per chapter. In a terminal it is a tree; redirected, it is plain text to paste into
+an issue or a pull request.
+
+```bash
+dotnet run -- describe-event-model
+dotnet run -- describe-event-model --chapter BookingAppointments
+dotnet run -- describe-event-model --hotspots-only > open-questions.txt
+```
+
+Every `EventModelDefinition` subclass in the application's assemblies is registered for you (GH-4916), from the
+manifest JasperFx's source generator writes at compile time, so one definition per chapter needs no
+`AddEventModel<T>()` each. Definitions with no `Name` join the application's model. A definition you register
+yourself is not registered twice, and `opts.AutoRegisterEventModelDefinitions = false` turns the discovery off.
+
 ```bash
 dotnet run -- event-model                       # writes event-model.json in the working directory
 dotnet run -- event-model --json ./docs/orders.json
 dotnet run -- event-model --json ./out.json --name Orders
 ```
+
+### Linking slices to their specifications
+
+`--specs` on either command (GH-5004) hands it one or more built specification assemblies. Each carries a
+manifest Bobcat's source generator wrote at compile time, listing every specification and the command it sends,
+and each slice handling that command is linked to those specifications before the model is rendered or
+exported. A command several slices handle is not guessed at: it shows up as an `UnresolvedSpecification`
+hotspot. With `--model` (or `--name` on `event-model`) only the selected model is linked.
+
+```bash
+dotnet run -- describe-event-model --specs ../Orders.Specs/bin/Debug/net10.0/Orders.Specs.dll
+dotnet run -- event-model --specs ../Orders.Specs/bin/Debug/net10.0/Orders.Specs.dll ../Billing.Specs/bin/Debug/net10.0/Billing.Specs.dll
+```
+
+Several spec assemblies go after a single `--specs`. A path that does not exist fails the command; an assembly
+with no manifest is reported and skipped.
 
 ### Publishing to a monitor
 
@@ -378,8 +411,16 @@ public static StartStream Handle(HomeCheckAssignmentAccepted trigger)
 ```
 
 The slice is known to append events; the events themselves are built in the method body, so nothing on the
-signature says what they are. Put `[Emits]` on the handler method (or on the handler type, when every method
-of it emits the same events) to say it:
+signature says what they are. **The JasperFx.Events source generator reads them from the body instead**
+(GH-4914): it records the events a handler passes to `AppendOne`/`AppendMany` on an `IEventStream<T>`, to
+`Storage.StartStream` or `MartenOps`/`PolecatOps`/`FisherOps.StartStream`, or puts in an `EventsToAppend`, in an
+assembly-level manifest that the derived model reads. Marten, Polecat and Fisher bundle that generator, so this
+needs no setup once your store ships with JasperFx 2.82 or later. Until then, reference
+`JasperFx.Events.SourceGenerator` 2.82+ in the application project directly.
+
+The generator can't see an event built somewhere else, such as in a helper method or held as `object`. For
+that, put `[Emits]` on the handler method (or on the handler type, when every method of it emits the same
+events) to say it:
 
 ```cs
 [Emits(typeof(AppointmentConfirmed))]
@@ -391,9 +432,9 @@ public static (ConfirmAppointmentResponse, EventsToAppend) Post(
 }
 ```
 
-It is additive — everything the signature already says still holds — and purely diagnostic: nothing about
-dispatch, codegen or persistence reads it. Without it, `emittedEvents` on those slices is empty, which is
-indistinguishable from a slice that emits nothing at all.
+It is additive — everything the signature and the generator already say still holds — and purely
+diagnostic: nothing about dispatch, codegen or persistence reads it. Without it, or the generator, `emittedEvents`
+on those slices is empty, which is indistinguishable from a slice that emits nothing at all.
 
 ::: tip
 `[Emits]` is worth reaching for precisely when a declared model says a slice emits an event. An empty derived
@@ -458,6 +499,40 @@ Nothing is aligned between two sources on the *same* rung (Wolverine core and Wo
 how they name things), a handler type carrying more than one slice inside a source identifies none of them, and
 a rename that would collide with a slice already in that source is dropped.
 
+A model declared *stub-first* has no handler type yet, so the export also joins on the other roles a stub pins
+down, in this order: the triggering message **and its domain** (see below), the triggering message on its own —
+the event an automation reacts to with `On<T>()`, else the command from `Command<T>()` or `Automation<TCommand>()`,
+which is also the request type a Wolverine.HTTP endpoint is named for — and the read model of a `View<T>()`. A
+stub *is* the real type, so these joins are exact, and a role declared by name matches the type of that name. The
+same guards apply to every one of them, and a slice joined on an earlier key is never joined again on a later one.
+
+### One message, several modules
+
+In a modular monolith running `MultipleHandlerBehavior.Separated`, every module's handler of the same message is
+its own chain, and each gets its own slice. A message with a single handler keeps its bare name; a message with
+several gets one slice per handler, named for its **domain** — `OrderPlaced (Billing)`, `OrderPlaced (Shipping)` —
+or, when no domain is declared, for its handler type: `OrderPlaced (MyApp.Billing.OrderPlacedHandler)`.
+
+A module is a domain, and membership is **declared, never inferred** — Wolverine never guesses a module from a
+namespace or an assembly on its own. Declare it on the handler or endpoint, or as a policy on a declared model:
+
+```cs
+[Domain("Billing")]
+public class OrderPlacedHandler
+{
+    public InvoiceRequested Handle(OrderPlaced e) => new(e.OrderId);
+}
+
+services.AddEventModel("Orders", model =>
+{
+    model.Domain("Shipping").IncludesNamespace("MyApp.Shipping");
+    model.Domain("Billing").Includes(typeof(BillingModule).Assembly);
+});
+```
+
+Every slice derived for such a handler carries that `Domain`, and a declaration that lost to a more specific one
+— a namespace policy overridden by an attribute, say — is called out as a hotspot on the slice rather than dropped.
+
 ### The slice next to the route
 
 The assembled model is one picture of the whole service. A monitoring console often wants the other view —
@@ -502,3 +577,60 @@ triggered `External`; a named listener bound to no slice still renders as a trig
 side, every slice whose published messages or emitted events the named endpoint subscribes to gets the system on
 its far end (a pure relay becomes a `Translation` slice; a command slice that also notifies Stripe stays a command
 slice).
+
+## Scaffolding Declared Slices
+
+Once a model is declared over stub types, the `scaffold` command writes an implementation skeleton for every slice
+that is declared but has **no code behind it yet** — something only the running application can tell, because it
+takes the declared model and the derived chains assembled together:
+
+```bash
+dotnet run -- scaffold                         # write into the current directory
+dotnet run -- scaffold --output ./src/MyApp    # somewhere else
+dotnet run -- scaffold --dry-run               # report only
+dotnet run -- scaffold --json                  # the plan as JSON, every notice with a stable code
+dotnet run -- scaffold --strong-typed-ids      # a strong-typed id for every aggregate
+```
+
+Each slice is written to its own file, in a folder and namespace per chapter:
+`Features/Scheduling/ConfirmAppointment.cs` in `MyApp.Scheduling`, or `Features/` and the root namespace for a slice
+with no chapter. That is the layout Bobcat's `import-event-model` writes, so a handler whose command already exists is
+added to the command's file, and anything new lands beside it. Skeletons are always in Wolverine's store-agnostic
+style, so the same code runs on the in-memory prototyping store, Marten, Polecat or Fisher:
+
+| Declared slice | Skeleton |
+| --- | --- |
+| `Command` triggered by `TriggerKind.Http` | a Wolverine.HTTP endpoint with an empty `Validate` and a `[WolverinePost]` method |
+| `Command` triggered by `TriggerKind.MessageHandler` | a message handler |
+| `Automation` with `On<T>()` | a message handler for `T`, returning the command it issues as `OutgoingMessages` |
+| `Query<T>()` triggered by `TriggerKind.Http` | a `[WolverineGet]` endpoint returning `T`, read with `[ReadModel]` for an aggregate or `[Entity]` for a document, at the slice's route (and route name) or `/api/{t}/{id}` |
+| `Query<T>()` triggered by `TriggerKind.MessageHandler` or gRPC | a query handler returning `T`, for the declared query message or a stub that carries the id |
+| `.Against<T>()` | a non-nullable `[WriteModel] T` parameter |
+| `.StartsStream<T>()` | a `StartStream` return built with `Storage.StartStream<T>(...)` |
+| `model.ForAggregate<T>()` default | the same as `.Against<T>()` on every command that declares no aggregate of its own |
+| `.NoAggregate()` | a `StartStream` return built with `Storage.StartStream(id, ...)`, a stream with no aggregate type, and no warning |
+| `.DeciderModel<T>()` | a `[DcbModel] T` parameter fetched by a `Load` method returning an `EventTagQuery` over the command's strong-typed id members (a TODO when it has none), `T` getting `Apply` methods for what the slice emits, and a notice with the `opts.Events.RegisterTagType<TTag>()` lines to add |
+| `.Emits<T>()` | a `T?` return when it is the slice's only event, else an `EventsToAppend` return; no `[Emits]`, because the source generator reads the events from the body |
+| `.Reads<T>()` / `.Produces<T>()` | an `[Entity] T` parameter / an `IStorageAction<T>` return |
+| an aggregate or view declared **by name** | a class with an `Apply` method per event it folds |
+| an aggregate or view that **already exists** | the `Apply` methods it is missing, added to the end of its class |
+| any other role declared **by name** | a `public record` stub to give fields |
+| `--strong-typed-ids`, or `model.Aggregate<T>().IdentifiedBy<TId>()` | a `public readonly record struct TId(Guid Value) : IParsable<TId>` with a `System.Text.Json` converter that writes the bare Guid, threaded through the aggregate's `Id`, its commands, stream starts and queries; a declared identity wins over the flag, an aggregate class that already exists keeps its own `Id` (with a notice), and a `string` identity is a natural key the command carries |
+| a command or event declared **by name** | a command stub carries the stream it identifies as `Id`, or `{Aggregate}Id` each when it identifies several; an event carries ids only in a multi-stream or DCB slice |
+
+Method bodies describe the shape to fill in and throw `NotImplementedException`, so a slice nobody has filled in yet
+never stops the rest of the application compiling. Guard reasons live in your specifications and are not scaffolded.
+
+The command **never overwrites a file**. An implemented slice is not declared-only, so running it again is a no-op,
+and a file that already exists is reported and left alone. The report is one line per slice, written to be acted on
+by a person or an agent:
+
+```
+WROTE Features/Scheduling/ConfirmAppointment.cs -- ConfirmAppointment: scaffolded.
+EDIT src/Domain/Appointment.cs -- MyApp.Appointment (aggregate): the aggregate already exists, so it was not rewritten. Add these methods to it by hand: public void Apply(AppointmentConfirmed e).
+UNKNOWN BookAppointment: trigger Unknown -- no HTTP endpoint, message handler or gRPC service handles BookAppointmentRequest yet, and the declaration does not say which it will be. Declare .TriggeredBy(TriggerKind.Http) or .TriggeredBy(TriggerKind.MessageHandler) and run the scaffold again.
+```
+
+A stub type that already exists — an aggregate or a view — is never rewritten: `EDIT` names the file it is declared in
+and the exact `Apply` methods it is missing. And a command slice whose trigger neither the declaration nor the code
+reveals is reported as `UNKNOWN` rather than guessed.

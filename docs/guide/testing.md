@@ -168,6 +168,10 @@ private static async Task using_tracked_sessions_advanced(IHost otherWolverineSy
         // Another option
         .IgnoreMessagesMatchingType(type => type.CanBeCastTo<IAgentCommand>())
 
+        // And when the message TYPE cannot tell the traffic apart, filter
+        // on the envelope itself
+        .IgnoreEnvelopes(e => e.Destination == new Uri("rabbitmq://queue/audit-log"))
+
         // There are many other options as well
         .InvokeMessageAndWaitAsync(debitAccount);
 
@@ -175,6 +179,8 @@ private static async Task using_tracked_sessions_advanced(IHost otherWolverineSy
     overdrawn.AccountId.ShouldBe(debitAccount.AccountId);
 }
 ```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/DocumentationSamples/TestingSupportSamples.cs#L136-L202' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_advanced_tracked_session_usage' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
 
 ::: tip
 As of 6.17.3, tracked sessions ignore Wolverine's own framework traffic by default — anything marked
@@ -191,6 +197,120 @@ yourself:
 acknowledgement APIs depend on them.
 :::
 
+### Scoping a session by envelope
+
+`IgnoreMessageType<T>()` and `IgnoreMessagesMatchingType()` can only separate traffic by *message type*,
+which does not help on a shared host where the same message type is legitimately in flight for more than
+one reason at once — background subscriptions, hosted services, or another test's tail. A session that
+keeps recording that traffic waits on it, and times out.
+
+`IgnoreEnvelopes()` is the envelope-level twin. The predicate sees the whole `Envelope`, so you can scope
+on destination, tenant id, correlation id, a header your test stamped, or anything else that actually
+distinguishes the flow under test:
+
+<!-- snippet: sample_ignore_envelopes_on_a_shared_host -->
+<a id='snippet-sample_ignore_envelopes_on_a_shared_host'></a>
+```cs
+private static async Task scoping_a_tracked_session_by_envelope(IHost host, Guid tenantId)
+{
+    var debitAccount = new DebitAccount(111, 300);
+
+    var session = await host
+        .TrackActivity()
+
+        // This host also runs background subscriptions and other tests' work, so the same
+        // message types are legitimately in flight for more than one reason at once and
+        // IgnoreMessageType cannot separate them. The predicate sees the whole Envelope, so
+        // scope on whatever actually distinguishes this flow -- here, the tenant under test.
+        .IgnoreEnvelopes(e => e.TenantId != tenantId.ToString())
+
+        .InvokeMessageAndWaitAsync(debitAccount);
+
+    session.Sent.SingleMessage<AccountOverdrawn>()
+        .AccountId.ShouldBe(debitAccount.AccountId);
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/DocumentationSamples/TestingSupportSamples.cs#L204-L223' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_ignore_envelopes_on_a_shared_host' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+Two things are worth knowing before reaching for it:
+
+* It narrows what gets **recorded**, not what completion requires. A session can still time out waiting on
+  a message it deliberately never consumes.
+* Acknowledgements are never ignored, whatever the filter says, because the session's own acknowledgement
+  APIs depend on them being recorded.
+
+If you want to scope by correlation id, write that predicate yourself —
+`IgnoreEnvelopes(e => e.CorrelationId != mine)`. Wolverine deliberately does not offer a built-in version,
+because that would be a promise that a correlation id survives every transport, HTTP endpoint and interop
+mapping, and any gap would surface as a session that silently stops waiting rather than as an error.
+
+### Ignoring traffic in every session on a host <Badge type="tip" text="6.50" />
+
+Some hosts always have an envelope in flight. An embedded CritterWatch console (`opts.AddCritterWatchEmbedded()`)
+polls, raises alerts and pushes batches to its browser clients for the life of the host, and any library with
+background messaging of its own does the same. A tracked session waits for every envelope it saw to finish, so on a
+host like that it never finishes, and every test that uses one times out, including every WolverineFx.Bobcat act.
+
+Rather than filtering each session, write the rules once on `WolverineOptions.Tracking`, and every tracked session
+against that host applies them:
+
+```cs
+builder.Host.UseWolverine(opts =>
+{
+    // Everything whose message type is declared in these assemblies, a batch of them included
+    opts.Tracking.IgnoreMessagesFromAssembly(typeof(SomeEmbeddedToolMessage).Assembly);
+
+    // Any envelope sent to, or received by, this endpoint
+    opts.Tracking.IgnoreEndpoint(new Uri("local://embedded-tool"));
+
+    // And the same type and envelope rules a single session has
+    opts.Tracking.IgnoreMessageType<HeartbeatTick>();
+    opts.Tracking.IgnoreMessagesMatchingType(t => t.Namespace == "SomeTool.Messages");
+    opts.Tracking.IgnoreEnvelopes(e => e.Headers.ContainsKey("x-background"));
+});
+```
+
+In a test project, the same rules go into the test host's configuration, for example
+`services.ConfigureWolverine(opts => opts.Tracking.IgnoreMessagesFromAssembly(...))` in an Alba or
+WolverineFx.Bobcat fixture. `WolverineScenario` opens its tracked sessions from the host, so the acts honor the rules
+with nothing to configure on the specification.
+
+An ignored envelope is never recorded:
+
+* it does not hold the session open, so the session completes on the application's own messages;
+* it does not appear in the session's history (`AllRecordsInOrder()`, `Sent`, `Executed` and the rest). When a
+  session times out, the activity grid says how many envelope events the rules dropped;
+* an exception it throws is not the session's: `AllExceptions()` leaves it out and `AssertNoExceptionsWereThrown()`
+  does not fail on it;
+* events it appends, and consistency boundaries it loads, are not reported to `AppendedEvents` or `LoadedBoundaries`.
+
+A batch is an array of the batched message type, so every rule that tests a message type, the default ignoring of
+`ISystemCommand` included, also matches a batch of that type. Acknowledgements are never ignored.
+
+A single session can add rules of its own with `IgnoreMessagesFromAssembly()` and `IgnoreEndpoint()` on
+`TrackActivity()`, and a test that asserts on the traffic the host ignores, such as an extension's own tests,
+opts back in with `IncludeHostIgnoredTraffic()`:
+
+```cs
+var session = await host.TrackActivity()
+    .IncludeHostIgnoredTraffic()
+    .InvokeMessageAndWaitAsync(new SomeEmbeddedToolMessage());
+```
+
+An extension that knows its own traffic is background noise can add the rule itself, from an `IWolverineExtension`
+or its `WolverineOptions` registration method, so the applications that use it don't have to:
+
+```cs
+public class MyToolExtension : IWolverineExtension
+{
+    public void Configure(WolverineOptions options)
+    {
+        options.Tracking.IgnoreMessagesFromAssembly(typeof(MyToolExtension).Assembly);
+    }
+}
+```
+
 ### Timeouts govern the whole session
 
 `Timeout()` bounds the *entire* tracked session, including any stage it runs — so a stage that does
@@ -204,8 +324,35 @@ await host.TrackActivity().Timeout(30.Seconds())
     .PauseThenCatchUpOnMartenDaemonActivity()
     .InvokeMessageAndWaitAsync(command);
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/DocumentationSamples/TestingSupportSamples.cs#L136-L198' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_advanced_tracked_session_usage' title='Start of snippet'>anchor</a></sup>
-<!-- endSnippet -->
+
+### First-use handler compilation counts against the timeout
+
+With `TypeLoadMode.Dynamic`, the usual setting in development and tests, Wolverine generates and compiles
+a message handler the first time a message of that type is handled. Handlers compile one at a time, so a
+first message also waits for any other handler that is compiling at that moment. On a small CI runner a
+compile can take a second or more, which means a tracked session whose message and cascades are the
+first of their types can spend most of its 5 seconds compiling, and time out with nothing actually stuck.
+
+Rather than raising the timeout, compile every handler once while the test host starts:
+
+```csharp
+var handlers = host.GetRuntime().Handlers;
+foreach (var chain in handlers.Chains)
+{
+    try
+    {
+        handlers.HandlerFor(chain.MessageType);
+    }
+    catch (NoHandlerForEndpointException)
+    {
+        // A chain with only sticky handlers compiles per endpoint, on first use
+    }
+}
+```
+
+HTTP endpoints compile on their first request in the same way; `WarmUpRoutes = RouteWarmup.Eager` (see
+[the HTTP docs](/guide/http/#eager-warmup)) builds them at startup instead. Pre-generated code
+(`TypeLoadMode.Static`) does no compilation at runtime at all.
 
 ### Forcing projection catch-up outside a tracked session
 
@@ -307,7 +454,7 @@ public class When_message_is_sent : IAsyncLifetime
 {
     private IHost _host = null!;
 
-    public async Task InitializeAsync()
+    public async ValueTask InitializeAsync()
     {
         var hostBuilder = Host.CreateDefaultBuilder();
         hostBuilder.ConfigureServices(
@@ -376,13 +523,202 @@ public class When_message_is_sent : IAsyncLifetime
             .ShouldBeOfType<FileAdded>();
     }
 
-    public async Task DisposeAsync() => await _host.StopAsync();
+    public async ValueTask DisposeAsync() => await _host.StopAsync();
 }
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/DocumentationSamples/TestingSupportSamples.cs#L213-L321' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_send_message_on_file_change' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/DocumentationSamples/TestingSupportSamples.cs#L247-L355' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_send_message_on_file_change' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 As you can see, we just have to start our application, attach a tracked session to it, and then wait for the message to be published. This way, we can test the whole process of the application, from the file change to the message publication, in a single test.
+
+### Finding events caused past an asynchronous boundary <Badge type="tip" text="6.49" />
+
+A tracked session can only wait on what it can see. Let's say your handler appends an event, and an event
+subscription running in the async daemon picks that event up later and publishes a message whose handler
+appends more events. The tracked session is long done by the time that happens, so `AppendedEvents` will never
+show you those downstream events.
+
+What *can* follow the work across that boundary is the correlation id. If you run the tracked work under a known
+correlation id, every message it causes carries that id, and an event store with correlation ids enabled records
+it on every event those messages append:
+
+```csharp
+var session = await host.TrackActivity()
+    .WithCorrelationId("the-trip-test")
+    .InvokeMessageAndWaitAsync(new CompleteTrip(tripId));
+```
+
+From there you can query the event store by that correlation id once the async daemons have caught up.
+
+::: warning
+Correlation ids are **off by default** in Marten, Polecat and Fisher. You'll need
+`opts.Events.MetadataConfig.CorrelationIdEnabled = true` in `AddMarten()`, or
+`opts.Events.EnableCorrelationId = true` in `AddPolecat()` or `AddFisher()`, and the new column in your schema.
+:::
+
+The correlation id only reaches an event if every hop carries it. Wolverine's own handlers do that for you, but an
+event subscription or a projection's side effect that publishes a message has to pass the event's correlation id
+along itself:
+
+<!-- snippet: sample_bobcat_pass_the_correlation_id_on -->
+<a id='snippet-sample_bobcat_pass_the_correlation_id_on'></a>
+```cs
+public static class ParcelSubscription
+{
+    // The subscription passes the event's correlation id on to the message it publishes, so the events that
+    // message's handler appends are recorded with the act's correlation id too
+    public static ValueTask Relay(IEvent<ParcelShipped> e, IMessageBus bus)
+        => bus.PublishAsync(new NotifyRecipient(e.StreamId), new DeliveryOptions { CorrelationId = e.CorrelationId });
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Bobcat/Wolverine.Bobcat.Tests/events_the_act_eventually_caused.cs#L72-L82' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_bobcat_pass_the_correlation_id_on' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+::: info
+Polecat's async daemon does not currently load the correlation id onto the events it hands to a subscription, so on
+Polecat there is nothing to pass along yet. Marten does.
+:::
+
+#### With WolverineFx.Bobcat
+
+If you're writing specifications with WolverineFx.Bobcat, every act already runs under a correlation id of its own,
+and the `ThenEventuallyCaused()` step does the waiting and the querying for you. It waits for the async daemons to
+catch up, queries the event store for every event recorded with the act's correlation id, and keeps looking for a
+little while (`EventuallyTimeout` on the spec or its scenario, ten seconds by default) for work that lands after the daemons, like a handler on a
+local queue. Using this Marten configuration:
+
+<!-- snippet: sample_bobcat_events_past_an_async_boundary_marten -->
+<a id='snippet-sample_bobcat_events_past_an_async_boundary_marten'></a>
+```cs
+public sealed class MartenParcelHost : ParcelHost
+{
+    public override string? WhyNoAsyncBoundary => null;
+
+    protected override void ConfigureStore(WolverineOptions opts)
+        => opts.Services.AddMarten(m =>
+            {
+                m.Connection(Servers.PostgresConnectionString);
+                m.DatabaseSchemaName = "bobcat_eventually_caused";
+                m.DisableNpgsqlLogging = true;
+
+                // ThenEventuallyCaused queries the store by the act's correlation id, which Marten only
+                // records when this is on
+                m.Events.MetadataConfig.CorrelationIdEnabled = true;
+            })
+            .IntegrateWithWolverine()
+            .AddAsyncDaemon(DaemonMode.Solo)
+            .PublishEventsToWolverine("parcels", relay => relay.PublishEvent<ParcelShipped>(ParcelSubscription.Relay));
+}
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Bobcat/Wolverine.Bobcat.Tests/events_the_act_eventually_caused.cs#L121-L143' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_bobcat_events_past_an_async_boundary_marten' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+the specification reads like this:
+
+<!-- snippet: sample_bobcat_then_eventually_caused -->
+<a id='snippet-sample_bobcat_then_eventually_caused'></a>
+```cs
+var theParcel = await aBookedParcel();
+
+await WhenReceived(new ShipParcel(theParcel));
+
+// RecipientNotified is appended by the handler of a message an event subscription published, after the
+// tracked session is over: found in the store by the act's correlation id
+await ThenEventuallyCaused(new RecipientNotified(theParcel));
+```
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Bobcat/Wolverine.Bobcat.Tests/events_the_act_eventually_caused.cs#L253-L263' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_bobcat_then_eventually_caused' title='Start of snippet'>anchor</a></sup>
+<!-- endSnippet -->
+
+`ThenEventuallyCaused()` checks the events you name are *among* the ones the act caused, the same way `ThenEmitted()`
+does, because the act's own events and its cascades' carry the correlation id too. Whole objects, `Expect.Value()`
+and partial `Specify<T>()` objects all work.
+
+A few things to know:
+
+* If the event store does not record correlation ids, the step **fails** and tells you the exact setting to turn on
+  for Marten, Polecat or Fisher. It does not skip, because a skipped "then" looks green.
+* The act carries its tenant (`LastAct.TenantId`): the tenant an HTTP endpoint's tenant detection found, or the entry
+  message's, which `WhenReceived(message, options: new DeliveryOptions { TenantId = "red" })` sets. On a store with
+  conjoined tenancy (one database, the tenant as a column) the step looks for the act's events within that tenant only.
+* On a store that gives each tenant its own database, the step waits on and reads the act's tenant's database. It
+  asks the store which database that is through `IEventStore.FindDatabaseForTenantAsync()`, and if the store can't
+  say yet, it just waits on every database before reading through the tenant. An act that carried no tenant at all is
+  looked for in every database. That's still exact, because a correlation id only ever belongs to one act.
+* For an HTTP act, `WhenPosted()` sends the act's correlation id as the `X-Correlation-ID` header. For the events an
+  endpoint appends to record it, turn on `WolverineHttpOptions.ApplyCorrelationIdHeaderToAllEndpoints` -- see
+  [applying the correlation id to every endpoint](/guide/http/middleware#applying-the-correlation-id-to-every-endpoint).
+  If you make your own HTTP call inside `WhenTracked()`, send `ActCorrelationId` as that header yourself.
+
+### More WolverineFx.Bobcat: several stores, context, and foreign events <Badge type="tip" text="6.50" />
+
+`WolverineSpec` and `WolverineScenario` inherit everything Bobcat's `CritterStackSpec` does, and a few of those steps
+are worth knowing about from the Wolverine side:
+
+* **Several event stores.** On a host with a main store and an ancillary one, such as Marten's
+  `AddMartenStore<IInvoicingStore>()`, each Given and Then goes to the store whose registrations claim its type. When the
+  type doesn't decide it, address the store explicitly with `In<IInvoicingStore>()` or `In("name")`. The view `In()`
+  returns is still a `WolverineScenario`: an act through it is the specification's act, and the message and consistency
+  boundary steps work on it. The act itself is observed on every store, so a `[MartenStore(typeof(IInvoicingStore))]`
+  handler that reads the main store and appends to the ancillary one is specified in one test, and
+  `ITrackedSession.AppendedEvents` says which store each commit belonged to.
+* **`GivenContext<T>()`** arranges events for something the slice *reads* (its `ReadsFrom`), like a customer an
+  `[Entity]` parameter loads, without claiming it as the slice's aggregate.
+* **`ForeignEvents`.** An act that appends through a session Wolverine did not open is read back from the store, store by
+  store. Events on streams the specification never arranged or started go to `LastAct.ForeignEvents` instead of being
+  judged, and a failing whole-store step adds a "cross-talk suspected" line and, with several stores, which store each
+  event came from. To claim a stream the host seeded, address it in the specification: `WhenActingOn<T>(id, ...)`,
+  `GivenContext`, or `GivenEvents` on that stream.
+* **A concurrent writer.** `WhileActing(concurrently: Tagged(new ItemReserved(sku, 1), sku))` lands a real append
+  between the next act's read and its write, on the act's first save, so a specification can prove a Dynamic
+  Consistency Boundary: inside it the act is refused with a `DcbConcurrencyException` (`ThenRefusedWith<T>()`), or a
+  retry policy retries it and `ThenRetried()` passes; outside it, the act succeeds. The append is keyed by the act's own
+  correlation id and lands on the first save of a session Wolverine opens for the act (a handler's or an HTTP
+  endpoint's, with the store integrated with Wolverine); a session the act opens straight from the store carries no
+  correlation id, so it never fires there. The hook is only added while a tracked session runs.
+* **`ProjectionCatchUpTimeoutException`.** A document or read-model step that waits for the async daemons and runs out of
+  time throws this (it's a `TimeoutException`), naming the shards that were behind and the identity being read.
+
+### WolverineFx.Bobcat.Http: reads and the other verbs <Badge type="tip" text="6.50" />
+
+`WolverineHttpSpec` (and `WolverineHttpScenario`, and its `In<T>()` views) can read as well as post. A read is an act
+like any other: it runs inside the tracked session, and its exchange lands in the HTTP report a failing spec writes out.
+
+```cs
+[Fact]
+public async Task a_scheduled_appointment_is_read()
+{
+    var id = Guid.NewGuid();
+    await GivenEvents<Appointment>(id, new AppointmentScheduled(id, "Ann"));
+
+    // GET the template, filled with its values in order; the 2xx body comes back as the type
+    var appointment = await WhenReading<Appointment>("/api/appointments/{id}", id);
+    appointment!.Patient.ShouldBe("Ann");
+
+    // or address the endpoint by its RouteName
+    var summary = await WhenReadingRoute<AppointmentSummary>("AppointmentSummary", id);
+}
+
+[Fact]
+public async Task a_missing_appointment_is_not_found()
+{
+    await WhenReading<Appointment>("/api/appointments/{id}", Guid.NewGuid());
+    ThenNotFound();
+}
+```
+
+* **`WhenReading<T>(route, params routeValues)`** and **`WhenReadingRoute<T>(routeName, params routeValues)`** GET the
+  endpoint and hand back the 2xx body as a `T`, or null for a 4xx. A 404 is a refusal, not a failure, so
+  `ThenNotFound()` (or `ThenResponseIs(404)`) asserts it.
+* **A read is a Query slice.** Both acts declare a GET trigger and a read model role with no command, so Bobcat puts a
+  spec whose last act is a read on the Event Model as a **Query** slice that reads `T`. The slice carries the route, and
+  for `WhenReadingRoute` the route name too. Pass the template or the route name as a constant so the generator can
+  read it.
+* **PUT, PATCH and DELETE** have the same three forms as `WhenPosted`, each a command act with its verb on the trigger:
+  `WhenPut`/`WhenPatched`/`WhenDeleted(command)` find the endpoint from the command's type,
+  `(command, route)` takes the route, and `WhenPutToRoute`/`WhenPatchedToRoute`/`WhenDeletedToRoute`/`WhenPostedToRoute(command, routeName)`
+  address the endpoint by route name. Route parameters are filled from the command's properties, and `DELETE` sends the
+  command as its JSON body.
+* **`TheResponse<T>()`** reads the last HTTP act's 2xx body, for the acts that don't hand one back.
 
 ## Dealing with Scheduled Messages  <Badge type="tip" text="4.12" />
 
@@ -426,7 +762,7 @@ using var host = await Host.CreateDefaultBuilder()
     {
         opts.PersistMessagesWithPostgresql(Servers.PostgresConnectionString, "wolverine");
         opts.Policies.UseDurableInboxOnAllListeners();
-    }).StartAsync();
+    }).StartAsync(cancellationToken: TestContext.Current.CancellationToken);
 
 // Should finish cleanly
 var tracked = await host.SendMessageAndWaitAsync(new TriggerScheduledMessage("Chiefs"));
@@ -456,13 +792,13 @@ using var sender = await Host.CreateDefaultBuilder()
     {
         opts.PublishMessage<ScheduledMessage>().ToPort(port2);
         opts.ListenAtPort(port1);
-    }).StartAsync();
+    }).StartAsync(cancellationToken: TestContext.Current.CancellationToken);
 
 using var receiver = await Host.CreateDefaultBuilder()
     .UseWolverine(opts =>
     {
         opts.ListenAtPort(port2);
-    }).StartAsync();
+    }).StartAsync(cancellationToken: TestContext.Current.CancellationToken);
 
 // Should finish cleanly
 var tracked = await sender
@@ -655,7 +991,7 @@ public class when_the_account_is_overdrawn : IAsyncLifetime
     // I happen to like NSubstitute for mocking or dynamic stubs
     private readonly IDocumentSession theDocumentSession = Substitute.For<IDocumentSession>();
 
-    public async Task InitializeAsync()
+    public async ValueTask InitializeAsync()
     {
         var command = new DebitAccount(theAccount.Id, 1200);
         await DebitAccountHandler.Handle(command, theAccount, theDocumentSession, theContext);
@@ -686,13 +1022,13 @@ public class when_the_account_is_overdrawn : IAsyncLifetime
             .ScheduleDelay.ShouldBe(10.Days());
     }
 
-    public Task DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        return Task.CompletedTask;
+        return ValueTask.CompletedTask;
     }
 }
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/Middleware/AppWithMiddleware.Tests/try_out_the_middleware.cs#L89-L141' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_when_the_account_is_overdrawn' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/Middleware/AppWithMiddleware.Tests/try_out_the_middleware.cs#L88-L140' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_when_the_account_is_overdrawn' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 The `TestMessageContext` mostly just collects an array of objects that are sent, published, or scheduled. The
@@ -735,7 +1071,7 @@ spy.WhenInvokedMessageOf<NumberRequest>(endpointName:"incoming")
 var response3 = await context.EndpointFor("incoming")
     .InvokeAsync<NumberResponse>(new NumberRequest(5, 6));
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Testing/CoreTests/TestMessageContextTests.cs#L502-L533' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_using_invoke_with_expected_response_with_test_message_context' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Testing/CoreTests/TestMessageContextTests.cs#L566-L597' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_using_invoke_with_expected_response_with_test_message_context' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 ## Stubbing All External Transports
@@ -797,7 +1133,7 @@ using var host = await Host.CreateDefaultBuilder()
     // messages to run completely locally
     .ConfigureServices(services => services.DisableAllExternalWolverineTransports())
 
-    .StartAsync();
+    .StartAsync(cancellationToken: TestContext.Current.CancellationToken);
 ```
 <sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Testing/CoreTests/Configuration/disabling_all_external_transports.cs#L12-L26' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_disabling_external_transports' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
@@ -821,7 +1157,7 @@ await using var host = await AlbaHost.For<Program>(x =>
     x.ConfigureServices(services => services.DisableAllExternalWolverineTransports());
 });
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/Middleware/AppWithMiddleware.Tests/try_out_the_middleware.cs#L24-L34' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_disabling_the_transports_from_web_application_factory' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Samples/Middleware/AppWithMiddleware.Tests/try_out_the_middleware.cs#L23-L33' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_disabling_the_transports_from_web_application_factory' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 In the sample above, I'm bootstrapping the `IHost` for my production application with 
@@ -850,7 +1186,7 @@ public static async Task reset_everything(IHost host)
     await host.ClearAllWolverineStorageAsync();
 }
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/PersistenceTests/Samples/DocumentationSamples.cs#L52-L64' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_clear_all_wolverine_storage' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Persistence/PersistenceTests/Samples/DocumentationSamples.cs#L51-L64' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_clear_all_wolverine_storage' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 The method is the union of two things:

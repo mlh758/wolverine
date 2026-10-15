@@ -2,6 +2,7 @@
 using JasperFx.Descriptors;
 using JasperFx.MultiTenancy;
 using Wolverine.Persistence;
+using Wolverine.Transports;
 
 namespace Wolverine;
 
@@ -32,7 +33,36 @@ public enum DurabilityMode
     /// Optimizes Wolverine for usage as strictly a mediator tool. This completely disables all node
     /// persistence including the inbox and outbox
     /// </summary>
-    MediatorOnly
+    MediatorOnly,
+
+    /// <summary>
+    /// The same lean runtime as <see cref="Serverless"/> -- no node registration, no node agents,
+    /// no leader election, no local queues and no background durability timers -- but the message
+    /// store's transactional outbox stays active. Outgoing envelopes are persisted inside the
+    /// handler's transaction with an owner of "any node" (0), and are recovered by an externally
+    /// triggered durability pass. See GH-5016
+    /// </summary>
+    ServerlessWithOutbox
+}
+
+/// <summary>
+/// GH-4569. The part a node plays in a Balanced cluster during a blue/green rollout
+/// </summary>
+public enum NodeRole
+{
+    /// <summary>
+    /// The default. The node handles messages and runs whatever agents the leader assigns it
+    /// </summary>
+    Serving,
+
+    /// <summary>
+    /// The node only warms up the projections of a new release before it is cut over to. It takes part in
+    /// the agent cluster through the control queue, but never leads, never handles application messages,
+    /// never recovers or schedules persisted envelopes, and only runs the projection agents that no
+    /// serving node declares -- in rebuild mode, so their side effects are not published. Restart the
+    /// node as <see cref="Serving"/> to cut over to it
+    /// </summary>
+    Warmup
 }
 
 /// <summary>
@@ -224,14 +254,77 @@ public class DurabilitySettings : IDescribeMyself
     /// If non-null, this directs Wolverine to "push" any message in the durable outbox that is older
     /// than the configured time even if the message is marked as owned by an active node
     /// </summary>
-    public TimeSpan? OutboxStaleTime { get; set; }
+    /// <remarks>
+    /// Under <see cref="DurabilityMode.ServerlessWithOutbox"/> this defaults to 60 seconds. A value set
+    /// explicitly always wins.
+    /// </remarks>
+    public TimeSpan? OutboxStaleTime
+    {
+        get => _outboxStaleTime ?? (Mode == DurabilityMode.ServerlessWithOutbox ? ServerlessWithOutboxDefaultOutboxStaleTime : null);
+        set => _outboxStaleTime = value;
+    }
+
+    private TimeSpan? _outboxStaleTime;
+
+    internal static readonly TimeSpan ServerlessWithOutboxDefaultOutboxStaleTime = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// The owner id stamped onto outgoing envelopes when they are written to the outbox. Under
+    /// <see cref="DurabilityMode.ServerlessWithOutbox"/> there is no node record to own them, so they are
+    /// written as owned by any node (0) from the start
+    /// </summary>
+    internal int OutgoingOwnerId => Mode == DurabilityMode.ServerlessWithOutbox
+        ? TransportConstants.AnyNode
+        : AssignedNodeNumber;
+
+    /// <summary>
+    /// GH-5016. Opt in to an index on the outgoing envelope table's <c>timestamp</c> column, for the stale
+    /// <c>owner_id = 0</c> predicate a <see cref="DurabilityMode.ServerlessWithOutbox"/> durability pass
+    /// uses to find the outbox rows whose inline send failed. Only applies where the column exists, which
+    /// is whenever <see cref="OutboxStaleTime"/> has a value. Default is false, so there is no schema
+    /// change unless you ask for one
+    /// </summary>
+    public bool EnableOutgoingTimestampIndex { get; set; }
     
     /// <summary>
     /// If non-null, this directs Wolverine to "push" any message in the durable inbox that is older
     /// than the configured time even if the message is marked as owned by an active node. Should NOT ever
     /// be necessary, but it's an imperfect world. Enable this if you see "stuck" envelopes
     /// </summary>
-    public TimeSpan? InboxStaleTime { get; set; }
+    /// <remarks>
+    /// The age is measured from when a node last claimed the message -- on receipt, on recovery, or when a
+    /// scheduled retry came due -- and only messages waiting to run are released, not scheduled ones (GH-5022).
+    /// While a node holds a message in memory -- queued in a durable receiver, or running in a handler -- its
+    /// clock is restarted three times per InboxStaleTime, so a long handler or a long local backlog is not
+    /// released underneath itself. That needs a store implementing
+    /// <see cref="Wolverine.Persistence.Durability.IMessageInboxHeartbeat" />, which every relational store does.
+    /// Under <see cref="DurabilityMode.ServerlessWithOutbox"/> this defaults to 5 minutes, so a durability pass
+    /// recovers the inbox rows of a process that died before its handler finished (GH-5037). That mode runs no
+    /// durable receivers and so no heartbeat, so there it must be longer than the longest handler. A value set
+    /// explicitly always wins.
+    /// </remarks>
+    public TimeSpan? InboxStaleTime
+    {
+        get => _inboxStaleTime ?? (Mode == DurabilityMode.ServerlessWithOutbox ? ServerlessWithOutboxDefaultInboxStaleTime : null);
+        set => _inboxStaleTime = value;
+    }
+
+    private TimeSpan? _inboxStaleTime;
+
+    internal static readonly TimeSpan ServerlessWithOutboxDefaultInboxStaleTime = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// GH-4659. How long a tenant database's writes are held after it refuses one, before a single probe
+    /// is let through to see whether it is back. Defaults to 2 seconds.
+    /// </summary>
+    /// <remarks>
+    /// While a tenant's database is down, its stranded envelopes are deferred back to the broker and
+    /// redelivered immediately, so every one of them retries as fast as the database can refuse a
+    /// connection. This bounds the cost of that spin to one connection attempt per store per cycle; the
+    /// refusals in between never reach the network. Raising it reduces the load on a database that is
+    /// already struggling, at the cost of taking longer to notice it has recovered.
+    /// </remarks>
+    public TimeSpan TenantWriteBrakeCycle { get; set; } = 2.Seconds();
     
     /// <summary>
     /// For persistence mechanisms that support this (PostgreSQL), this directs Wolverine to use partitioning
@@ -342,7 +435,53 @@ public class DurabilitySettings : IDescribeMyself
     ///     <c>Policies.RequireDeduplicationId()</c>.
     ///     </para>
     /// </summary>
-    public bool EnableMessageDeduplication { get; set; }
+    /// <remarks>
+    ///     GH-4757. A boolean cannot say HOW the ids are compared, and the original string comparison
+    ///     behaves differently on SQL Server and MySQL than on PostgreSQL and SQLite — see
+    ///     <see cref="MessageDeduplicationMode" />. Kept as a pass-through so existing configuration code
+    ///     keeps compiling: <c>true</c> now means
+    ///     <see cref="Wolverine.MessageDeduplicationMode.CompareByHash" />, the engine-independent
+    ///     comparison. An application that needs the old table and the old comparison sets
+    ///     <see cref="MessageDeduplicationMode" /> to
+    ///     <see cref="Wolverine.MessageDeduplicationMode.CompareByString" /> explicitly.
+    /// </remarks>
+    [Obsolete(
+        "Use DurabilitySettings.MessageDeduplicationMode instead. 'true' maps to MessageDeduplicationMode.CompareByHash and 'false' to MessageDeduplicationMode.None. GH-4757")]
+    public bool EnableMessageDeduplication
+    {
+        get => MessageDeduplicationMode != MessageDeduplicationMode.None;
+        set => MessageDeduplicationMode =
+            value ? MessageDeduplicationMode.CompareByHash : MessageDeduplicationMode.None;
+    }
+
+    /// <summary>
+    ///     GH-4757. Opt in to storage for <b>logical</b> message deduplication ids, and choose how those
+    ///     ids are compared for equality. <see cref="Wolverine.MessageDeduplicationMode.None" /> — the
+    ///     default — provisions nothing, so an upgrade migrates nothing.
+    ///
+    ///     <para>
+    ///     Prefer <see cref="Wolverine.MessageDeduplicationMode.CompareByHash" />: the comparison is a
+    ///     binary one and therefore identical on every engine.
+    ///     <see cref="Wolverine.MessageDeduplicationMode.CompareByString" /> preserves the original
+    ///     GH-4180 table and comparison exactly, for an application that cannot take the schema change.
+    ///     </para>
+    ///
+    ///     <para>
+    ///     Setting this provisions storage; it does not by itself deduplicate anything. Individual
+    ///     message handlers, HTTP endpoints and gRPC methods opt in with <c>[Deduplicated]</c> or via
+    ///     <c>Policies.RequireDeduplicationId()</c>.
+    ///     </para>
+    /// </summary>
+    public MessageDeduplicationMode MessageDeduplicationMode { get; set; } = MessageDeduplicationMode.None;
+
+    /// <summary>
+    ///     GH-4742. Opt in to storage for <c>[DeduplicatedWithResponse]</c> HTTP endpoints, which answer a repeat
+    ///     of a request with its first response. Provisions a separate <c>wolverine_deduplicated_responses</c>
+    ///     table, so it is independent of <see cref="EnableMessageDeduplication" />. Claims expire after
+    ///     <see cref="DeduplicationWindow" /> unless the endpoint sets its own, and are reaped on
+    ///     <see cref="DeduplicationCleanupPollingTime" />.
+    /// </summary>
+    public bool EnableDeduplicatedResponses { get; set; }
 
     /// <summary>
     ///     GH-4180. How long a logical deduplication claim is honoured before the reaper removes it.
@@ -473,6 +612,17 @@ public class DurabilitySettings : IDescribeMyself
     public TimeSpan HealthCheckPollingTime { get; set; } = 10.Seconds();
 
     /// <summary>
+    /// GH-4986. The longest a locally owned event subscription shard waits before it is restarted after the
+    /// daemon paused it on a transient failure (<see cref="JasperFx.Events.Daemon.ShardFailure.IsTransient" />:
+    /// a connection pool exhausted during a large rebuild, a timeout, a failover). The first restart comes
+    /// <see cref="HealthCheckPollingTime" /> after the failure, and every further one for the same shard
+    /// doubles that, up to this ceiling, so a shard failing on a starved pool does not keep adding load to
+    /// exactly that pool. The shard's count starts over once it has run longer than this ceiling without
+    /// failing again. Default five minutes.
+    /// </summary>
+    public TimeSpan TransientFailureRestartMaxBackoff { get; set; } = 5.Minutes();
+
+    /// <summary>
     /// Age of health check data before a node is considered to be "stale" or dormant and
     /// will be recovered by the durability agent
     /// </summary>
@@ -560,6 +710,63 @@ public class DurabilitySettings : IDescribeMyself
     public int AssignmentSettleNodeCount { get; set; }
 
     /// <summary>
+    ///     GH-4897. How many of its first assignment evaluations a newly elected leader spends NOT placing
+    ///     agents that are running nowhere yet, when it took over a cluster whose other nodes already hold
+    ///     assignments. The pending-assignment ledger is leader-local, so a new leader cannot see the starts
+    ///     its predecessor dispatched that have not yet come up as persisted rows; placing those agents
+    ///     straight away can send one to a second node while the first copy is still starting. Holding the
+    ///     unplaced ones back for a snapshot cycle lets those rows appear and be kept where they are.
+    ///
+    ///     Only agents that are running nowhere and have no start in flight wait; moves, stops and every
+    ///     agent already visible proceed. The hold only applies when another node already holds assignments;
+    ///     a cold cluster's first leader is governed by <see cref="LeaderColdStartHoldEvaluations" /> instead.
+    ///     Default 1. Zero disables it.
+    /// </summary>
+    public int LeaderTakeoverHoldEvaluations { get; set; } = 1;
+
+    /// <summary>
+    ///     GH-4569. How many assignment evaluations the first node of a cold cluster spends NOT placing agents
+    ///     while it is the only node registered. With nobody else in the node table every distribution hands
+    ///     that node the whole agent universe, and each node that joins afterwards is served out of the first
+    ///     node's own lane as a stop-then-start: on the reported fleet 37,310 of 37,388 agents started on the
+    ///     first node before any peer got a share. One or two evaluations is enough for pods that start
+    ///     together to register and take their share from the outset.
+    ///
+    ///     Only applies when the wave being held is larger than <see cref="AgentStartBatchSize" />, so a single
+    ///     node running a handful of agents is not made to wait for peers that are never coming, and ends the
+    ///     moment a second node registers. A rollout whose pods arrive over a longer period is what
+    ///     <see cref="AssignmentSettlePeriod" /> is for. Default 1. Zero disables it.
+    /// </summary>
+    public int LeaderColdStartHoldEvaluations { get; set; } = 1;
+
+    /// <summary>
+    ///     GH-4569. Whether this node may be elected leader of the cluster and run the agent assignment. Every
+    ///     node is eligible by default. Set it to false on a node that should run agents but never decide
+    ///     their placement -- the warm-up nodes of a blue/green rollout, whose own store enumerates the NEW
+    ///     version's agents and which would otherwise evaluate the whole cluster from the least representative
+    ///     node in it. An ineligible node still heartbeats, ejects stale peers, reconciles and sweeps its own
+    ///     agents, and takes whatever assignments the leader gives it; it simply never contends for the
+    ///     leadership lock. At least one node of the cluster must be eligible, or nothing is ever assigned.
+    /// </summary>
+    public bool LeadershipEligible { get; set; } = true;
+
+    /// <summary>
+    ///     GH-4569. The part this node plays in a blue/green rollout. The default is <see cref="Wolverine.NodeRole.Serving"/>.
+    ///     A <see cref="Wolverine.NodeRole.Warmup"/> node warms up the new release's projections in the same cluster as
+    ///     the serving nodes without doing any of their messaging, and is never eligible for leadership. The
+    ///     role travels to the leader as a marker in the node's capabilities, so it needs no change to any
+    ///     node table, but the serving nodes -- the leader among them -- must run a Wolverine version that
+    ///     understands it before a warm-up node uses it.
+    /// </summary>
+    public NodeRole NodeRole { get; set; } = NodeRole.Serving;
+
+    /// <summary>
+    ///     Whether this node may contend for leadership: <see cref="LeadershipEligible"/>, and never on a
+    ///     <see cref="Wolverine.NodeRole.Warmup"/> node.
+    /// </summary>
+    internal bool CanLead => LeadershipEligible && NodeRole == NodeRole.Serving;
+
+    /// <summary>
     ///     GH-3604 / D3: the maximum number of agent assignments the leader packs into a single
     ///     <c>StartAgents</c> control message to a node. A node running a very large agent universe
     ///     (e.g. database-per-tenant Marten with thousands of subscription shards) cannot start
@@ -567,6 +774,33 @@ public class DurabilitySettings : IDescribeMyself
     ///     are chunked into batches of this size and sent one chunk at a time. Default 50.
     /// </summary>
     public int AgentStartBatchSize { get; set; } = 50;
+
+    /// <summary>
+    ///     GH-4720. Compress agent command payloads on the wire, under the separate
+    ///     <c>binary/wolverine+gzip</c> content type. Off by default.
+    /// </summary>
+    /// <remarks>
+    ///     <para>
+    ///     An agent command carries a list of agent URIs, which at cluster scale is both large and extremely
+    ///     compressible — nearly all of it is repeated scheme, family, projection and database structure.
+    ///     Measured 3.9x on a GUID-dominated URI shape and up to 24x on a structural one, at roughly 5ms for
+    ///     7,592 agents. That shrinks the control queue rows a large cluster writes and re-reads on every
+    ///     poll, and it raises the ceiling under <c>Options.MaxIncomingEnvelopeDataSize</c>.
+    ///     </para>
+    ///     <para>
+    ///     <b>Turn this on only once every node in the cluster is running a version that can read it.</b>
+    ///     Reading is unconditional from this version forward, so the upgrade path is: deploy everywhere
+    ///     first, then enable. A node that predates the content type will reject the command rather than
+    ///     misread it — loudly, but it will still reject it, and agent assignment to that node stops until it
+    ///     is upgraded. It is off by default for exactly that reason; a rolling deploy is the normal case.
+    ///     </para>
+    ///     <para>
+    ///     Compression does not REPLACE chunking by <see cref="AgentStartBatchSize" /> (GH-4718). It scales
+    ///     the constant; it does not bound anything, and at tens of thousands of agents even a 10x saving is
+    ///     back over the reader's limit.
+    ///     </para>
+    /// </remarks>
+    public bool CompressAgentCommands { get; set; }
 
     /// <summary>
     ///     GH-3604 / D3: the maximum number of agents a receiving node starts concurrently when it
@@ -604,6 +838,16 @@ public class DurabilitySettings : IDescribeMyself
     ///     daemon's bounded side-effect gate, which has a five-minute ceiling. Default 5 minutes.
     /// </summary>
     public TimeSpan AgentProgressStallTimeout { get; set; } = 5.Minutes();
+
+    /// <summary>
+    ///     GH-4871: how long <see cref="IAgentRuntime.ApplyRestrictionsAsync" /> waits for an agent that an
+    ///     operator's restart or pin should have put to work to show up in the persisted node assignments,
+    ///     before it reports the change as not confirmed. The kickstarted health check dispatches its
+    ///     assignment commands asynchronously, so the start may still be in flight when the inline drain
+    ///     returns; a healthy start lands within milliseconds, so this only runs its full length when an
+    ///     agent genuinely will not start. Default 10 seconds.
+    /// </summary>
+    public TimeSpan AgentRestrictionConfirmationTimeout { get; set; } = 10.Seconds();
 
     /// <summary>
     ///     GH-3519: how many extra times this node immediately re-tries an agent that failed to start,
@@ -654,6 +898,69 @@ public class DurabilitySettings : IDescribeMyself
     ///     negative number for no cap. Default 50.
     /// </summary>
     public int MaxLocalAgentReconciliationsPerTick { get; set; } = 50;
+
+    /// <summary>
+    ///     Opt in to capacity-aware agent assignment. Each node advertises its current load (see
+    ///     <see cref="NodeLoadMonitor" />) on every heartbeat; the leader prefers the least-loaded
+    ///     nodes, never places onto a node at or above <see cref="NodeOverloadThreshold" />, and sheds
+    ///     agents off overloaded nodes onto nodes that still have headroom. Requires a message store
+    ///     that persists the load advertisement — PostgreSQL, SQL Server, MySQL, Oracle, SQLite, RavenDB
+    ///     and Azure Cosmos DB all do (GH-4593); a store that does not is reported as a startup warning.
+    ///     Off by default.
+    ///     <para>
+    ///         Setting this to true <b>requires</b> a <see cref="NodeLoadMonitor" />; there is no
+    ///         default. Starting a host with this on and no monitor is a startup error.
+    ///     </para>
+    ///     <para>
+    ///         How strictly load is honored depends on how constrained the placement already is.
+    ///         <see cref="Runtime.Agents.AssignmentGrid.DistributeEvenly(string)" /> treats the overload
+    ///         threshold as a hard line — every node is a candidate there, so refusing the overloaded
+    ///         ones cannot strand an agent, and an agent waits rather than being piled onto a node that
+    ///         cannot start it. The capability-aware paths — group affinity for multi-database event
+    ///         stores, blue/green across mixed capabilities, and the durability-agent affinity spread —
+    ///         treat it as a strong preference instead: their candidate sets are already narrowed by
+    ///         declared capabilities, so a second hard constraint could empty one and leave a shard
+    ///         database with no running agent at all. There, a node with headroom always wins, but an
+    ///         overloaded node still beats nothing.
+    ///     </para>
+    ///     <para>
+    ///         Group affinity additionally moves whole partitions off an overloaded node, at most
+    ///         <see cref="OverloadShedBatchSize" /> per evaluation and only when another candidate can
+    ///         take the entire partition — a shard database's agents are never split to relieve pressure.
+    ///     </para>
+    ///     <para>
+    ///         On a relational store, enabling this provisions a <c>load_factor</c> column on the
+    ///         <c>wolverine_nodes</c> table. With <c>AutoCreate.None</c> — or a process without DDL
+    ///         rights — apply the schema migration before turning this on; otherwise every heartbeat
+    ///         fails against the missing column. Every statement naming the column is gated on this same
+    ///         flag, so leaving it off migrates nothing and reads nothing. The document stores have no
+    ///         schema to migrate: an absent property simply reads back as "not advertising".
+    ///     </para>
+    /// </summary>
+    public bool CapacityAwareAssignment { get; set; }
+
+    /// <summary>
+    ///     Advertised load percentage at or above which a node is considered overloaded: it begins
+    ///     shedding agents, and stops receiving new ones starting 10 points below this value.
+    ///     Default 90.
+    /// </summary>
+    public double NodeOverloadThreshold { get; set; } = 90;
+
+    /// <summary>
+    ///     Maximum number of agents per scheme the leader moves off an overloaded node in one
+    ///     assignment evaluation. Default 1. Shedding only happens when some other node can take the
+    ///     work — an overloaded node with nowhere to shed to keeps what it is running.
+    /// </summary>
+    public int OverloadShedBatchSize { get; set; } = 1;
+
+    /// <summary>
+    ///     Sampler for this node's own load. <b>Required</b> when
+    ///     <see cref="CapacityAwareAssignment" /> is enabled — there is deliberately no default,
+    ///     because what "load" means is specific to what the application does. See
+    ///     <see cref="Runtime.Agents.INodeLoadMonitor" />, and
+    ///     <see cref="Runtime.Agents.MemoryPressureLoadMonitor" /> for the memory case.
+    /// </summary>
+    public Runtime.Agents.INodeLoadMonitor? NodeLoadMonitor { get; set; }
 
     /// <summary>
     ///     GH-3970: how many consecutive assignment ticks may fail to <i>build or start</i> an agent on this
@@ -847,6 +1154,7 @@ public class DurabilitySettings : IDescribeMyself
         desc.AddValue(nameof(MetricsCollectionSamplingInterval), MetricsCollectionSamplingInterval);
         desc.AddValue(nameof(ScheduledJobPollingTime), ScheduledJobPollingTime);
         desc.AddValue(nameof(HealthCheckPollingTime), HealthCheckPollingTime);
+        desc.AddValue(nameof(TransientFailureRestartMaxBackoff), TransientFailureRestartMaxBackoff);
         desc.AddValue(nameof(StaleNodeTimeout), StaleNodeTimeout);
         desc.AddValue(nameof(CheckAssignmentPeriod), CheckAssignmentPeriod);
         desc.AddValue(nameof(AssignmentSettlePeriod), AssignmentSettlePeriod);
@@ -854,6 +1162,9 @@ public class DurabilitySettings : IDescribeMyself
         desc.AddValue(nameof(AssignmentSettleNodeCount), AssignmentSettleNodeCount);
         desc.AddValue(nameof(LocalAgentReconciliationThreshold), LocalAgentReconciliationThreshold);
         desc.AddValue(nameof(MaxLocalAgentReconciliationsPerTick), MaxLocalAgentReconciliationsPerTick);
+        desc.AddValue(nameof(CapacityAwareAssignment), CapacityAwareAssignment);
+        desc.AddValue(nameof(NodeOverloadThreshold), NodeOverloadThreshold);
+        desc.AddValue(nameof(OverloadShedBatchSize), OverloadShedBatchSize);
         desc.AddValue(nameof(TenantCheckPeriod), TenantCheckPeriod);
         desc.AddValue(nameof(UpdateMetricsPeriod), UpdateMetricsPeriod);
         desc.AddValue(nameof(DurabilityMetricsEnabled), DurabilityMetricsEnabled);
@@ -866,18 +1177,21 @@ public class DurabilitySettings : IDescribeMyself
         desc.AddValue(nameof(MaxAgentStartFailuresBeforeRelease), MaxAgentStartFailuresBeforeRelease);
         desc.AddValue(nameof(AgentReleaseCooldown), AgentReleaseCooldown);
         desc.AddValue(nameof(SendingAgentIdleTimeout), SendingAgentIdleTimeout);
+        desc.AddValue(nameof(AgentRestrictionConfirmationTimeout), AgentRestrictionConfirmationTimeout);
         desc.AddValue(nameof(DrainTimeout), DrainTimeout);
         desc.AddValue(nameof(EnableInboxPartitioning), EnableInboxPartitioning);
-        desc.AddValue(nameof(EnableMessageDeduplication), EnableMessageDeduplication);
-        if (EnableMessageDeduplication)
+        desc.AddValue(nameof(MessageDeduplicationMode), MessageDeduplicationMode);
+        if (MessageDeduplicationMode != MessageDeduplicationMode.None || EnableDeduplicatedResponses)
         {
             desc.AddValue(nameof(DeduplicationWindow), DeduplicationWindow);
             desc.AddValue(nameof(DeduplicationCleanupPollingTime), DeduplicationCleanupPollingTime);
         }
 
+        desc.AddValue(nameof(EnableDeduplicatedResponses), EnableDeduplicatedResponses);
         desc.AddValue(nameof(EnableRecurringMessages), EnableRecurringMessages);
 
         if (OutboxStaleTime.HasValue) desc.AddValue(nameof(OutboxStaleTime), OutboxStaleTime.Value);
+        if (EnableOutgoingTimestampIndex) desc.AddValue(nameof(EnableOutgoingTimestampIndex), EnableOutgoingTimestampIndex);
         if (InboxStaleTime.HasValue) desc.AddValue(nameof(InboxStaleTime), InboxStaleTime.Value);
         if (MessageStorageSchemaName != null) desc.AddValue(nameof(MessageStorageSchemaName), MessageStorageSchemaName);
         return desc;

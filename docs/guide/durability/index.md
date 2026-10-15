@@ -154,6 +154,16 @@ Idempotency protections will help keep your system from having inconsistent stat
 times, but it's always best to not make your system work so hard.
 :::
 
+The inbox clock starts over whenever a node claims a message -- when it's received, when a different node recovers
+it, or when a scheduled retry comes due -- and Wolverine only bumps messages that are waiting to run, never scheduled
+ones. That means a message bouncing through durable retries isn't going to get replayed underneath itself anymore.
+
+Wolverine also keeps the clock running for any message a node is still holding onto, whether it's sitting in a durable
+listener's local queue or its handler is actually running. A few times per `InboxStaleTime` window, each durable
+listener tells the database "I've still got these," so a handler that legitimately takes longer than `InboxStaleTime`
+or a big local backlog isn't going to get a second copy started out from under it. A message a node has genuinely lost
+track of gets no such heartbeat, and that's exactly the kind of stuck message this setting exists to bump.
+
 It should *not* be possible for there to be any path where a message gets "stuck" in the outbox tables without eventually
 being sent by the originating node or recovered by a different node if the original node goes down first. However, it's 
 an imperfect world. If you are using one of the relational backed message stores for Wolverine (PostgreSQL, SQL Server, MySQL, SQLite, or Oracle),
@@ -363,6 +373,86 @@ None of this is configurable, and it works the same in `Solo` mode as in `Balanc
 worth remembering: **if no node in the cluster is running an exclusive endpoint's listener, that endpoint's
 unowned inbox messages stay put by design.** They are recovered promptly once a listener activates. See
 [Exclusive Node Processing](/guide/messaging/exclusive-node-processing#inbox-recovery-ownership).
+
+## When a Tenant Database Is Down <Badge type="tip" text="6.42" />
+
+Let's say you're using [multi-tenancy through separate databases](/guide/handlers/multi-tenancy), and you've
+got a durable listener on a single endpoint that's serving every one of your tenants. Now one tenant's
+database goes down, or just stops accepting connections for a while. What happens to everybody else?
+
+Wolverine tries hard to keep the blast radius down to the tenant that's actually broken, but the behavior is
+worth knowing about before you're reading logs at two in the morning.
+
+### A tenant database failure is scoped to that tenant
+
+When Wolverine can't write an incoming envelope to a *tenant* database, that failure is tenant-scoped. Those
+envelopes are deferred back to the broker, and the listener keeps right on running for every other tenant. You
+get one warning per batch:
+
+```
+warn: Inbox write failed for 1 envelope(s) against one or more tenant databases at rabbitmq://queue/incoming.
+      The listener keeps running; those envelopes are deferred back to the broker
+```
+
+That's it. No error, and no pause.
+
+### A main store failure pauses the listener
+
+A failure that reached the **main** store is a different animal, because at that point nothing can be
+persisted at all. The listener pauses for inbox recovery:
+
+```
+warn: Inbox database unavailable for rabbitmq://queue/incoming. Signaling listener to pause.
+warn: Paused listener at rabbitmq://queue/incoming — inbox database unavailable
+```
+
+::: warning
+That pause is **indefinite**. Nothing resumes a paused listener except Wolverine's own health probe, which
+retries on a 2 second back-off that grows by half each time up to a 30 second ceiling, and then keeps going at
+that rate forever. "Paused" reads like it's temporary and self-limiting, so it's worth saying plainly: the
+listener comes back when the database comes back, and not before.
+:::
+
+The probe only tests the **main** store. It used to run across every active tenant database, which meant one
+unrelated tenant's outage could hold a listener paused for the entire time that tenant was down, even though
+the main store had been healthy the whole while.
+
+### What the redelivery costs you
+
+A deferred envelope goes straight back to the broker and comes straight back to you. There's no delay anywhere
+on that path on any transport, so while a tenant's database is down, its stranded messages retry as fast as
+that database can refuse a connection. On a real deployment that's been measured at a few hundred turns a
+second from a *single* stranded message.
+
+That's a problem in itself. Each turn used to open a connection, and a host with a hundred stranded messages
+could work its way through most of its ephemeral ports -- ports it shares with the broker, the telemetry, and
+every healthy tenant's connections.
+
+So Wolverine puts a brake on it. Once a tenant's store refuses a write, that store's writes are held for a
+short cycle and refused *without opening a connection*, and exactly one probe per cycle is let through to find
+out whether the database is back. A success releases it immediately. The message still goes around and around
+while its database is down, but it stops costing you a connection every time.
+
+```csharp
+opts.Durability.TenantWriteBrakeCycle = 2.Seconds();
+```
+
+::: tip
+Two seconds is the default and honestly it's fine for most systems. Raise it if you'd rather not have a
+struggling database poked so often, and accept that Wolverine will take a little longer to notice it's
+recovered.
+:::
+
+### What you should expect to see
+
+| What happened | What you'll see |
+| --- | --- |
+| One tenant's database is down | A `Warning` per deferral, the listener still running, and that tenant's messages retrying until it's back |
+| The main store is down | A `Warning` that the listener paused, then nothing until the probe succeeds |
+| A tenant is down and you're using the brake | The same warnings, but one connection attempt per store per cycle instead of hundreds per second |
+
+If you see a listener paused and the tenant databases look healthy, check the main store. That's the only
+thing that pauses a listener.
 
 ## Local Queues
 

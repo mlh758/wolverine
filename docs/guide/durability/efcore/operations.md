@@ -134,7 +134,7 @@ public static class TodoHandler
     }
 }
 ```
-<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Testing/Wolverine.ComplianceTests/StorageActionCompliance.cs#L295-L394' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_todohandler_to_demonstrate_storage_operations' title='Start of snippet'>anchor</a></sup>
+<sup><a href='https://github.com/JasperFx/wolverine/blob/main/src/Testing/Wolverine.ComplianceTests/StorageActionCompliance.cs#L368-L467' title='Snippet source file'>snippet source</a> | <a href='#snippet-sample_todohandler_to_demonstrate_storage_operations' title='Start of snippet'>anchor</a></sup>
 <!-- endSnippet -->
 
 ::: warning
@@ -145,6 +145,26 @@ handler is not explicitly decorated with `[Transactional]` or `AutoApplyTransact
 This behavior is required because Wolverine needs to automatically call `SaveChangesAsync()` on the EF Core `DbContext`
 to persist the storage operation, which should be done within a single transaction together with publication of messages
 to the outbox/inbox.
+:::
+
+::: tip
+That single-transaction promise holds in `TransactionMiddlewareMode.Lightweight` too, as of 6.41. There is no explicit
+transaction there, but Wolverine enrolls the `DbContext` in the outbox, so your storage operation and the rows for every
+message the handler cascades are written by one `SaveChangesAsync()`. Before 6.41 a message handler in `Lightweight`
+mode wrote the messages in a separate call afterwards, and a failure in between left the row without them. See
+[Lightweight Mode and the Outbox](/guide/durability/efcore/transactional-middleware#lightweight-mode-and-the-outbox).
+:::
+
+::: info
+It does not matter whether the entity you hand to `Storage.Update()` or `Storage.Store()` came from a `[Entity]`
+parameter, an `AsNoTracking()` query, an HTTP request body, or a `new` up off the message itself -- Wolverine attaches an
+entity the `DbContext` isn't already tracking, so `SaveChangesAsync()` writes it either way. `Storage.Store()` is a real
+upsert: it reads the row by its primary key first and then inserts or updates. That read is unavoidable, because EF Core
+has no upsert statement of its own -- so reach for `Storage.Insert()` or `Storage.Update()` when you already know which
+one you want.
+
+Before 6.41, declaring the return type as `Update<T>` or `Store<T>` (rather than `IStorageAction<T>`) silently saved
+nothing at all for an entity the `DbContext` wasn't tracking.
 :::
 
 ## [Entity]

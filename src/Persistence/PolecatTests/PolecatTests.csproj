@@ -4,7 +4,7 @@
         <OutputType>Exe</OutputType>
         <IsPackable>false</IsPackable>
         <IsTestProject>true</IsTestProject>
-        <TargetFrameworks>net9.0;net10.0</TargetFrameworks>
+        <TargetFrameworks>net10.0</TargetFrameworks>
         <NoWarn>$(NoWarn);NU1202;NETSDK1005</NoWarn>
     </PropertyGroup>
 
@@ -12,6 +12,12 @@
         <FrameworkReference Include="Microsoft.AspNetCore.App"/>
 
         <PackageReference Include="Microsoft.NET.Test.Sdk" />
+
+        <!-- GH-4605: the HTTP deduplication mirror needs an Alba host. It lives here rather than in
+             Wolverine.Http.Tests because that project's CI lane has no SQL Server 2025 container, while
+             this one already does, and because a Polecat endpoint type in the shared HTTP test assembly
+             would be scanned by every other host in it. -->
+        <PackageReference Include="Alba" />
 
         <PackageReference Include="Shouldly" />
         <PackageReference Include="xunit.v3"/>
@@ -34,6 +40,7 @@
 
     <ItemGroup>
         <ProjectReference Include="..\Wolverine.Polecat\Wolverine.Polecat.csproj"/>
+        <ProjectReference Include="..\..\Http\Wolverine.Http.Polecat\Wolverine.Http.Polecat.csproj" />
         <ProjectReference Include="..\..\Testing\Wolverine.ComplianceTests\Wolverine.ComplianceTests.csproj" />
     </ItemGroup>
     <ItemGroup>

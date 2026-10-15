@@ -45,7 +45,7 @@ internal class DeduplicationHandlerPolicy : IHandlerPolicy
             .ToArray();
 
         if (opted.Length == 0) return;
-        if (_options.Durability.EnableMessageDeduplication) return;
+        if (_options.Durability.MessageDeduplicationMode != MessageDeduplicationMode.None) return;
 
         WarnDeduplicationIsNotEnabled(container, opted.Select(x => x.Description));
     }
@@ -66,7 +66,7 @@ internal class DeduplicationHandlerPolicy : IHandlerPolicy
     /// <para>
     /// The property that actually matters — an application is never <i>silently</i> unprotected — is
     /// not weakened by warning here, because it is not enforced here. It is enforced at the point of
-    /// use: <see cref="MessageDeduplicator.TryClaimAsync" /> throws on a store whose
+    /// use: <see cref="MessageDeduplicator.TryClaimAsync(string, TimeSpan?, Type?, CancellationToken)" /> throws on a store whose
     /// <see cref="IDeduplicationStore.Enabled" /> is false rather than answering "yes, that's new" to
     /// every id. A misconfigured host still cannot process a single duplicate quietly; it just gets to
     /// start, and to tell its operator why at startup instead of at the first message.
@@ -77,8 +77,8 @@ internal class DeduplicationHandlerPolicy : IHandlerPolicy
         var logger = container.GetInstance<ILoggerFactory>().CreateLogger<DeduplicationHandlerPolicy>();
 
         logger.LogWarning(
-            "Logical message deduplication was requested by {Chains}, but {Setting} is false, so there is no storage to enforce it. These handlers will throw on their first message. Set opts.Durability.{Setting} = true (this provisions a new table) or remove the [Deduplicated] usage. See GH-4180",
-            descriptions.Join(", "), nameof(DurabilitySettings.EnableMessageDeduplication),
-            nameof(DurabilitySettings.EnableMessageDeduplication));
+            "Logical message deduplication was requested by {Chains}, but {Setting} is None, so there is no storage to enforce it. These handlers will throw on their first message. Set opts.Durability.{Setting} to CompareByHash (this provisions a new table) or remove the [Deduplicated] usage. See GH-4180",
+            descriptions.Join(", "), nameof(DurabilitySettings.MessageDeduplicationMode),
+            nameof(DurabilitySettings.MessageDeduplicationMode));
     }
 }

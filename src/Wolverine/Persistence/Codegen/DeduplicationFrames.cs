@@ -6,6 +6,23 @@ using JasperFx.Core.Reflection;
 namespace Wolverine.Persistence.Codegen;
 
 /// <summary>
+/// Renders a <see cref="DeduplicationRequirement.Window" /> into a generated claim call. Every claim frame,
+/// core and provider alike, goes through here so the chains agree on the overload they call.
+/// </summary>
+internal static class DeduplicationWindowRendering
+{
+    /// <summary>
+    /// The window argument plus its trailing separator, or nothing at all when the chain uses the host-wide
+    /// window. Nothing, rather than <c>null</c>, so a chain without a window keeps calling the original
+    /// overload and its generated code is unchanged.
+    /// </summary>
+    public static string ArgumentFor(TimeSpan? window)
+        => window.HasValue
+            ? $"{typeof(TimeSpan).FullNameInCode()}.{nameof(TimeSpan.FromTicks)}({window.Value.Ticks}), "
+            : string.Empty;
+}
+
+/// <summary>
 /// GH-4180. Tests whether a required logical deduplication id is absent, producing the
 /// <c>bool</c> that the chain-specific stop condition branches on.
 ///
@@ -63,6 +80,7 @@ internal class ClaimDeduplicationIdFrame : AsyncFrame
     private readonly Type? _ancillaryStoreMarker;
     private readonly string? _deduplicatorUsage;
     private readonly string? _cancellationUsage;
+    private readonly TimeSpan? _window;
     private Variable? _deduplicator;
     private Variable? _cancellation;
 
@@ -76,13 +94,17 @@ internal class ClaimDeduplicationIdFrame : AsyncFrame
     /// Explicit expression for the cancellation token, or null to resolve it as a chain variable.
     /// gRPC supplies <c>context.CancellationToken</c> for the same reason.
     /// </param>
+    /// <param name="window">
+    /// The chain's <see cref="DeduplicationRequirement.Window" />, or null for the host-wide window.
+    /// </param>
     public ClaimDeduplicationIdFrame(Variable deduplicationId, Type? ancillaryStoreMarker,
-        string? deduplicatorUsage = null, string? cancellationUsage = null)
+        string? deduplicatorUsage = null, string? cancellationUsage = null, TimeSpan? window = null)
     {
         _deduplicationId = deduplicationId;
         _ancillaryStoreMarker = ancillaryStoreMarker;
         _deduplicatorUsage = deduplicatorUsage;
         _cancellationUsage = cancellationUsage;
+        _window = window;
         Variable = new Variable(typeof(bool), "isDuplicateMessage", this);
     }
 
@@ -105,7 +127,7 @@ internal class ClaimDeduplicationIdFrame : AsyncFrame
         writer.Write($"var {Variable.Usage} = false;");
         writer.Write($"BLOCK:if (!string.IsNullOrWhiteSpace({_deduplicationId.Usage}))");
         writer.Write(
-            $"{Variable.Usage} = !(await {deduplicatorUsage}.{nameof(IMessageDeduplicator.TryClaimAsync)}({_deduplicationId.Usage}, {marker}, {cancellationUsage}).ConfigureAwait(false));");
+            $"{Variable.Usage} = !(await {deduplicatorUsage}.{nameof(IMessageDeduplicator.TryClaimAsync)}({_deduplicationId.Usage}, {DeduplicationWindowRendering.ArgumentFor(_window)}{marker}, {cancellationUsage}).ConfigureAwait(false));");
         writer.FinishBlock();
 
         Next?.GenerateCode(method, writer);
@@ -134,10 +156,13 @@ internal class ClaimDeduplicationIdFrame : AsyncFrame
 /// discarded as a duplicate of its own failed attempt.
 ///
 /// <para>
-/// Emitted ONLY into non-transactional chains. When the chain is transactional the claim is written
-/// inside the same transaction as the handler's work, so a rollback removes it and a compensating
-/// release would be both redundant and wrong — it would delete a claim that no longer exists, or
-/// worse, one that a concurrent caller has since legitimately taken.
+/// GH-4505. Emitted into every chain whose claim was written by <see cref="IMessageDeduplicator" />,
+/// which is to say every chain that does NOT have a store able to write the claim inside the handler's
+/// own transaction. That is not the same as "non-transactional": a <c>[Transactional]</c> chain on a
+/// plain RDBMS message store still claims on a separate connection, and its first failed attempt would
+/// permanently poison the id without this. A chain whose provider supplies
+/// <see cref="TransactionalDeduplication" /> instead gets no release frame at all, because a rollback
+/// takes the uncommitted claim with it and there is nothing to give back.
 /// </para>
 ///
 /// <para>
@@ -155,7 +180,7 @@ internal class ReleaseDeduplicationIdOnFailureFrame : AsyncFrame
     private Variable? _deduplicator;
     private Variable? _cancellation;
 
-    /// <inheritdoc cref="ClaimDeduplicationIdFrame(Variable, Type, string, string)" />
+    /// <inheritdoc cref="ClaimDeduplicationIdFrame(Variable, Type, string, string, TimeSpan?)" />
     public ReleaseDeduplicationIdOnFailureFrame(Variable deduplicationId, Type? ancillaryStoreMarker,
         string? deduplicatorUsage = null, string? cancellationUsage = null)
     {
@@ -168,25 +193,71 @@ internal class ReleaseDeduplicationIdOnFailureFrame : AsyncFrame
     private string deduplicatorUsage => _deduplicatorUsage ?? _deduplicator!.Usage;
     private string cancellationUsage => _cancellationUsage ?? _cancellation!.Usage;
 
+    /// <summary>The claimed id, for a subclass that needs it before the try block.</summary>
+    protected Variable DeduplicationId => _deduplicationId;
+
+    /// <summary>Usage of the <see cref="IMessageDeduplicator" />, for a subclass emitting its own call.</summary>
+    protected string DeduplicatorUsage => deduplicatorUsage;
+
+    /// <summary><c>typeof(...)</c> for the ancillary store, or <c>null</c>, rendered for codegen.</summary>
+    protected string AncillaryStoreMarkerUsage => _ancillaryStoreMarker == null
+        ? "null"
+        : $"typeof({_ancillaryStoreMarker.FullNameInCode()})";
+
+    /// <summary>
+    /// GH-4547. Hook for a chain type whose failure response is FLUSHED before this frame's finally can
+    /// run, and which therefore has to arrange the compensating release earlier. Emitted immediately
+    /// before the try block, so the claim already exists.
+    /// </summary>
+    protected virtual void writeBeforeTry(ISourceWriter writer)
+    {
+    }
+
+    /// <summary>
+    /// Name of the <c>bool</c> the generated code sets when execution threw. Chain types that can fail
+    /// without throwing widen the release test around it — see <see cref="BuildReleaseCondition" />.
+    /// </summary>
+    protected const string ThrewFlag = "deduplicatedExecutionThrew";
+
+    /// <summary>
+    /// The condition under which the claim is given back. A throw is the only failure a message handler
+    /// or a gRPC method has; HTTP endpoints also stop on an error status without throwing, and override
+    /// this to say so. GH-4501.
+    /// </summary>
+    protected virtual string BuildReleaseCondition() => ThrewFlag;
+
     public override void GenerateCode(GeneratedMethod method, ISourceWriter writer)
     {
         var marker = _ancillaryStoreMarker == null
             ? "null"
             : $"typeof({_ancillaryStoreMarker.FullNameInCode()})";
 
-        // Wraps everything downstream, then rethrows. `throw;` rather than `throw e;` so the original
-        // stack trace survives to the error policies -- this frame compensates for a failure, it does
-        // not handle one, and swallowing here would turn every handler exception into a silent success.
+        // try/catch/finally rather than a bare catch, because the failures this compensates for are not
+        // all exceptions: an HTTP chain refused by a ProblemDetails 400 or a 404 on a missing aggregate
+        // leaves through a plain `return`, which a catch block never sees. The flag carries the throw
+        // case into the same finally, where `return` lands too.
+        //
+        // `throw;` rather than `throw e;` so the original stack trace survives to the error policies --
+        // this frame compensates for a failure, it does not handle one, and swallowing here would turn
+        // every handler exception into a silent success.
+        writeBeforeTry(writer);
+
+        writer.Write($"var {ThrewFlag} = false;");
         writer.Write("BLOCK:try");
         Next?.GenerateCode(method, writer);
         writer.FinishBlock();
 
         writer.Write("BLOCK:catch");
-        writer.Write($"BLOCK:if (!string.IsNullOrWhiteSpace({_deduplicationId.Usage}))");
+        writer.Write($"{ThrewFlag} = true;");
+        writer.Write("throw;");
+        writer.FinishBlock();
+
+        writer.Write("BLOCK:finally");
+        writer.Write(
+            $"BLOCK:if ({BuildReleaseCondition()} && !string.IsNullOrWhiteSpace({_deduplicationId.Usage}))");
         writer.Write(
             $"await {deduplicatorUsage}.{nameof(IMessageDeduplicator.ReleaseAsync)}({_deduplicationId.Usage}, {marker}, {cancellationUsage}).ConfigureAwait(false);");
         writer.FinishBlock();
-        writer.Write("throw;");
         writer.FinishBlock();
     }
 
@@ -205,5 +276,16 @@ internal class ReleaseDeduplicationIdOnFailureFrame : AsyncFrame
             _cancellation = chain.FindVariable(typeof(CancellationToken));
             yield return _cancellation;
         }
+
+        foreach (var variable in FindAdditionalVariables(chain))
+        {
+            yield return variable;
+        }
     }
+
+    /// <summary>
+    /// Hook for a subclass whose <see cref="BuildReleaseCondition" /> reads something else in the chain.
+    /// </summary>
+    protected virtual IEnumerable<Variable> FindAdditionalVariables(IMethodVariables chain)
+        => Array.Empty<Variable>();
 }

@@ -105,28 +105,58 @@ public enum InvokeTracingMode
 public enum EnvelopeIdGeneration
 {
     /// <summary>
-    /// Default. Uses MassTransit's NewId algorithm which generates sequential GUIDs
-    /// based on machine identity (MAC/DNS) and timestamp. Good for SQL Server index
-    /// performance but can produce duplicates in cloud environments where multiple
-    /// instances share network identity (containers, Cloud Run, serverless).
+    /// Default. Uses MassTransit's NewId algorithm (<c>NewId.NextSequentialGuid()</c>), which builds
+    /// GUIDs from machine identity (MAC/DNS) and a timestamp, laid out so they sort in time order the way
+    /// .NET and PostgreSQL compare GUIDs. SQL Server compares a <c>uniqueidentifier</c> starting from its
+    /// last six bytes, so these ids arrive in effectively random order there and fragment SQL Server's
+    /// clustered envelope tables; see <see cref="NewIdSqlServerOrder"/>. Can produce duplicates in cloud
+    /// environments where multiple instances share network identity (containers, Cloud Run, serverless).
     /// </summary>
     NewId,
 
     /// <summary>
-    /// Uses Guid.CreateVersion7() which produces time-ordered GUIDs with cryptographically
-    /// strong random bits per RFC 9562. Recommended for greenfield applications and
-    /// cloud environments where instances may share network identity. Guaranteed unique
-    /// without relying on machine-specific properties.
+    /// Uses Guid.CreateVersion7() which produces GUIDs with a millisecond timestamp and cryptographically
+    /// strong random bits per RFC 9562. Recommended for greenfield applications and cloud environments
+    /// where instances may share network identity. Guaranteed unique without relying on machine-specific
+    /// properties. Ids created within the same millisecond are in random order, and SQL Server does not
+    /// sort them by time at all.
     /// </summary>
-    GuidV7
+    GuidV7,
+
+    /// <summary>
+    /// GH-4902. The same NewId algorithm and uniqueness as <see cref="NewId"/>, but laid out with the
+    /// timestamp in the last six bytes (<c>NewId.NextGuid()</c>) so the ids sort in time order the way SQL
+    /// Server compares a <c>uniqueidentifier</c>. This keeps SQL Server's clustered inbox, outbox and
+    /// dead-letter tables from fragmenting. Wolverine switches to this automatically when every message store
+    /// in the application is SQL Server and nothing was set explicitly. The id travels with the message and
+    /// becomes the key in the RECEIVING application's inbox, and on PostgreSQL these ids index worse than
+    /// random GUIDs, so set <see cref="WolverineOptions.EnvelopeIdGeneration"/> explicitly to
+    /// <see cref="NewId"/> if a SQL Server-only application sends to services that store envelopes in PostgreSQL.
+    /// </summary>
+    NewIdSqlServerOrder
 }
 
 public class MetricsOptions
 {
+    private WolverineMetricsMode? _mode;
+
     /// <summary>
     /// How should Wolverine collect and publish metrics about message handling and publications?
     /// </summary>
-    public WolverineMetricsMode Mode { get; set; } = WolverineMetricsMode.SystemDiagnosticsMeter;
+    public WolverineMetricsMode Mode
+    {
+        get => _mode ?? WolverineMetricsMode.SystemDiagnosticsMeter;
+        set => _mode = value;
+    }
+
+    /// <summary>
+    /// Is <c>true</c> once anything has assigned <see cref="Mode"/>, even when the assigned value happens to be
+    /// the default <see cref="WolverineMetricsMode.SystemDiagnosticsMeter"/>. Lets configuration that would
+    /// otherwise overwrite <see cref="Mode"/> — add on extensions like CritterWatch monitoring, say — tell an
+    /// application's deliberate choice of <see cref="WolverineMetricsMode.SystemDiagnosticsMeter"/> apart from
+    /// nobody having chosen anything at all. See GH-4753.
+    /// </summary>
+    public bool ModeWasSetExplicitly => _mode.HasValue;
 
     /// <summary>
     /// If using either CritterWatch or Hybrid metrics publishing, this is the period in which
@@ -228,6 +258,67 @@ public class TrackingOptions
     /// when profiling a transactional handler. Default is <c>false</c>.
     /// </summary>
     public bool OutboxDiagnosticsEnabled { get; set; }
+
+    internal Wolverine.Tracking.TrackingIgnoreRules IgnoreRules { get; } = new();
+
+    /// <summary>
+    /// Every tracked session against this host ignores messages whose type is declared in
+    /// <paramref name="assembly" />, a batch of them included. Use this for traffic an embedded tool or
+    /// library keeps in flight for the whole life of the host, such as an embedded CritterWatch console's
+    /// polling, so a tracked session (and every WolverineFx.Bobcat act) waits for the application's own
+    /// messages only. An ignored envelope is never recorded: it does not hold the session open, it does not
+    /// appear in the session's history, and an exception it throws is not reported by the session. A single
+    /// session can opt back in with <c>TrackedSessionConfiguration.IncludeHostIgnoredTraffic()</c>.
+    /// </summary>
+    public TrackingOptions IgnoreMessagesFromAssembly(Assembly assembly)
+    {
+        IgnoreRules.IgnoreMessagesMatchingType(Wolverine.Tracking.TrackingIgnoreRules.FromAssembly(assembly));
+        return this;
+    }
+
+    /// <summary>
+    /// Every tracked session against this host ignores messages of type <typeparamref name="T" />, a batch
+    /// of them included. See <see cref="IgnoreMessagesFromAssembly" /> for what ignoring means.
+    /// </summary>
+    public TrackingOptions IgnoreMessageType<T>()
+    {
+        return IgnoreMessagesMatchingType(t => t == typeof(T));
+    }
+
+    /// <summary>
+    /// Every tracked session against this host ignores messages whose type matches
+    /// <paramref name="filter" />. A batch's array type is tested along with its element type. See
+    /// <see cref="IgnoreMessagesFromAssembly" /> for what ignoring means.
+    /// </summary>
+    public TrackingOptions IgnoreMessagesMatchingType(Func<Type, bool> filter)
+    {
+        IgnoreRules.IgnoreMessagesMatchingType(filter);
+        return this;
+    }
+
+    /// <summary>
+    /// Every tracked session against this host ignores traffic to or through the endpoint at
+    /// <paramref name="endpointUri" />: any envelope whose destination is that endpoint, whether it is sent
+    /// there or received by its listener. See <see cref="IgnoreMessagesFromAssembly" /> for what ignoring
+    /// means.
+    /// </summary>
+    public TrackingOptions IgnoreEndpoint(Uri endpointUri)
+    {
+        IgnoreRules.IgnoreEnvelopes(Wolverine.Tracking.TrackingIgnoreRules.ForEndpoint(endpointUri));
+        return this;
+    }
+
+    /// <summary>
+    /// Every tracked session against this host ignores any envelope matching <paramref name="filter" />.
+    /// The host-wide twin of <c>TrackedSessionConfiguration.IgnoreEnvelopes()</c>. Acknowledgements are
+    /// never ignored, whatever the filter. See <see cref="IgnoreMessagesFromAssembly" /> for what ignoring
+    /// means.
+    /// </summary>
+    public TrackingOptions IgnoreEnvelopes(Func<Envelope, bool> filter)
+    {
+        IgnoreRules.IgnoreEnvelopes(filter);
+        return this;
+    }
 }
 
 /// <summary>
@@ -250,6 +341,11 @@ public sealed partial class WolverineOptions
 
         _serializers.Add(EnvelopeReaderWriter.Instance.ContentType, EnvelopeReaderWriter.Instance);
         _serializers.Add(IntrinsicSerializer.MimeType, IntrinsicSerializer.Instance);
+
+        // GH-4720: registered unconditionally, and independently of whether this node ever WRITES compressed
+        // agent commands. Reading has to work on every node in the cluster before any node can safely start
+        // writing it, which is the whole rollout story for a format that travels between nodes.
+        _serializers.Add(CompressedIntrinsicSerializer.MimeType, CompressedIntrinsicSerializer.Instance);
 
         UseSystemTextJsonForSerialization();
 
@@ -339,8 +435,13 @@ public sealed partial class WolverineOptions
     /// <summary>
     /// When enabled, Wolverine will automatically relay the authenticated user name
     /// from HTTP ClaimsPrincipal through the messaging infrastructure, propagating it
-    /// on outgoing envelopes and into Marten's IDocumentSession.LastModifiedBy
+    /// on outgoing envelopes and into the outboxed session of the Marten, Polecat or Fisher
+    /// integration (LastModifiedBy, or CurrentUserName on Fisher)
     /// </summary>
+    /// <remarks>
+    /// Applies to every HTTP endpoint with a message context, including ones that only open an
+    /// outboxed session.
+    /// </remarks>
     public bool EnableRelayOfUserName { get; set; }
 
     /// <summary>
@@ -354,11 +455,32 @@ public sealed partial class WolverineOptions
 
     /// <summary>
     /// Controls how Wolverine generates unique identifiers for message envelopes.
-    /// Default is <see cref="EnvelopeIdGeneration.NewId"/> for backward compatibility.
+    /// Default is <see cref="EnvelopeIdGeneration.NewId"/> for backward compatibility, except that when this is
+    /// not set explicitly and every message store in the application prefers the same value -- for example
+    /// <see cref="EnvelopeIdGeneration.NewIdSqlServerOrder"/> when SQL Server is the only message storage --
+    /// Wolverine switches to that value at startup. Setting this explicitly, even to
+    /// <see cref="EnvelopeIdGeneration.NewId"/>, turns that automatic switch off.
     /// Use <see cref="EnvelopeIdGeneration.GuidV7"/> for greenfield applications or
     /// cloud environments where multiple instances may share network identity.
     /// </summary>
-    public EnvelopeIdGeneration EnvelopeIdGeneration { get; set; } = EnvelopeIdGeneration.NewId;
+    public EnvelopeIdGeneration EnvelopeIdGeneration
+    {
+        get => _envelopeIdGeneration ?? _storePreferredEnvelopeIdGeneration ?? EnvelopeIdGeneration.NewId;
+        set => _envelopeIdGeneration = value;
+    }
+
+    // GH-4902. Set only by an explicit assignment, which always wins over what the message stores prefer
+    private EnvelopeIdGeneration? _envelopeIdGeneration;
+
+    // GH-4902. What every message store agreed on at startup, used only when nothing was set explicitly
+    private EnvelopeIdGeneration? _storePreferredEnvelopeIdGeneration;
+
+    internal bool EnvelopeIdGenerationIsExplicit => _envelopeIdGeneration.HasValue;
+
+    internal void UseStorePreferredEnvelopeIdGeneration(EnvelopeIdGeneration generation)
+    {
+        _storePreferredEnvelopeIdGeneration = generation;
+    }
 
     /// <summary>
     /// What is the policy within this application for whether or not it is valid to allow Service Location within
@@ -423,6 +545,19 @@ public sealed partial class WolverineOptions
     /// List of <see cref="IEnvelopeRule"/> instances applied to every outgoing envelope.
     /// </summary>
     public List<IEnvelopeRule> MetadataRules { get; } = new();
+
+    /// <summary>
+    /// GH-4527. Connection string names this application expects to find in <c>IConfiguration</c>, registered
+    /// by the <c>Use{Transport}UsingNamedConnection(name)</c> APIs. The runtime validates all of them in one
+    /// pass at startup -- before the message store migrates and before any transport connects -- and throws a
+    /// single <see cref="MissingNamedConnectionStringsException"/> naming every one that is missing.
+    ///
+    /// <para>
+    /// Any API that resolves a connection string by name should register here so the check stays uniform and
+    /// the developer sees every missing name on one run rather than one per deploy.
+    /// </para>
+    /// </summary>
+    public List<NamedConfigurationDependency> NamedConfigurationDependencies { get; } = new();
 
     /// <summary>
     /// GH-3001 extension point. Factories for codegen frames that prime a handler's service-location
@@ -608,6 +743,14 @@ public sealed partial class WolverineOptions
     ///     Descriptive name of the running service. Used in Wolverine diagnostics and testing support
     /// </summary>
     public string ServiceName { get; set; } = null!;
+
+    /// <summary>
+    ///     GH-4916. Register every <c>EventModelDefinition</c> subclass in the application's assemblies from the
+    ///     compile-time manifest JasperFx.SourceGenerator writes, so no definition needs its own
+    ///     <c>AddEventModel&lt;T&gt;()</c>. Diagnostic surface only; default true. Set false to register
+    ///     definitions explicitly and only those.
+    /// </summary>
+    public bool AutoRegisterEventModelDefinitions { get; set; } = true;
 
     /// <summary>
     ///     Free-form, user-defined service-level tags. These are surfaced on <c>ServiceCapabilities.Tags</c> and flow

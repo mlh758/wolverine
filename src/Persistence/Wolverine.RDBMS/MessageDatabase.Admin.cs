@@ -1,4 +1,5 @@
 using System.Data.Common;
+using System.Globalization;
 using JasperFx;
 using JasperFx.Core;
 using JasperFx.Core.Reflection;
@@ -16,6 +17,65 @@ namespace Wolverine.RDBMS;
 public abstract partial class MessageDatabase<T>
 {
     public abstract Task<PersistedCounts> FetchCountsAsync();
+
+    /// <summary>
+    /// GH-4499 follow-up. Populate <see cref="PersistedCounts.OldestOutgoing" /> — the timestamp of the head
+    /// of the durable outbox — so the stuck-outbox health signal has a discriminator to work with. A no-op
+    /// leaving the value null when the column is not there.
+    /// </summary>
+    /// <remarks>
+    /// <para>The <c>timestamp</c> column on the outgoing table only exists when
+    /// <see cref="DurabilitySettings.OutboxStaleTime" /> is set — see each provider's
+    /// <c>OutgoingEnvelopeTable</c> — so this is gated on the same setting rather than probing the schema.
+    /// Leaving it null is the documented "NOT MEASURED" signal and stands the health check down, which is
+    /// the same rule <see cref="PersistedCounts.ScheduledDue" /> established.</para>
+    ///
+    /// <para>Shared here rather than repeated per provider: <c>min(timestamp)</c> needs no dialect-specific
+    /// syntax, and every provider that reaches this base class has the same column.</para>
+    /// </remarks>
+    protected async Task fetchOldestOutgoingAsync(PersistedCounts counts)
+    {
+        if (!Durability.OutboxStaleTime.HasValue) return;
+
+        await using var conn = await DataSource.OpenConnectionAsync();
+        try
+        {
+            var raw = await conn
+                .CreateCommand(
+                    $"select min({DatabaseConstants.Timestamp}) from {QuotedTableNameFor(DatabaseConstants.OutgoingTable)}")
+                .ExecuteScalarAsync();
+
+            // Every provider writes this column as a true UTC instant -- Postgres via `now()` into a
+            // timestamptz (GH-4663; it used to be `now() at time zone 'utc'`, which was not), SQLite via
+            // `datetime('now')` -- but they hand it back as three different CLR types, and two of the
+            // three carry no offset with them. A value with no offset has to be read as UTC explicitly: the
+            // framework default is to assume LOCAL, which silently shifts the head by the machine's offset
+            // and reported a timestamp five hours in the future on a UTC-5 box. That is the same trap as
+            // GH-3645's timestamp headers.
+            counts.OldestOutgoing = raw switch
+            {
+                // Postgres: the driver materialises timestamptz as a DateTimeOffset already
+                DateTimeOffset value => value.ToUniversalTime(),
+
+                // SQL Server and MySQL: a DateTime, whose Kind is Unspecified for these columns
+                DateTime value => new DateTimeOffset(
+                    value.Kind == DateTimeKind.Unspecified ? DateTime.SpecifyKind(value, DateTimeKind.Utc) : value,
+                    TimeSpan.Zero).ToUniversalTime(),
+
+                // SQLite: the column is TEXT, e.g. "2026-09-23 19:26:15"
+                string value when DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsed) => parsed,
+
+                // DBNull, or anything unrecognised: an empty outbox has no head, and NOT MEASURED is the
+                // safe reading for a value that cannot be interpreted
+                _ => null
+            };
+        }
+        finally
+        {
+            await conn.CloseAsync();
+        }
+    }
 
     public virtual Task DeleteAllHandledAsync()
     {
@@ -176,10 +236,16 @@ public abstract partial class MessageDatabase<T>
             .ExecuteNonQueryAsync(_cancellation);
     }
 
+    /// <summary>
+    /// GH-4739: `owner_id &lt;&gt; 0` is what lets SQL Server seek the FILTERED owner indexes on both tables
+    /// instead of scanning them -- a parameterized `owner_id = @id` alone cannot use a filtered index,
+    /// because the plan has to remain correct for @id = 0. This runs on every clean shutdown
+    /// (WolverineRuntime.HostService), so on a large inbox it is two full table scans in the shutdown path.
+    /// </summary>
     public Task ReleaseAllOwnershipAsync(int ownerId)
     {
         return CreateCommand(
-                $"update {QuotedTableNameFor(DatabaseConstants.IncomingTable)} set owner_id = 0 where owner_id = @id;update {QuotedTableNameFor(DatabaseConstants.OutgoingTable)} set owner_id = 0 where owner_id = @id")
+                $"update {QuotedTableNameFor(DatabaseConstants.IncomingTable)} set owner_id = 0 where owner_id = @id and owner_id <> 0;update {QuotedTableNameFor(DatabaseConstants.OutgoingTable)} set owner_id = 0 where owner_id = @id and owner_id <> 0")
             .With("id", ownerId)
             .ExecuteNonQueryAsync(_cancellation);
     }
@@ -282,6 +348,34 @@ public abstract partial class MessageDatabase<T>
 
             await Migrator.ApplyAllAsync(conn, migration, autoCreate, new MigrationLogger(Logger), ct: _cancellation);
         }
+
+        if (autoCreate != AutoCreate.None)
+        {
+            await repairLegacyColumnDefaultsAsync(conn);
+        }
+    }
+
+    /// <summary>
+    /// Correct column DEFAULT expressions that a previous version of Wolverine declared wrongly.
+    ///
+    /// <para>
+    /// This exists because Weasel does not compare defaults unless a table opts into
+    /// <c>DetectColumnDrift</c>, which Wolverine never sets and which Weasel itself warns against for
+    /// datetime defaults (they canonicalize non-trivially, so a textual comparison produces perpetual
+    /// false-positive migrations). A column whose name and type still match is "the same" column, so a
+    /// corrected declaration reaches new databases only — every deployed one keeps the old default
+    /// forever. That is how GH-2634's Oracle fix silently never reached existing Oracle deployments.
+    /// </para>
+    ///
+    /// <para>
+    /// Runs inside the migration advisory lock, and deliberately runs even when the schema diff is empty,
+    /// because an already-provisioned database is exactly the case that needs repairing. Implementations
+    /// must be idempotent and must not take a lock when there is nothing to correct.
+    /// </para>
+    /// </summary>
+    protected virtual Task repairLegacyColumnDefaultsAsync(DbConnection conn)
+    {
+        return Task.CompletedTask;
     }
 
     private async Task truncateEnvelopeDataAsync(DbConnection conn)
@@ -300,9 +394,19 @@ public abstract partial class MessageDatabase<T>
             // provisioned for every store role, and ClearAllAsync means "no residue from the previous
             // test". A surviving claim would silently refuse the next test's first message as a
             // duplicate -- a green suite over a system that did nothing.
-            if (Durability.EnableMessageDeduplication)
+            // GH-4757: whichever of the two tables this mode provisioned, and only that one -- a
+            // delete against the other would fail because it does not exist.
+            if (Durability.MessageDeduplicationMode != MessageDeduplicationMode.None)
             {
-                await tx.CreateCommand($"delete from {QuotedTableNameFor(DatabaseConstants.DeduplicationTableName)}")
+                await tx.CreateCommand(
+                        $"delete from {QuotedTableNameFor(DeduplicationTableNameFor(Durability))}")
+                    .ExecuteNonQueryAsync(_cancellation);
+            }
+
+            // GH-4742. The same, for [DeduplicatedWithResponse]: a surviving claim would replay a previous test's response.
+            if (Durability.EnableDeduplicatedResponses)
+            {
+                await tx.CreateCommand($"delete from {QuotedTableNameFor(DatabaseConstants.DeduplicatedResponsesTableName)}")
                     .ExecuteNonQueryAsync(_cancellation);
             }
 

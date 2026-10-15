@@ -31,7 +31,7 @@ public partial class CosmosDbMessageStore : IMessageStoreWithAgentSupport
         _identity = options.Durability.MessageIdentity == MessageIdentity.IdOnly
             ? e => $"incoming|{e.Id}"
             : e =>
-                $"incoming|{e.Id}|{e.Destination?.ToString().Replace(":/", "").TrimEnd('/')}";
+                $"incoming|{e.Id}|{CosmosSafeId(e.Destination?.ToString().Replace(":/", "").TrimEnd('/'))}";
 
         _leaderLockId = $"lock|leader";
         _scheduledLockId = $"lock|scheduled";
@@ -56,6 +56,15 @@ public partial class CosmosDbMessageStore : IMessageStoreWithAgentSupport
     public Uri Uri => new($"{PersistenceConstants.AgentScheme}://cosmosdb/durability");
 
     public string IdentityFor(Envelope envelope) => _identity(envelope);
+
+    // GH-4216. Cosmos DB does not allow '/', '\\', '?' or '#' in a document id: a create succeeds, but point reads,
+    // replaces and deletes by that id miss, so every update under MessageIdentity.IdAndDestination -- whose
+    // identity carried the destination's slashes -- quietly fell through to "not found". '|' is already the
+    // separator inside the identity
+    internal static string? CosmosSafeId(string? value)
+    {
+        return value?.Replace('/', '|').Replace('\\', '|').Replace('?', '|').Replace('#', '|');
+    }
 
     public ValueTask DisposeAsync()
     {
@@ -93,7 +102,11 @@ public partial class CosmosDbMessageStore : IMessageStoreWithAgentSupport
         return new DatabaseDescriptor(this)
         {
             Engine = "cosmosdb",
-            DatabaseName = _databaseName
+            DatabaseName = _databaseName,
+
+            // The container plays the part a schema does for the relational stores: two applications sharing a
+            // database are told apart by it
+            SchemaOrNamespace = _container.Id
         };
     }
 
@@ -140,12 +153,14 @@ public partial class CosmosDbMessageStore : IMessageStoreWithAgentSupport
             .WithParameter("@status", EnvelopeStatus.Incoming)
             .WithParameter("@limit", limit);
 
+        // GH-5059. Under IdOnly a document is partitioned by its identity, not by the address it was received at, and
+        // documents written before that are still in the address's partition, so the query runs across partitions.
+        // Under IdAndDestination every document for the address is in its partition
         var results = new List<Envelope>();
         using var iterator = _container.GetItemQueryIterator<IncomingMessage>(query,
-            requestOptions: new QueryRequestOptions
-            {
-                PartitionKey = new PartitionKey(partitionKey)
-            });
+            requestOptions: _options.Durability.MessageIdentity == MessageIdentity.IdOnly
+                ? null
+                : new QueryRequestOptions { PartitionKey = new PartitionKey(partitionKey) });
 
         while (iterator.HasMoreResults)
         {
@@ -160,20 +175,11 @@ public partial class CosmosDbMessageStore : IMessageStoreWithAgentSupport
     {
         foreach (var envelope in incoming)
         {
-            var id = _identity(envelope);
-            var partitionKey = envelope.Destination?.ToString() ?? DocumentTypes.SystemPartition;
-            try
-            {
-                var response =
-                    await _container.ReadItemAsync<IncomingMessage>(id, new PartitionKey(partitionKey));
-                var message = response.Resource;
-                message.OwnerId = ownerId;
-                await _container.ReplaceItemAsync(message, id, new PartitionKey(partitionKey));
-            }
-            catch (CosmosException e) when (e.StatusCode == HttpStatusCode.NotFound)
-            {
-                // Envelope was already handled/deleted, skip it
-            }
+            // Envelope was already handled/deleted, skip it
+            if (await readIncomingAsync(envelope) is not var (message, partitionKey)) continue;
+
+            message.OwnerId = ownerId;
+            await replaceIncomingAsync(message, partitionKey);
         }
     }
 }

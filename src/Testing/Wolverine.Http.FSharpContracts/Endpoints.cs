@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.WebUtilities;
 using Wolverine;
 
 namespace Wolverine.Http.FSharpContracts;
@@ -12,6 +13,11 @@ public record ThingCreated(string Name);
 
 /// <summary>Complex query string type exercising <c>QueryStringBindingFrame</c>.</summary>
 public record ThingFilter(string? Name, int MaxResults);
+
+// GH-4978: hand-written single-value wrappers with no TryParse of their own
+public readonly record struct ThingId(Guid Value);
+
+public readonly record struct ThingCode(string Value);
 
 /// <summary>
 ///     The "smallest viable" Wolverine.Http endpoints for the F# code-generation audit
@@ -47,6 +53,13 @@ public class ThingEndpoints
     }
 
     // Query-string binding: q has no matching route token, so it binds from the query string.
+    // GH-4978: a single-value wrapper bound from a route value and from a query string value
+    [WolverineGet("/fsharp/things/by-id/{id}")]
+    public string GetByThingId(ThingId id) => id.Value.ToString();
+
+    [WolverineGet("/fsharp/things/by-code")]
+    public string GetByThingCode(ThingCode code) => code.Value;
+
     [WolverineGet("/fsharp/search")]
     public string Search(string q)
     {
@@ -85,6 +98,31 @@ public class ThingEndpoints
     public ThingCreated Filter([FromQuery] ThingFilter filter)
     {
         return new ThingCreated(filter.Name ?? "");
+    }
+
+    // A MultipartReader parameter: exercises ReadMultipartBody. See GH-4680.
+    [WolverinePost("/fsharp/upload")]
+    public static async Task<ThingCreated> Upload(MultipartReader reader)
+    {
+        var section = await reader.ReadNextSectionAsync();
+        return new ThingCreated(section?.ContentType ?? "");
+    }
+
+    // GH-4742. [DeduplicatedWithResponse] weaves in all six DeduplicatedResponseFrames: the request
+    // buffering, the scoped key, the fingerprint, the claim (with its short-circuit when the claim is
+    // lost), the try/finally that releases an unanswered claim, and the record of the response. Tenant is
+    // in the scope so the frame's tenant-id dependency is emitted too, and WindowInSeconds is non-zero so
+    // the TimeSpan literal is emitted rather than the null window.
+    //
+    // Required is FALSE deliberately: a required key also weaves DeduplicationIdMissingFrame and
+    // DeduplicationProblemDetailsFrame, which have no F# emitter yet and are still in the
+    // FSharpCoverageRatchet baseline. Turn this on once they do.
+    [DeduplicatedWithResponse(DeduplicationScope.Tenant | DeduplicationScope.User | DeduplicationScope.Endpoint,
+        Required = false, WindowInSeconds = 60)]
+    [WolverinePost("/fsharp/deduplicated")]
+    public ThingCreated Deduplicated(CreateThing command)
+    {
+        return new ThingCreated(command.Name);
     }
 }
 

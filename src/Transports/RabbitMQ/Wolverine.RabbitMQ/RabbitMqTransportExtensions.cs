@@ -37,12 +37,35 @@ public static class RabbitMqTransportExtensions
     public static RabbitMqExchangeConfiguration PublishMessagesToRabbitMqExchange<T>(this WolverineOptions options, string exchangeName,
         Func<T, string> topicSource, BrokerName? name = null)
     {
+        return options.PublishMessagesToRabbitMqExchange(exchangeName, topicSource, additive: false, name);
+    }
+
+    /// <summary>
+    /// Publish messages that are of type T or could be cast to type T to a Rabbit MQ
+    /// topic exchange using the supplied function to determine the topic for the message,
+    /// choosing whether Wolverine's other routing rules still apply to the same messages
+    /// </summary>
+    /// <param name="exchangeName"></param>
+    /// <param name="topicSource"></param>
+    /// <param name="additive">
+    /// When true, the exchange route is added to whatever else would route the message: an explicit rule
+    /// such as <c>PublishMessage&lt;T&gt;().ToLocalQueue("name")</c>, or local routing to a handler for
+    /// <typeparamref name="T"/> in this application, still applies, so one publish goes to the exchange
+    /// and to the local queue at the same time. When false -- the behavior of the overload without this
+    /// parameter -- the exchange is the only route those terminating rules leave the message.
+    /// </param>
+    /// <param name="name">If connecting to more than one Rabbit MQ broker, this is the identity of the additional broker</param>
+    /// <typeparam name="T"></typeparam>
+    /// <returns></returns>
+    public static RabbitMqExchangeConfiguration PublishMessagesToRabbitMqExchange<T>(this WolverineOptions options, string exchangeName,
+        Func<T, string> topicSource, bool additive, BrokerName? name = null)
+    {
         var transport = options.RabbitMqTransport(name);
         var exchange = transport.Exchanges[exchangeName];
         exchange.ExchangeType = ExchangeType.Topic;
         exchange.RoutingType = RoutingMode.ByTopic;
 
-        var routing = new TopicRouting<T>(topicSource, exchange);
+        var routing = new TopicRouting<T>(topicSource, exchange) { IsPassThrough = additive };
         options.PublishWithMessageRoutingSource(routing);
 
         return new RabbitMqExchangeConfiguration(exchange);
@@ -119,13 +142,19 @@ public static class RabbitMqTransportExtensions
     public static RabbitMqTransportExpression UseRabbitMqUsingNamedConnection(this WolverineOptions options,
         string connectionStringName, Action<ConnectionFactory>? configure = null)
     {
+        // GH-4527: declare the dependency so the runtime validates it -- together with every other named
+        // connection string this application needs -- in one pass at startup, before the message store
+        // migrates and before any transport connects, and so check-env can catch it before a deploy. The
+        // guard inside the factory below stays as a backstop for hosts assembled without IConfiguration.
+        var dependency = new NamedConfigurationDependency("Rabbit MQ", connectionStringName, "AddRabbitMQ");
+        options.RequireNamedConnectionString(dependency.Kind, dependency.Name, dependency.AspireResourceMethod);
+
         options.Services.AddSingleton<IConnectionFactory>(s =>
         {
             var configuration = s.GetRequiredService<IConfiguration>();
             var connectionString = configuration.GetConnectionString(connectionStringName);
             if (connectionString.IsEmpty())
-                throw new InvalidOperationException(
-                    $"The connection string named '{connectionStringName}' is missing in configuration");
+                throw dependency.MissingException(configuration);
 
 
             var factory = new ConnectionFactory();

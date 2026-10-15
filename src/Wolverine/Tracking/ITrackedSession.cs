@@ -85,6 +85,33 @@ public interface ITrackedSession
     RecordCollection Discarded { get; }
 
     /// <summary>
+    ///     GH-4931. Every event-store session that committed appended events during the tracked session, in
+    ///     commit order, each with the message being handled when it committed. Recorded by the Marten,
+    ///     Polecat and Fisher integrations for sessions opened through Wolverine's outbox.
+    /// </summary>
+    IReadOnlyList<AppendedEvents> AppendedEvents => Array.Empty<AppendedEvents>();
+
+    /// <summary>
+    ///     GH-4940. Every Dynamic Consistency Boundary a handler or HTTP endpoint loaded during the tracked
+    ///     session, in load order, each with the <see cref="JasperFx.Events.Tags.EventTagQuery" /> it was loaded
+    ///     over and the message being handled. Recorded by Wolverine's generated code for <c>[DcbModel]</c> and
+    ///     <c>[BoundaryModel]</c> parameters, on Marten, Polecat and Fisher alike.
+    /// </summary>
+    IReadOnlyList<LoadedBoundary> LoadedBoundaries => Array.Empty<LoadedBoundary>();
+
+    /// <summary>
+    ///     GH-4940. Every concurrent append <see cref="Tracking.ConcurrentAppends" /> landed during the tracked session:
+    ///     an append armed under an act's correlation id, run on the first save of a session carrying it.
+    /// </summary>
+    IReadOnlyList<ConcurrentAppendRecord> ConcurrentAppends => Array.Empty<ConcurrentAppendRecord>();
+
+    /// <summary>
+    ///     GH-4939. The correlation id the tracked work ran under, when one was given through
+    ///     <see cref="TrackedSessionConfiguration.WithCorrelationId" />. Null otherwise.
+    /// </summary>
+    string? CorrelationId => null;
+
+    /// <summary>
     ///     Finds a message of type T that was either sent, received,
     ///     or executed during this session. This will throw an exception
     ///     if there is more than one message

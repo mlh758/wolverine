@@ -37,11 +37,81 @@ partial class Build
     /// </summary>
     void LaunchDockerServices(params string[] services)
     {
-        var serviceList = string.Join(" ", services);
+        // GH-5019: a service whose host port already answers is reused rather than started. Every
+        // worktree is its own compose project, but the ports in docker-compose.yml are fixed, so a
+        // suite started in a second worktree -- an agent's gate in a Stoat plan, say -- failed with
+        // "port is already allocated" while the first worktree's stack was up. AwaitDockerServices
+        // still runs the real readiness probe on a reused service. On a CI runner nothing is
+        // listening yet, so this changes nothing there.
+        var ports = composeServicePorts();
+        var reused = services
+            .Where(service => ports.TryGetValue(service, out var port) && portAnswers(port))
+            .ToArray();
+
+        if (reused.Length > 0)
+            Log.Information("Reusing docker services already listening on their ports: {Services}",
+                string.Join(" ", reused));
+
+        var toStart = services.Except(reused).ToArray();
+        if (toStart.Length == 0) return;
+
+        var serviceList = string.Join(" ", toStart);
         Log.Information("Starting docker services: {Services}", serviceList);
 
         // Pass each service as a separate argument to avoid quoting issues
         ComposeUp("compose up -d " + serviceList, serviceList);
+    }
+
+    static bool portAnswers(int port)
+    {
+        try
+        {
+            using var client = new System.Net.Sockets.TcpClient();
+            return client.ConnectAsync("localhost", port).Wait(TimeSpan.FromSeconds(1)) && client.Connected;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Each docker-compose.yml service's first published host port, read from the file itself so the
+    /// reuse check in <see cref="LaunchDockerServices"/> cannot drift from it. A line-based read of the
+    /// two shapes the file uses (<c>"5433:5432"</c> and <c>"127.0.0.1:4566:4566"</c>), not a YAML parser.
+    /// </summary>
+    Dictionary<string, int> composeServicePorts()
+    {
+        var ports = new Dictionary<string, int>();
+        string service = null;
+        var inPorts = false;
+
+        foreach (var line in File.ReadAllLines(RootDirectory / "docker-compose.yml"))
+        {
+            var serviceMatch = System.Text.RegularExpressions.Regex.Match(line, @"^  ([A-Za-z0-9_-]+):\s*$");
+            if (serviceMatch.Success)
+            {
+                service = serviceMatch.Groups[1].Value;
+                inPorts = false;
+                continue;
+            }
+
+            if (service is null) continue;
+
+            if (System.Text.RegularExpressions.Regex.IsMatch(line, @"^    [A-Za-z_]+:"))
+            {
+                inPorts = line.Trim() == "ports:";
+                continue;
+            }
+
+            if (!inPorts || ports.ContainsKey(service)) continue;
+
+            var portMatch = System.Text.RegularExpressions.Regex.Match(line,
+                @"^\s+-\s+""?(?:[0-9.]+:)?([0-9]+)(?:-[0-9]+)?:[0-9]+");
+            if (portMatch.Success) ports[service] = int.Parse(portMatch.Groups[1].Value);
+        }
+
+        return ports;
     }
 
     /// <summary>
@@ -561,9 +631,9 @@ partial class Build
 
     void BuildTestProjectsWithFramework(string frameworkOverride, params AbsolutePath[] projects)
     {
-        var framework = frameworkOverride ?? Framework;
         foreach (var project in projects)
         {
+            var framework = frameworkFor(project, frameworkOverride);
             Log.Information("Building {Project} ({Framework})...", project.Name, framework ?? "all");
             DotNetBuild(c => c
                 .SetProjectFile(project)
@@ -687,9 +757,14 @@ partial class Build
         {
             var fisherTests = RootDirectory / "src" / "Persistence" / "FisherTests" / "FisherTests.csproj";
 
-            BuildTestProjects(fisherTests);
+            // GH-4838. The in-memory prototyping store needs no infrastructure either, and its suite runs
+            // in seconds, so it rides this job rather than paying for a runner of its own.
+            var inMemoryTests = RootDirectory / "src" / "Persistence" / "InMemoryTests" / "InMemoryTests.csproj";
+
+            BuildTestProjects(fisherTests, inMemoryTests);
 
             RunTestProject(fisherTests);
+            RunTestProject(inMemoryTests);
         });
 
     Target CISqlServer => _ => _
@@ -713,7 +788,7 @@ partial class Build
         });
 
     // MartenTests was the 18m long pole of the matrix (#3752). It was first attacked with worker lanes —
-    // four processes, each on its own database via WOLVERINE_POSTGRES — and that halved the wall clock but
+    // four processes, each on its own database via its own connection string — and that halved the wall clock but
     // did not hold up: the runner itself was killed outright ("The runner has received a shutdown signal")
     // twice in a row at ~15 minutes on an unrelated diff (#3771), which is the OOM signature, not a test
     // failure. Several Marten test hosts plus Postgres does not fit a 4-vCPU/16GB hosted runner, and a lane
@@ -854,21 +929,52 @@ partial class Build
             RunTestProject(oracleTests);
         });
 
+    AbsolutePath EfCoreTests => RootDirectory / "src" / "Persistence" / "EfCoreTests" / "EfCoreTests.csproj";
+
+    AbsolutePath EfCoreMultiTenancyTests => RootDirectory / "src" / "Persistence" / "EfCoreTests.MultiTenancy" /
+                                            "EfCoreTests.MultiTenancy.csproj";
+
+    /// <param name="framework">
+    /// Which target framework the two EF suites run on, or null to inherit <c>--framework</c>.
+    /// Both projects multi-target net9.0;net10.0 and <c>Directory.Packages.props</c> resolves EF Core 9
+    /// for net9.0 and EF Core 10 for net10.0, so the framework IS the EF Core major version under test.
+    /// CI passes <c>--framework net9.0</c> globally (tests.yml), which is why <see cref="CIEfCore" />
+    /// alone never exercised EF 10 in CI even though both suites have multi-targeted since #3540.
+    /// See GH-4635.
+    /// </param>
+    void runEfCoreSuites(string framework)
+    {
+        // EfCoreTests.MultiTenancy is net10.0-only: its MultiTenancyCompliance base hosts through Alba,
+        // and Alba 9 has no net9.0 target. It runs in the EF Core 10 lane only, rather than being
+        // silently promoted to net10.0 here and run twice.
+        var chosen = framework ?? Framework;
+        AbsolutePath[] suites = declaredFrameworks(EfCoreMultiTenancyTests).Contains(chosen)
+            ? [EfCoreTests, EfCoreMultiTenancyTests]
+            : [EfCoreTests];
+
+        BuildTestProjectsWithFramework(framework, suites);
+        // RabbitMQ is required by Bug_2588_ef_core_durable_outbox_with_conventional_routing,
+        // which exercises EF Core + RabbitMQ conventional routing + durable outbox policy.
+        // See GH-2588.
+        StartDockerServices("postgresql", "sqlserver", "rabbitmq");
+
+        RunTestProjects(suites.Select(x => (string)x).ToArray(), frameworkOverride: framework);
+    }
+
     Target CIEfCore => _ => _
         .ProceedAfterFailure()
-        .Executes(() =>
-        {
-            var efCoreTests = RootDirectory / "src" / "Persistence" / "EfCoreTests" / "EfCoreTests.csproj";
-            var efCoreMultiTenancy = RootDirectory / "src" / "Persistence" / "EfCoreTests.MultiTenancy" / "EfCoreTests.MultiTenancy.csproj";
+        .Executes(() => runEfCoreSuites(null));
 
-            BuildTestProjects(efCoreTests, efCoreMultiTenancy);
-            // RabbitMQ is required by Bug_2588_ef_core_durable_outbox_with_conventional_routing,
-            // which exercises EF Core + RabbitMQ conventional routing + durable outbox policy.
-            // See GH-2588.
-            StartDockerServices("postgresql", "sqlserver", "rabbitmq");
-
-            RunTestProjects([efCoreTests, efCoreMultiTenancy]);
-        });
+    /// <summary>
+    /// GH-4635. The same two EF suites on net10.0 / EF Core 10. A SEPARATE matrix job rather than a
+    /// second framework inside <see cref="CIEfCore" />: this matrix is minute-bound, not wall-clock
+    /// bound, and doubling an existing lane's work is the one thing the 20 minute cap is there to
+    /// prevent. As its own job the EF 10 run costs wall clock only against the other 34 jobs already
+    /// running in parallel.
+    /// </summary>
+    Target CIEfCoreNet10 => _ => _
+        .ProceedAfterFailure()
+        .Executes(() => runEfCoreSuites("net10.0"));
 
     // ─── Transport CI Targets ──────────────────────────────────────────
 
@@ -927,6 +1033,35 @@ partial class Build
     Target CIAWS => _ => _
         .ProceedAfterFailure()
         .DependsOn(CIAWSSqs, CIAWSSqsCompliance, CIAWSSns);
+
+    /// <summary>
+    /// GH-4833. WolverineFx.Bobcat and WolverineFx.Bobcat.Http. Their tests run on Marten until the
+    /// in-memory prototyping store implements IEventStore (JasperFx/jasperfx#985). The HTTP suite is
+    /// net10.0-only (Alba 9); frameworkFor picks that up from the project.
+    /// </summary>
+    Target CIBobcat => _ => _
+        .ProceedAfterFailure()
+        .Executes(() =>
+        {
+            var tests = RootDirectory / "src" / "Bobcat" / "Wolverine.Bobcat.Tests" / "Wolverine.Bobcat.Tests.csproj";
+            var httpTests = RootDirectory / "src" / "Bobcat" / "Wolverine.Bobcat.Http.Tests" / "Wolverine.Bobcat.Http.Tests.csproj";
+
+            // The samples dogfooding the library. Neither ran in any CI lane before, which is how both
+            // sat unable to start a host (no runtime compiler since GH-2876, and the test assembly
+            // adopted as the application assembly) with nobody noticing.
+            var incidents = RootDirectory / "src" / "Samples" / "IncidentService" / "IncidentService.Tests" / "IncidentService.Tests.csproj";
+            var processManager = RootDirectory / "src" / "Samples" / "ProcessManagerViaHandlers" /
+                                 "ProcessManagerViaHandlers.Tests" / "ProcessManagerViaHandlers.Tests.csproj";
+
+            BuildTestProjects(tests, httpTests, incidents, processManager);
+
+            // The store-agnostic specs (GH-4892, GH-4920, GH-4921) run on Marten, Polecat AND Fisher, and
+            // Polecat needs SQL Server. Without it every Polecat fixture fails to start, which surfaced as a
+            // NullReferenceException in DisposeAsync rather than as the connection failure it was.
+            StartDockerServices("postgresql", "sqlserver");
+
+            RunTestProjects([tests, httpTests, incidents, processManager]);
+        });
 
     Target CIKafka => _ => _
         .ProceedAfterFailure()
@@ -1212,45 +1347,180 @@ partial class Build
     // committed pre-gen under that project's Internal/Generated/ drifts
     // or the static-load path silently falls back to Roslyn, the smoke
     // binary exits non-zero with a clear diagnostic.
+    //
+    // GH-4810. Every lane runs, even after one has failed, and the target reports ALL of them at the end.
+    //
+    // This used to be one inline sequence of AssertZeroExitCode() calls, so it stopped at the first
+    // failure and the lanes after it never published. That is not a theoretical cost: it is the literal
+    // explanation in GH-4825's report -- "each one appears once the previous one is worked around" -- three
+    // distinct bugs discovered one per publish cycle, because nothing could report more than one per run.
+    //
+    // Cheapest-first, so a breakage in core fails fast before an ILC-expensive store lane spends minutes
+    // proving the same thing.
     Target CIAotSmoke => _ => _
         .ProceedAfterFailure()
         .Executes(() =>
         {
-            var smoke = RootDirectory / "src" / "Testing" / "Wolverine.AotSmoke" / "Wolverine.AotSmoke.csproj";
-            var staticSmoke = RootDirectory / "src" / "Testing" / "Wolverine.AotSmoke.Static" / "Wolverine.AotSmoke.Static.csproj";
-            var aiSmoke = RootDirectory / "src" / "Testing" / "Wolverine.AI.AotSmoke" / "Wolverine.AI.AotSmoke.csproj";
+            var failures = new List<string>();
 
-            DotNet($"build {smoke} --configuration {Configuration} --framework net9.0");
-            DotNet($"run --project {smoke} --no-build --configuration {Configuration} --framework net9.0");
-
-            DotNet($"build {staticSmoke} --configuration {Configuration} --framework net9.0");
-            DotNet($"run --project {staticSmoke} --no-build --configuration {Configuration} --framework net9.0");
+            // The two CoreCLR smokes. They never leave the JIT, which is exactly how every Native AOT
+            // startup crash in GH-4287 shipped unseen -- GetReferencedAssemblies() throwing, the stack walk
+            // with no frame metadata, and Activator.CreateInstance over trimmed closed generics all behave
+            // fine here. Kept because they are seconds each and still catch ordinary bootstrap breaks.
+            lane(failures, "Wolverine.AotSmoke", () => runJitAotSmoke("Wolverine.AotSmoke"));
+            lane(failures, "Wolverine.AotSmoke.Static", () => runJitAotSmoke("Wolverine.AotSmoke.Static"));
 
             // GH-4230. Runs as well as builds: the schema generation this gates fails by returning an
             // empty schema rather than by throwing, so a build-only check would pass over exactly the
             // regression it exists to catch.
-            DotNet($"build {aiSmoke} --configuration {Configuration} --framework net9.0");
-            DotNet($"run --project {aiSmoke} --no-build --configuration {Configuration} --framework net9.0");
+            lane(failures, "Wolverine.AI.AotSmoke", () => runJitAotSmoke("Wolverine.AI.AotSmoke"));
 
-            // GH-4287. The two smokes above never leave CoreCLR, which is exactly how every Native
-            // AOT startup crash in that issue shipped unseen: GetReferencedAssemblies() throwing,
-            // the stack walk with no frame metadata, and Activator.CreateInstance over trimmed
-            // closed generics all behave fine under the JIT and only fail in a native image. This
-            // one does a REAL PublishAot and executes the produced native binary, asserting the
-            // full boot + one dispatched message. The pinned JasperFx (2.63.1+) carries the
-            // jasperfx#742 bootstrap guard, so any regression here fails the lane outright.
-            var publishSmoke = RootDirectory / "src" / "Testing" / "Wolverine.AotSmoke.Publish" /
-                               "Wolverine.AotSmoke.Publish.csproj";
-            var publishSmokeOutput = RootDirectory / "src" / "Testing" / "Wolverine.AotSmoke.Publish" /
-                                     "bin" / "aot-publish";
-            DotNet(
-                $"publish {publishSmoke} --configuration {Configuration} --framework net9.0 --use-current-runtime --output {publishSmokeOutput}");
+            // ─── AOT smoke #3 (GH-4287): the first REAL native image ───
+            //
+            // Does a real PublishAot and executes the produced binary, asserting the full boot plus one
+            // dispatched message. The pinned JasperFx (2.63.1+) carries the jasperfx#742 bootstrap guard,
+            // so any regression here fails the lane outright.
+            lane(failures, "Wolverine.AotSmoke.Publish",
+                () => runNativeAotLane("Wolverine.AotSmoke.Publish", "aot-publish"));
 
-            var binaryName = EnvironmentInfo.IsWin ? "Wolverine.AotSmoke.Publish.exe" : "Wolverine.AotSmoke.Publish";
-            var process = ProcessTasks.StartProcess(publishSmokeOutput / binaryName,
-                workingDirectory: RootDirectory);
-            process.AssertZeroExitCode();
+            // ─── AOT smoke #4 (GH-4778): the HTTP entry path ───
+            //
+            // Every lane above references Wolverine.csproj alone, so HttpGraph.DiscoverEndpoints -- the
+            // frame at the top of the stack traces in GH-4752 and GH-4778 both -- never executed in a
+            // native image here. That is why this class of bug kept arriving from users' production
+            // publishes instead of from CI.
+            //
+            // Boots Wolverine.Http through MapWolverineEndpoints with an endpoint whose return type
+            // implements IResponseAware, and serves one request. Without the rooting block
+            // HttpEndpointRegistryCodeFile emits, this does NOT crash: the registry is trimmed, the
+            // fallback scan finds nothing in a native image, and the host boots clean having discovered
+            // ZERO endpoints. Hence the smoke's own vacuity guard -- it asserts ConfigureResponse actually
+            // ran, which is the only thing that distinguishes a working API from a silently empty one.
+            lane(failures, "Wolverine.AotSmoke.Http",
+                () => runNativeAotLane("Wolverine.AotSmoke.Http", "aot-http"));
+
+            // ─── AOT smoke #5 (GH-4805): the STORE-BACKED lane ───
+            //
+            // The gap GH-4765 was filed over. Every lane above references Wolverine.csproj or
+            // Wolverine.Http alone, so until this one no native image in CI had ever executed a chain that
+            // a PERSISTENCE package composed -- which is why this whole class of bug reached us from
+            // users' production publishes (GH-4752, GH-4778, the EF Core frames in #4803, and the three
+            // separate saga blockers in GH-4805).
+            //
+            // Sqlite-backed, so it costs a runner nothing: a file, no server, no container. It drives a
+            // Guid-keyed saga through start and advance and asserts the saga actually handled the second
+            // message -- the vacuity guard matters, because an earlier revision of this smoke booted
+            // perfectly while the saga never ran at all.
+            lane(failures, "Wolverine.AotSmoke.Saga",
+                () => runNativeAotLane("Wolverine.AotSmoke.Saga", "aot-saga"));
+
+            // ─── AOT smoke #7 (GH-4825): the FISHER-backed HTTP lane ───
+            //
+            // Two of GH-4825's failures are in Wolverine itself and reach any store that returns side
+            // effects from a handler or an endpoint -- SideEffectPolicy losing an op interface's Execute
+            // metadata, and HttpChain closing its own Applier<T> over a Results<Ok<T>, ProblemHttpResult>
+            // return type. IStartStream, IPolecatOp and IFisherOp are three unrelated interfaces in three
+            // packages and the rooting block is emitted per application, so proving a fix against one
+            // store says nothing about the others.
+            //
+            // Before the Marten lane below because it needs no container at all.
+            lane(failures, "Wolverine.AotSmoke.Fisher",
+                () => runNativeAotLane("Wolverine.AotSmoke.Fisher", "aot-fisher"));
+
+            // ─── AOT smoke #6 (GH-4825): the MARTEN-backed HTTP lane ───
+            //
+            // No lane above references Wolverine.Marten, so a Marten-backed application was the one shape
+            // no native image in CI had booted. Three startup failures reached 6.46 that way, each masked
+            // by the one before it -- see the note at the top of this target, which is why they could only
+            // be found one per run: SideEffectPolicy losing IStartStream's Execute method,
+            // HttpChain+Applier<T> closed over a Results<Ok<T>, ProblemHttpResult> return type, and Marten
+            // unable to find Envelope.Id. The lane asserts the stream really was started, so a host that
+            // boots while silently dropping the side effect still fails.
+            lane(failures, "Wolverine.AotSmoke.Marten", () =>
+            {
+                StartDockerServices("postgresql");
+                runNativeAotLane("Wolverine.AotSmoke.Marten", "aot-marten");
+            });
+
+            // ─── AOT smoke #8 (GH-4825): the POLECAT twin, DELIBERATELY NOT RUN YET ───
+            //
+            // src/Testing/Wolverine.AotSmoke.Polecat exists, builds with the solution, and its pre-gen is
+            // held to the codegen drift gate below -- but it is not run here, because it cannot pass for a
+            // reason outside this repository. Polecat's own DocumentStore constructor builds a provider for
+            // JasperFx's DeadLetterEvent, and DocumentMapping.BuildRawIdAccessors closes
+            // RawIdAccessors<DeadLetterEvent, Guid> with MethodInfo.MakeGenericMethod. GH-4805 measured
+            // that NO rooting mechanism makes ILC generate code for a value-type instantiation, so this is
+            // not something a [DynamicDependency] here can reach: today no Polecat application can be
+            // published with PublishAot at all, with or without Wolverine. Tracked as JasperFx/polecat#733.
+            //
+            // Now that the lanes aggregate instead of aborting, turning this on would no longer silence
+            // the seven above it -- so when polecat#733 is fixed, uncomment and delete this note.
+            //
+            //   lane(failures, "Wolverine.AotSmoke.Polecat", () =>
+            //   {
+            //       StartDockerServices("sqlserver");
+            //       runNativeAotLane("Wolverine.AotSmoke.Polecat", "aot-polecat");
+            //   });
+
+            if (failures.Count > 0)
+            {
+                throw new Exception(
+                    $"{failures.Count} of the Native AOT smoke lanes failed:{Environment.NewLine}" +
+                    string.Join(Environment.NewLine, failures.Select(x => "  " + x)) +
+                    $"{Environment.NewLine}{Environment.NewLine}Each lane's own output is above, in the order they ran.");
+            }
         });
+
+    /// <summary>
+    ///     Run one AOT smoke lane, recording a failure instead of aborting the target.
+    /// </summary>
+    /// <remarks>
+    ///     GH-4810. The first line of the exception message is what goes in the summary -- a publish
+    ///     failure's message is the whole MSBuild log otherwise, and the useful detail is already in the
+    ///     lane's own streamed output.
+    /// </remarks>
+    static void lane(List<string> failures, string name, Action run)
+    {
+        try
+        {
+            run();
+        }
+        catch (Exception e)
+        {
+            var firstLine = e.Message.Trim().Split('\n', 2)[0].Trim();
+            failures.Add($"{name} -- {firstLine}");
+            Log.Error("Native AOT lane {Lane} FAILED: {Message}", name, firstLine);
+        }
+    }
+
+    /// <summary>
+    ///     Build and run one <c>src/Testing/&lt;name&gt;</c> smoke on CoreCLR. Not a native image — these
+    ///     catch ordinary bootstrap breaks, and cost seconds rather than ILC minutes.
+    /// </summary>
+    void runJitAotSmoke(string projectName)
+    {
+        var project = RootDirectory / "src" / "Testing" / projectName / $"{projectName}.csproj";
+
+        DotNet($"build {project} --configuration {Configuration} --framework net9.0");
+        DotNet($"run --project {project} --no-build --configuration {Configuration} --framework net9.0");
+    }
+
+    /// <summary>
+    ///     Publish one <c>src/Testing/&lt;name&gt;</c> project as a REAL native image and run it, throwing
+    ///     on a non-zero exit code.
+    /// </summary>
+    void runNativeAotLane(string projectName, string outputFolder)
+    {
+        var project = RootDirectory / "src" / "Testing" / projectName / $"{projectName}.csproj";
+        var output = RootDirectory / "src" / "Testing" / projectName / "bin" / outputFolder;
+
+        DotNet(
+            $"publish {project} --configuration {Configuration} --framework net9.0 --use-current-runtime --output {output}");
+
+        var binaryName = EnvironmentInfo.IsWin ? $"{projectName}.exe" : projectName;
+        ProcessTasks.StartProcess(output / binaryName, workingDirectory: RootDirectory)
+            .AssertZeroExitCode();
+    }
 
     // ─── Codegen drift gate ────────────────────────────────────────────
     //
@@ -1296,14 +1566,33 @@ partial class Build
             // ConsoleApp configures RabbitMQ, and DeepMiddlewareUsage configures Marten against
             // Postgres. `codegen write` compiles the handler graph without ever starting the host, so
             // neither is strictly contacted -- but both containers are cheap, and their absence would
-            // make this gate flaky instead of red if that ever stops being true.
-            StartDockerServices("postgresql", "rabbitmq");
+            // make this gate flaky instead of red if that ever stops being true. GH-4825 adds sqlserver
+            // for the same reason, for Wolverine.AotSmoke.Polecat.
+            StartDockerServices("postgresql", "rabbitmq", "sqlserver");
 
             var projects = new[]
             {
                 RootDirectory / "src" / "Testing" / "ConsoleApp",
                 RootDirectory / "src" / "Testing" / "Wolverine.AotSmoke.Static",
                 RootDirectory / "src" / "Testing" / "Wolverine.AotSmoke.Publish",
+                // GH-4778. Its committed pre-gen is what CIAotSmoke's native HTTP lane runs, so it has to
+                // be held to the same freshness gate as the rest -- a stale tree here would make that lane
+                // assert against generated code nobody has regenerated since the emitters changed.
+                RootDirectory / "src" / "Testing" / "Wolverine.AotSmoke.Http",
+                // GH-4805. Same reasoning, and this one finally gives the drift gate a SAGA: it is the
+                // first project here whose committed output contains a saga chain, so the saga emission
+                // is byte-compared from now on. Before it, GH-4765's and GH-4803's rooting changes both
+                // came out identical across every project in this list because none of them had one.
+                RootDirectory / "src" / "Testing" / "Wolverine.AotSmoke.Saga",
+                // GH-4825. Their committed pre-gen is what the store-backed native lanes run, and the
+                // rooting block is the part of that output this issue changed -- these three are the only
+                // projects here whose emitted roots cover a side effect or an IEndpointMetadataProvider
+                // resource type at all. Polecat is in this list even though CIAotSmoke does not run its
+                // lane yet (see the comment there): a project whose output nothing regenerates is exactly
+                // how the committed pre-gen went stale by six files before this gate existed.
+                RootDirectory / "src" / "Testing" / "Wolverine.AotSmoke.Marten",
+                RootDirectory / "src" / "Testing" / "Wolverine.AotSmoke.Polecat",
+                RootDirectory / "src" / "Testing" / "Wolverine.AotSmoke.Fisher",
                 RootDirectory / "src" / "Http" / "CodeGenTarget",
                 RootDirectory / "src" / "Http" / "StaticCodeGenDemonstrator",
                 RootDirectory / "src" / "Http" / "DeepMiddlewareUsage"

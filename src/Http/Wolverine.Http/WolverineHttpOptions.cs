@@ -152,7 +152,6 @@ public class WolverineHttpOptions
     {
         Policies.Add(new HttpAwarePolicy());
         Policies.Add(new RequestIdPolicy());
-        Policies.Add(new UserNamePolicy());
         Policies.Add(new RequiredEntityPolicy());
         Policies.Add(new HttpChainResponseCacheHeaderPolicy());
         Policies.Add(new TagHttpHandlerPolicy());
@@ -234,6 +233,21 @@ public class WolverineHttpOptions
     }
 
     /// <summary>
+    ///     When true, the request's <c>X-Correlation-ID</c> header becomes the correlation id of <b>every</b>
+    ///     Wolverine.HTTP endpoint, applied where the endpoint's message context is created -- before any Marten,
+    ///     Polecat or Fisher session is opened from it -- so the events the endpoint appends record it too.
+    ///     <para>
+    ///     By default the header is applied by <c>RequestIdMiddleware</c>, and only to an endpoint that uses
+    ///     <c>IMessageBus</c> or <c>IMessageContext</c>. The messages such an endpoint sends carry it, but its event
+    ///     store session is opened before that middleware runs, and an endpoint that only uses a session never gets
+    ///     the middleware at all, so the events record an Activity id or a new Guid instead of the request's.
+    ///     </para>
+    ///     Turn this on when a caller's correlation id has to reach the events an endpoint appends, as when a test
+    ///     finds what a request caused by its correlation id. Off by default. See GH-4939.
+    /// </summary>
+    public bool ApplyCorrelationIdHeaderToAllEndpoints { get; set; }
+
+    /// <summary>
     /// Potentially control how the Wolverine HTTP routes are "warmed up" at runtime
     /// to alleviate concurrent access problems
     /// </summary>
@@ -293,6 +307,14 @@ public class WolverineHttpOptions
     ///     an ApiExplorer read that early depends on. See <see cref="HostEndpointDataSources" />.
     /// </summary>
     internal IEndpointRouteBuilder? RouteBuilder { get; set; }
+
+    /// <summary>
+    ///     Did MapWolverineEndpoints() manage to make the host's whole route table visible to a pre-start
+    ///     ApiExplorer read? False when Wolverine was mapped into a route group, or when ASP.NET Core's
+    ///     internals moved — either way a read before the host starts describes only part of the
+    ///     application, and <see cref="WolverineApiDescriptionProvider" /> says so out loud.
+    /// </summary>
+    internal bool HostEndpointsPublished { get; set; }
 
     internal MiddlewarePolicy Middleware { get; } = new();
 
@@ -440,6 +462,73 @@ public class WolverineHttpOptions
     public void AddPolicy<T>() where T : IHttpPolicy, new()
     {
         Policies.Add(new T());
+    }
+
+    /// <summary>
+    /// GH-4512. Map the Critter Stack's commit-time concurrency failures onto a 409 ProblemDetails response
+    /// instead of letting them escape as an unhandled 500, and advertise the 409 in the OpenAPI document.
+    ///
+    /// <para>
+    /// Covers everything deriving from <see cref="JasperFx.ConcurrencyException"/>:
+    /// <c>EventStreamUnexpectedMaxEventIdException</c>, document revision/version violations,
+    /// <c>DcbConcurrencyException</c> and <c>SagaConcurrencyException</c>.
+    /// </para>
+    ///
+    /// <para>
+    /// <b>On Marten or Polecat, call that store's own overload instead</b> --
+    /// <c>MapMartenConcurrencyFailuresToConflict()</c> or <c>MapPolecatConcurrencyFailuresToConflict()</c>.
+    /// Their <c>StreamLockedException</c>, which <c>FetchForExclusiveWriting</c> throws on a contended
+    /// stream, does <b>not</b> derive from <see cref="JasperFx.ConcurrencyException"/> and is not
+    /// referenceable from this assembly, so this method alone leaves the exclusive locking path returning
+    /// 500s. The store overloads call this one and add their own type.
+    /// </para>
+    /// </summary>
+    /// <param name="filter">
+    /// Which chains the mapping applies to. Defaults to the transactional chains -- the only ones that
+    /// commit a unit of work, and so the only ones that can raise a commit-time concurrency failure.
+    /// </param>
+    public void MapConcurrencyFailuresToConflict(Func<HttpChain, bool>? filter = null)
+    {
+        filter ??= ConflictMapping.IsTransactional;
+
+        AddMiddleware(typeof(ConcurrencyExceptionMiddleware), filter);
+        Policies.Add(new ConflictProblemPolicy(filter));
+    }
+
+    /// <summary>
+    /// GH-4516. Map an <b>unknown</b> tenant id onto a 404 ProblemDetails instead of letting it escape as an
+    /// unhandled 500, and advertise the 404 in the OpenAPI document.
+    ///
+    /// <para>
+    /// A <b>missing</b> mandatory tenant id is already handled without this: <c>[RequiresTenant]</c> stops
+    /// the request with a 400 ProblemDetails. This covers the other case -- a tenant id that is present on
+    /// the request and simply has no database or registration behind it, which throws
+    /// <see cref="JasperFx.MultiTenancy.UnknownTenantIdException"/> from the store or from Wolverine's own
+    /// tenant sources. That is a client-side error, and it was answering 500.
+    /// </para>
+    ///
+    /// <para>
+    /// 404 rather than 400 on purpose: it reads as "the thing you addressed does not exist", and it keeps
+    /// 400 meaning "you did not say which tenant".
+    /// </para>
+    ///
+    /// <para>
+    /// A <i>disabled</i> tenant would deserve a 403 -- the tenant exists and access is refused -- but on
+    /// Marten and Polecat it is indistinguishable from unknown today, and JasperFx has no lifted
+    /// <c>DisabledTenantException</c> to catch. When it lands, it belongs here.
+    /// </para>
+    /// </summary>
+    /// <param name="filter">
+    /// Which chains the mapping applies to. Defaults to the tenanted chains -- those declared
+    /// <c>[RequiresTenant]</c> or <c>[MaybeTenanted]</c> -- since a chain that resolves no tenant cannot
+    /// fail to resolve one.
+    /// </param>
+    public void MapUnknownTenantToNotFound(Func<HttpChain, bool>? filter = null)
+    {
+        filter ??= TenancyProblemMapping.IsTenanted;
+
+        AddMiddleware(typeof(UnknownTenantMiddleware), filter);
+        Policies.Add(new UnknownTenantProblemPolicy(filter));
     }
 
     /// <summary>

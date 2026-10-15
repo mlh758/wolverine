@@ -1,3 +1,4 @@
+using Wolverine.Persistence.Sagas;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using ImTools;
@@ -11,7 +12,7 @@ using Weasel.Core;
 using Weasel.Core.Migrations;
 using Weasel.MySql;
 using Wolverine.Logging;
-using Wolverine.MySql.Sagas;
+using Wolverine.MySql.Internals;
 using Wolverine.MySql.Schema;
 using Wolverine.MySql.Util;
 using Wolverine.Persistence.Durability;
@@ -27,8 +28,27 @@ using Table = Weasel.MySql.Tables.Table;
 
 namespace Wolverine.MySql;
 
-internal class MySqlMessageStore : MessageDatabase<MySqlConnection>
+internal partial class MySqlMessageStore : MessageDatabase<MySqlConnection>, ISagaStorageCodeSource
 {
+    /// <summary>
+    ///     GH-4805. Lets generated saga code construct <c>DatabaseSagaSchema<TSaga, TId></c> itself, which is the only way the
+    ///     saga path runs in a native image — <c>SagaSchemaFor</c> is an abstract generic method, and ILC
+    ///     cannot dispatch one.
+    /// </summary>
+    /// <remarks>
+    ///     <c>MakeGenericType</c> is safe here and nowhere near the runtime path: called once per saga
+    ///     chain while the chain model is built, under the JIT, and the <see cref="Type" /> it returns is
+    ///     only rendered as source text. <b>Note the argument order</b> — this store's schema is
+    ///     <c>DatabaseSagaSchema<TSaga, TId></c>, and the five relational stores do not agree on it, which is exactly why each
+    ///     answers this for itself rather than a shared helper guessing.
+    /// </remarks>
+    [UnconditionalSuppressMessage("AOT", "IL3050",
+        Justification = "GH-4805. The closed type is RENDERED AS SOURCE TEXT by EnrollAndFetchSagaStorageFrame and never instantiated from this Type. Called at codegen time under the JIT, so it does not execute in a native image at all -- the generated code that replaces it is what runs there.")]
+    public SagaSchemaCodegen? SagaSchemaCodegenFor(Type sagaType, Type idType)
+    {
+        return new SagaSchemaCodegen(typeof(DatabaseSagaSchema<,>).MakeGenericType(sagaType, idType), typeof(RelationalSagaStorage));
+    }
+
     /// <summary>
     /// GH-4375. MySQL's placeholder count is a uint16 on the wire, so 65,535. A multi-row insert of
     /// 65,536 parameters was accepted against the docker-compose MySQL, which means the practical limit
@@ -112,11 +132,19 @@ internal class MySqlMessageStore : MessageDatabase<MySqlConnection>
         }
     }
 
-    public override ISchemaObject AddExternalMessageTable(ExternalMessageTable definition)
+    /// <summary>GH-4742. A bounded reap: response bodies make one unbounded delete a long lock.</summary>
+    public override string? BatchedDeleteExpiredDeduplicatedResponsesSql(int batchSize)
+    {
+        return
+            $"delete from {SchemaName}.{DatabaseConstants.DeduplicatedResponsesTableName} " +
+            $"where {DatabaseConstants.Expires} <= @now limit {batchSize};";
+    }
+
+    public override ITable AddExternalMessageTable(ExternalMessageTable definition)
     {
         var table = new Table(definition.TableName);
         table.AddColumn<Guid>(definition.IdColumnName).AsPrimaryKey();
-        table.AddColumn(definition.JsonBodyColumnName, "JSON").NotNull();
+        table.AddColumn(definition.JsonBodyColumnName, "LONGBLOB").NotNull();
         if (definition.TimestampColumnName.IsNotEmpty())
         {
             table.AddColumn<DateTimeOffset>(definition.TimestampColumnName)
@@ -146,8 +174,8 @@ internal class MySqlMessageStore : MessageDatabase<MySqlConnection>
         await conn.CloseAsync();
     }
 
-    protected override Task deleteMany(DbTransaction tx, Guid[] ids, DbObjectName tableName,
-        string idColumnName)
+    protected override Task deleteManyAsync(DbTransaction tx, Guid[] ids, DbObjectName tableName,
+        string idColumnName, CancellationToken token)
     {
         if (ids.Length == 0) return Task.CompletedTask;
 
@@ -157,7 +185,7 @@ internal class MySqlMessageStore : MessageDatabase<MySqlConnection>
         var placeholders = MySqlCommandExtensions.WithIdList(cmd, "id", ids);
         cmd.CommandText = $"DELETE FROM {tableName.QualifiedName} WHERE {idColumnName} IN ({placeholders})";
 
-        return cmd.ExecuteNonQueryAsync();
+        return cmd.ExecuteNonQueryAsync(token);
     }
 
     protected override async Task<bool> TryAttainLockAsync(int lockId, MySqlConnection connection,
@@ -235,6 +263,9 @@ internal class MySqlMessageStore : MessageDatabase<MySqlConnection>
                 .ExecuteScalarAsync();
 
         counts.DeadLetter = Convert.ToInt32(deadLetterCount);
+
+        // GH-4499 follow-up: the head of the outbox, so a stuck outbox can be told from a busy one
+        await fetchOldestOutgoingAsync(counts);
 
         return counts;
     }
@@ -362,6 +393,9 @@ internal class MySqlMessageStore : MessageDatabase<MySqlConnection>
     /// Mirrors <c>PostgresqlMessageStore._reassignIncomingSql</c>, which does the same job through
     /// <c>unnest(@ids, @uris)</c>. See GH-4209 for the incident that first exposed the shape.
     /// </summary>
+    // GH-5022: the same clock as the inbox timestamp column default
+    protected override string currentTimestampSql => "UTC_TIMESTAMP(6)";
+
     private string writePromotionSql(DbCommand command, IReadOnlyList<Envelope> envelopes)
     {
         var matchesById = Durability.MessageIdentity == MessageIdentity.IdOnly;
@@ -388,7 +422,7 @@ internal class MySqlMessageStore : MessageDatabase<MySqlConnection>
             clauses.Add($"(id = @id_{i} AND {DatabaseConstants.ReceivedAt} = @uri_{i})");
         }
 
-        return $"UPDATE {SchemaName}.{DatabaseConstants.IncomingTable} SET owner_id = @owner, status = '{EnvelopeStatus.Incoming}' " +
+        return $"UPDATE {SchemaName}.{DatabaseConstants.IncomingTable} SET owner_id = @owner, status = '{EnvelopeStatus.Incoming}'{restartIncomingStaleClock} " +
                $"WHERE status = '{EnvelopeStatus.Scheduled}' AND ({string.Join(" OR ", clauses)})";
     }
 
@@ -451,12 +485,10 @@ internal class MySqlMessageStore : MessageDatabase<MySqlConnection>
 
                 await tx.CommitAsync(cancellationToken);
 
-                // Stamp owning store on each row so downstream pipeline routes
-                // its writes back here. See GH-2576.
-                foreach (var envelope in envelopes)
-                {
-                    envelope.Store = this;
-                }
+                // Mirror onto the in-memory envelopes what the UPDATE above just did to their rows:
+                // owning store (GH-2576) and promoted status (GH-4673).
+                DatabasePersistence.MarkPromotedFromScheduled(envelopes, this,
+                    durabilitySettings.AssignedNodeNumber);
 
                 await runtime.EnqueueDirectlyAsync(envelopes);
             }
@@ -467,7 +499,7 @@ internal class MySqlMessageStore : MessageDatabase<MySqlConnection>
         }
     }
 
-    public override async Task PublishMessageToExternalTableAsync(ExternalMessageTable table, string messageTypeName,
+    public override async Task PublishMessageToExternalTableAsync(ExternalMessageTable table, string? messageTypeName,
         byte[] json,
         CancellationToken token)
     {
@@ -488,7 +520,7 @@ internal class MySqlMessageStore : MessageDatabase<MySqlConnection>
                 $"INSERT INTO {table.TableName.QualifiedName} ({table.IdColumnName}, {table.JsonBodyColumnName}, {table.MessageTypeColumnName}) VALUES (@id, @json, @message)";
             cmd.Parameters.AddWithValue("@id", Guid.NewGuid());
             cmd.Parameters.AddWithValue("@json", json);
-            cmd.Parameters.AddWithValue("@message", messageTypeName);
+            cmd.Parameters.AddWithValue("@message", messageTypeName!);
         }
 
         await cmd.ExecuteNonQueryAsync(token);
@@ -536,9 +568,21 @@ internal class MySqlMessageStore : MessageDatabase<MySqlConnection>
         yield return new DeadLettersTable(Durability, SchemaName);
 
         // GH-4180. Every store role, not just Main -- see the PostgreSQL twin.
-        if (Durability.EnableMessageDeduplication)
+        // GH-4757: exactly one of the two, never both. The hash mode's key is a binary column, which
+        // cannot be reached from the original table by any migration Weasel can express.
+        if (Durability.MessageDeduplicationMode == MessageDeduplicationMode.CompareByString)
         {
             yield return new DeduplicationTable(SchemaName);
+        }
+        else if (Durability.MessageDeduplicationMode == MessageDeduplicationMode.CompareByHash)
+        {
+            yield return new HashedDeduplicationTable(SchemaName);
+        }
+
+        // GH-4742. Every store role, behind its own opt-in.
+        if (Durability.EnableDeduplicatedResponses)
+        {
+            yield return new DeduplicatedResponsesTable(SchemaName);
         }
 
         // Recurring-message tracking — Main store only, behind the opt-in. See the PostgreSQL twin.
@@ -571,6 +615,14 @@ internal class MySqlMessageStore : MessageDatabase<MySqlConnection>
             nodeTable.AddColumn<DateTimeOffset>("health_check").NotNull().DefaultValueByExpression("(UTC_TIMESTAMP(6))");
             nodeTable.AddColumn<string>("version");
             nodeTable.AddColumn("capabilities", "TEXT").AllowNulls();
+
+            // GH-4593, mirroring the PostgreSQL gate from GH-3959: provisioned only behind the opt-in so
+            // an upgrade migrates nothing, and MySqlNodePersistence gates every statement naming it on the
+            // same flag. Plain DOUBLE with no modifiers in the type string, per GH-3983.
+            if (Durability.CapacityAwareAssignment)
+            {
+                nodeTable.AddColumn(DatabaseConstants.LoadFactor, "DOUBLE").AllowNulls();
+            }
 
             yield return nodeTable;
 

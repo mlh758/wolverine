@@ -27,7 +27,79 @@ public partial class NodeAgentController
 
     private readonly Dictionary<Uri, PendingAssignment> _pendingAssignments = new();
 
-    private readonly record struct PendingAssignment(Guid NodeId, DateTimeOffset SentAt);
+    private readonly record struct PendingAssignment(Guid NodeId, DateTimeOffset SentAt, bool IsMove = false, Guid? SourceNodeId = null);
+
+    private int _lastUndeclaredAssignmentCount;
+
+    /// <summary>
+    ///     GH-4897. How many assignment evaluations this node has run since it last assumed leadership; null
+    ///     until it has ever been elected. Drives <see cref="DurabilitySettings.LeaderTakeoverHoldEvaluations" />.
+    /// </summary>
+    internal int? EvaluationsSinceElection { get; set; }
+
+    /// <summary>
+    ///     The clock the pending-assignment ledger stamps and ages its entries with. A simulation drives it in
+    ///     evaluation-sized steps so the TTL backstop means "two evaluations" there exactly as it does here.
+    /// </summary>
+    internal Func<DateTimeOffset> Clock { get; set; } = () => DateTimeOffset.UtcNow;
+
+    /// <summary>
+    ///     GH-4897. The agents the stale nodes filtered out of this tick's snapshot were running. A dead
+    ///     node's agents are orphans -- running nowhere, with no start in flight for them anywhere -- and
+    ///     the takeover hold must never delay them: a leader whose predecessor died is precisely when they
+    ///     turn up, and a cluster with a slow heartbeat may not evaluate again for a long time.
+    /// </summary>
+    internal HashSet<Uri> OrphanedByStaleNodes { get; set; } = [];
+
+    /// <summary>
+    ///     GH-4555. A placement the target node cannot honor is silent from the leader's side: the node throws
+    ///     <c>Unable to find a shard with path '...'</c> on start, so no assignment row is ever written, so the
+    ///     next evaluation sees the agent as unplaced and makes the identical decision. The reporter measured
+    ///     that loop running for twelve hours at ~504 failed starts an hour, and had to reconstruct it from
+    ///     application logs because the leader said nothing at all.
+    ///
+    ///     <para>
+    ///     GH-4562/GH-4563 closed the placement bug that caused it, so this is a tripwire rather than a fix:
+    ///     if the grid ever produces such a placement again, the cluster says so from the side that decided it.
+    ///     </para>
+    ///
+    ///     <para>
+    ///     Only agents that <b>some</b> node declares are checked. Durability and listener agents are
+    ///     advertised at the family level rather than per URI -- <c>MessageStoreCollection</c> publishes one
+    ///     <c>DurabilityCapabilityUri</c> for all of them -- so their absence from a node's capabilities means
+    ///     nothing. And an agent no node declares is the case the GH-3341 rescue exists to place deliberately.
+    ///     Latched on the count so a steady state is not re-logged every evaluation.
+    ///     </para>
+    /// </summary>
+    internal static void WarnAboutUndeclaredAssignments(AssignmentGrid grid,
+        IEnumerable<AssignmentGrid.Agent> beingIssued, ILogger logger, ref int lastReportedCount)
+    {
+        // Only the assignments this evaluation is actually dispatching, which in a settled cluster is
+        // none: there is no reason to re-examine placements every node has already confirmed.
+        var undeliverable = beingIssued
+            .Where(x => x.AssignedNode != null && !x.AssignedNode.Declares(x.Uri))
+            .Where(x => grid.Nodes.Any(n => n.Declares(x.Uri)))
+            .ToArray();
+
+        if (undeliverable.Length == lastReportedCount)
+        {
+            return;
+        }
+
+        lastReportedCount = undeliverable.Length;
+
+        if (undeliverable.Length == 0)
+        {
+            return;
+        }
+
+        var sample = string.Join(", ", undeliverable.Take(5)
+            .Select(x => $"{x.Uri} -> Node {x.AssignedNode!.AssignedId}"));
+
+        logger.LogWarning(
+            "{Count} agent assignment(s) were made to nodes that do not advertise the agent, and those agents cannot start there: {Sample}{More}. This is a Wolverine defect -- please report it with the node capability rows from wolverine_nodes.",
+            undeliverable.Length, sample, undeliverable.Length > 5 ? $", and {undeliverable.Length - 5} more" : "");
+    }
 
     /// <summary>
     ///     GH-3750: refresh the pending-assignment ledger for agents a resolving batch command just
@@ -46,7 +118,7 @@ public partial class NodeAgentController
             return;
         }
 
-        var now = DateTimeOffset.UtcNow;
+        var now = Clock();
 
         lock (_pendingLock)
         {
@@ -54,7 +126,7 @@ public partial class NodeAgentController
             {
                 if (_pendingAssignments.TryGetValue(uri, out var pending) && pending.NodeId == nodeId)
                 {
-                    _pendingAssignments[uri] = new PendingAssignment(nodeId, now);
+                    _pendingAssignments[uri] = pending with { SentAt = now };
                 }
             }
         }
@@ -103,13 +175,28 @@ public partial class NodeAgentController
         }
         
         var grid = new AssignmentGrid();
+        grid.OverloadShedBatchSize = Math.Max(1, _runtime.Options.Durability.OverloadShedBatchSize);
 
         var capabilities = nodes.SelectMany(x => x.Capabilities).Distinct().ToArray();
         grid.WithAgents(capabilities);
-        
+
+        var capacityAware = _runtime.Options.Durability.CapacityAwareAssignment;
+        var overloadThreshold = _runtime.Options.Durability.NodeOverloadThreshold;
+
         foreach (var node in nodes)
         {
-            grid.WithNode(node);
+            var gridNode = grid.WithNode(node);
+
+            // GH-3959: only the leader flags overload, and only when the feature is on — a node that
+            // advertises no load always counts as having headroom, which keeps stores without load
+            // persistence on today's behavior. The receive line sits a 10-point hysteresis band below
+            // the shed line so placement and shedding never fight around one threshold.
+            gridNode.IsOverloaded = capacityAware
+                                    && gridNode.LoadFactor.HasValue
+                                    && gridNode.LoadFactor.Value >= overloadThreshold;
+            gridNode.IsAcceptingAgents = !capacityAware
+                                         || !gridNode.LoadFactor.HasValue
+                                         || gridNode.LoadFactor.Value < Math.Max(0, overloadThreshold - 10);
         }
 
         // GH-3785: the durability family places each database's agent next to that database's
@@ -134,7 +221,11 @@ public partial class NodeAgentController
                 // dispatch) and BEFORE the family distributes, so the distribution balances the remaining
                 // agents *around* the ones already in flight instead of spreading everything evenly and
                 // then having them yanked back. See the method.
-                applyPendingAssignments(grid);
+                //
+                // GH-4901: only this family's agents. Applied to the whole grid, the next family's pass put
+                // every pending agent of the families before it back on its pending node, undoing their
+                // decisions to move it -- so an agent queued for a node stayed there until it had started.
+                applyPendingAssignments(grid, agentFamily.Scheme);
 
                 await agentFamily.EvaluateAssignmentsAsync(grid);
             }
@@ -146,14 +237,18 @@ public partial class NodeAgentController
         }
 
         var commands = new AgentCommands();
+        var issued = new List<AssignmentGrid.Agent>();
 
         foreach (var agent in grid.AllAgents)
         {
             if (agent.TryBuildAssignmentCommand(out var agentCommand))
             {
                 commands.Add(agentCommand);
+                issued.Add(agent);
             }
         }
+
+        holdUnplacedAgentsAfterTakeover(nodes, commands, issued);
 
         // Heal split-brain residue: if any agent is reported running on more
         // than one node — most likely because a stale leader and the current
@@ -171,6 +266,8 @@ public partial class NodeAgentController
             commands.Add(new StopRemoteAgent(report.AgentUri, report.ExistingNode.ToDestination()));
         }
 
+        WarnAboutUndeclaredAssignments(grid, issued, _logger, ref _lastUndeclaredAssignmentCount);
+
         // GH-3604 / D3+D6: before the observer logs anything, so a slow start isn't punished with a
         // duplicate control-queue flood and a matching burst of AssignmentChanged telemetry rows.
         reconcilePendingAssignments(grid, commands);
@@ -186,6 +283,132 @@ public partial class NodeAgentController
         }
 
         return commands;
+    }
+
+    // GH-4897. A newly elected leader's first evaluations against a cluster its predecessor was running.
+    //
+    // The pending-assignment ledger above is leader-local and in-memory, so a start the previous leader
+    // dispatched that has not yet come up as a persisted assignment row is invisible here: the agent has no
+    // OriginalNode and no PendingNode and looks completely unplaced. Placing it straight away can send it to a
+    // second node -- the dead leader's departure changed the node set, so the spread lands elsewhere -- while
+    // the first copy is still starting. GH-2602 heals that a cycle later, but the agent ran twice.
+    //
+    // So for the first LeaderTakeoverHoldEvaluations evaluations after election, a bare first-time placement
+    // is withheld: the agent is detached in the grid (so the observer and LastAssignments do not show a
+    // placement that was never sent) and nothing is dispatched for it. Every move, stop and visibly running
+    // agent proceeds. Next cycle the predecessor's starts have had a snapshot to appear as rows and are
+    // grandfathered where they are; whatever is still unplaced then is placed normally.
+    //
+    // Except the orphans. An agent a STALE node was running has no OriginalNode either -- the stale node is
+    // filtered out of the grid upstream -- but nothing is in flight for it anywhere; it is simply down. Those
+    // are placed on this very evaluation. The leader-election compliance tests pin this: the survivors run
+    // on a ten-minute heartbeat and trigger exactly one evaluation after the old leader goes stale, so a
+    // held orphan there is an orphan that never gets placed.
+    //
+    // Skipped outright when no other node holds any assignment: a cold cluster's first leader, or a single
+    // node, has no predecessor whose starts could be in flight, and must not pay a cycle for nothing.
+    private void holdUnplacedAgentsAfterTakeover(IReadOnlyList<WolverineNode> nodes, AgentCommands commands,
+        List<AssignmentGrid.Agent> issued)
+    {
+        if (EvaluationsSinceElection is not { } since)
+        {
+            return;
+        }
+
+        EvaluationsSinceElection = since + 1;
+
+        var selfId = _runtime.Options.UniqueNodeId;
+        var durability = _runtime.Options.Durability;
+
+        var takingOver = nodes.Any(n => n.NodeId != selfId && n.ActiveAgents.Any(a => a != LeaderUri));
+        var alone = nodes.All(n => n.NodeId == selfId);
+
+        int hold;
+        string reason;
+        if (takingOver)
+        {
+            hold = durability.LeaderTakeoverHoldEvaluations;
+            reason = "so starts the previous leader dispatched can surface as assignments before they are placed again";
+        }
+        else if (alone)
+        {
+            // GH-4569: the first node of a cold cluster. With nobody else registered yet every path hands it
+            // the whole agent universe, and every node that joins afterwards is then served out of this node's
+            // own lane as a stop-then-start -- on the reported fleet 37,310 of 37,388 agents started on the
+            // first node before any peer got a share. Holding first-time placement back for a tick or two is
+            // enough for pods that start together to register; a rollout that takes longer than that is what
+            // AssignmentSettlePeriod is for. Gated on the size of the wave, so a single node that genuinely
+            // runs a handful of agents is not made to wait on peers that are never coming.
+            hold = durability.LeaderColdStartHoldEvaluations;
+            reason = "so the nodes starting alongside it can register and take their share of the agents";
+        }
+        else
+        {
+            // Other nodes are here and none of them runs anything: nothing can be in flight from a predecessor,
+            // and nobody is still arriving that this node need wait for. Null is "no hold is owed", the same
+            // as never having been elected; the next election starts the count again.
+            EvaluationsSinceElection = null;
+            return;
+        }
+
+        if (since >= hold)
+        {
+            EvaluationsSinceElection = null;
+            return;
+        }
+
+        var orphans = OrphanedByStaleNodes;
+
+        bool holdable(int i) => commands[i] is AssignAgent && issued[i].OriginalNode == null
+                                                            && issued[i].PendingNode == null
+                                                            && !orphans.Contains(issued[i].Uri);
+
+        if (alone)
+        {
+            var wave = 0;
+            for (var i = 0; i < issued.Count; i++)
+            {
+                if (holdable(i)) wave++;
+            }
+
+            if (wave <= durability.AgentStartBatchSize)
+            {
+                EvaluationsSinceElection = null;
+                return;
+            }
+        }
+
+        var keptCommands = new List<IAgentCommand>(commands.Count);
+        var keptAgents = new List<AssignmentGrid.Agent>(issued.Count);
+        var held = 0;
+
+        for (var i = 0; i < issued.Count; i++)
+        {
+            var agent = issued[i];
+            if (holdable(i))
+            {
+                agent.Detach();
+                held++;
+                continue;
+            }
+
+            keptCommands.Add(commands[i]);
+            keptAgents.Add(agent);
+        }
+
+        if (held == 0)
+        {
+            return;
+        }
+
+        commands.Clear();
+        commands.AddRange(keptCommands);
+        issued.Clear();
+        issued.AddRange(keptAgents);
+
+        _logger.LogInformation(
+            "Node {NodeNumber} is holding {Count} unplaced agent(s) back on evaluation {Evaluation} of {Hold} after assuming leadership, {Reason}",
+            _runtime.Options.Durability.AssignedNodeNumber, held, since + 1, hold, reason);
     }
 
     // GH-3698: project the pending-assignment ledger onto the grid, so an agent whose start is already on
@@ -212,22 +435,22 @@ public partial class NodeAgentController
     //
     // Deliberately does NOT touch Agent.OriginalNode -- the ledger confirms entries by matching OriginalNode,
     // and fabricating one here would make every pending entry instantly self-confirming.
-    private void applyPendingAssignments(AssignmentGrid grid)
+    private void applyPendingAssignments(AssignmentGrid grid, string scheme)
     {
         lock (_pendingLock)
         {
-            applyPendingAssignmentsLocked(grid);
+            applyPendingAssignmentsLocked(grid, scheme);
         }
     }
 
-    private void applyPendingAssignmentsLocked(AssignmentGrid grid)
+    private void applyPendingAssignmentsLocked(AssignmentGrid grid, string scheme)
     {
         if (_pendingAssignments.Count == 0)
         {
             return;
         }
 
-        var now = DateTimeOffset.UtcNow;
+        var now = Clock();
 
         // Backstop only, and it no longer decides on its own whether a dispatch is still live -- the
         // dispatcher does. This covers the window between a command completing on the wire and the
@@ -237,7 +460,7 @@ public partial class NodeAgentController
         var nodes = grid.Nodes.ToDictionary(x => x.NodeId);
         List<Uri>? abandoned = null;
 
-        foreach (var agent in grid.AllAgents)
+        foreach (var agent in grid.AgentsForScheme(scheme))
         {
             if (!_pendingAssignments.TryGetValue(agent.Uri, out var pending)) continue;
 
@@ -261,6 +484,12 @@ public partial class NodeAgentController
             }
 
             agent.PendingNode = node;
+            agent.PendingMove = pending.IsMove;
+
+            // The node a pending move is taking the agent FROM, while that node is still here: a re-drive of
+            // the move has to stop the agent there first, however invisible the copy still is (its row only
+            // appears once the start it is waiting in has run).
+            agent.PendingSource = pending.SourceNodeId is { } source && nodes.TryGetValue(source, out var from) ? from : null;
 
             // The dispatcher holds a command from the moment it is queued until its lane is done with it,
             // whatever the outcome -- that, not the clock, is when a dispatch stops being outstanding.
@@ -305,7 +534,7 @@ public partial class NodeAgentController
 
     private void reconcilePendingAssignmentsLocked(AssignmentGrid grid, AgentCommands commands)
     {
-        var now = DateTimeOffset.UtcNow;
+        var now = Clock();
 
         // Confirmation: an agent observed running on the very node we assigned it to is no longer pending.
         // The grid sets Agent.OriginalNode from each node's persisted ActiveAgents, so a matching
@@ -353,7 +582,7 @@ public partial class NodeAgentController
                     // The stop half is synchronous within the command; what we are now waiting on is the
                     // start on the node taking the agent over.
                     _pendingAssignments[reassign.AgentUri] =
-                        new PendingAssignment(reassign.ActiveNode.NodeId, now);
+                        new PendingAssignment(reassign.ActiveNode.NodeId, now, IsMove: true, SourceNodeId: reassign.OriginalNode.NodeId);
                     break;
 
                 case StopRemoteAgent stop:
@@ -379,42 +608,114 @@ public partial class NodeAgentController
         // WO-5's pending-assignment ledger, one chunk in flight per destination at a time is enough.
         var batchSize = Math.Max(1, _runtime.Options.Durability.AgentStartBatchSize);
 
-        foreach (var group in commands.OfType<AssignAgent>().GroupBy(x => x.Destination).Where(x => x.Count() > 1).ToArray())
-        {
-            foreach (var message in group) commands.Remove(message);
-
-            foreach (var chunk in group.Select(x => x.AgentUri).Chunk(batchSize))
-            {
-                commands.Add(new AssignAgents(group.Key, chunk));
-            }
-        }
-
-        foreach (var group in commands.OfType<StopRemoteAgent>().GroupBy(x => x.Destination).Where(x => x.Count() > 1)
-                     .ToArray())
-        {
-            var stopAgents = new StopRemoteAgents(group.Key, group.Select(x => x.AgentUri).ToArray());
-
-            foreach (var message in group) commands.Remove(message);
-
-            commands.Add(stopAgents);
-        }
-
+        // GH-4718: stops are chunked too -- AgentStartBatchSize bounded the starts and the reassignments, but a
+        // node shedding every agent it holds (a scale-down, a rolling deploy, a rebalance away) emitted ONE
+        // StopRemoteAgents carrying its whole assignment: at field scale that is thousands of agent URIs and a
+        // serialized envelope of several MB, which the destination refuses to read at all past
+        // Options.MaxIncomingEnvelopeDataSize, and which AgentBatchTimeouts.ReplyWindowFor then makes the
+        // leader wait out for days. One knob bounds all three.
+        //
         // GH-3749: reassignment was the one command type never batched, so a rebalance moving thousands of
         // agents emitted thousands of individual ReassignAgent commands -- each a serial StopAgent round
-        // trip against the source inside one lane, with AgentStartBatchSize having no effect on any of them.
-        // Chunked like the starts: one chunk's stops per round trip, and the confirmed remainder cascades as
-        // a single AssignAgents into the destination's lane.
-        foreach (var group in commands.OfType<ReassignAgent>()
-                     .GroupBy(x => (x.OriginalNode, x.ActiveNode))
-                     .Where(x => x.Count() > 1)
-                     .ToArray())
-        {
-            foreach (var message in group) commands.Remove(message);
+        // trip against the source inside one lane. Chunked like the starts: one chunk's stops per round
+        // trip, and the confirmed remainder cascades as a single AssignAgents into the destination's lane.
+        //
+        // GH-4886 follow-up: this used to GroupBy each command type and then List.Remove every grouped
+        // command from the list one at a time -- a scan per command over a list the size of the whole
+        // evaluation, with a record-equality compare per element. A fresh leader's first evaluation of a
+        // cold cluster emits one AssignAgent per agent, so at the reported scale that was sixty thousand
+        // removals from a sixty-thousand-entry list: the same quadratic shape as the capability scan, on
+        // the same evaluation. One pass now sorts each command into its batch key and the list is rebuilt
+        // rather than edited in place. The result is unchanged: a group of one, or a command type that
+        // never batches, keeps its place; the batches follow in first-seen group order, starts first.
+        var starts = new BatchGroups<NodeDestination>();
+        var stops = new BatchGroups<NodeDestination>();
+        var reassignments = new BatchGroups<(NodeDestination, NodeDestination)>();
 
-            foreach (var chunk in group.Select(x => x.AgentUri).Chunk(batchSize))
+        foreach (var command in commands)
+        {
+            switch (command)
             {
-                commands.Add(new ReassignAgents(group.Key.OriginalNode, group.Key.ActiveNode, chunk));
+                case AssignAgent assign:
+                    starts.Add(assign.Destination, assign.AgentUri);
+                    break;
+                case StopRemoteAgent stop:
+                    stops.Add(stop.Destination, stop.AgentUri);
+                    break;
+                case ReassignAgent reassign:
+                    reassignments.Add((reassign.OriginalNode, reassign.ActiveNode), reassign.AgentUri);
+                    break;
             }
         }
+
+        if (!starts.AnyBatch && !stops.AnyBatch && !reassignments.AnyBatch)
+        {
+            return;
+        }
+
+        var rebuilt = new List<IAgentCommand>(commands.Count);
+        foreach (var command in commands)
+        {
+            var batched = command switch
+            {
+                AssignAgent assign => starts.IsBatched(assign.Destination),
+                StopRemoteAgent stop => stops.IsBatched(stop.Destination),
+                ReassignAgent reassign => reassignments.IsBatched((reassign.OriginalNode, reassign.ActiveNode)),
+                _ => false
+            };
+
+            if (!batched)
+            {
+                rebuilt.Add(command);
+            }
+        }
+
+        foreach (var (destination, uris) in starts.Batches)
+        {
+            foreach (var chunk in uris.Chunk(batchSize)) rebuilt.Add(new AssignAgents(destination, chunk));
+        }
+
+        foreach (var (destination, uris) in stops.Batches)
+        {
+            foreach (var chunk in uris.Chunk(batchSize)) rebuilt.Add(new StopRemoteAgents(destination, chunk));
+        }
+
+        foreach (var ((original, active), uris) in reassignments.Batches)
+        {
+            foreach (var chunk in uris.Chunk(batchSize)) rebuilt.Add(new ReassignAgents(original, active, chunk));
+        }
+
+        commands.Clear();
+        commands.AddRange(rebuilt);
+    }
+
+    /// <summary>
+    ///     The agent URIs of one command type keyed by batch destination, in first-seen key order. A key with a
+    ///     single URI is not a batch: that command stays as it was issued.
+    /// </summary>
+    private sealed class BatchGroups<TKey> where TKey : notnull
+    {
+        private readonly List<TKey> _keys = [];
+        private readonly Dictionary<TKey, List<Uri>> _uris = new();
+
+        public bool AnyBatch { get; private set; }
+
+        public void Add(TKey key, Uri agentUri)
+        {
+            if (!_uris.TryGetValue(key, out var uris))
+            {
+                uris = [];
+                _uris[key] = uris;
+                _keys.Add(key);
+            }
+
+            uris.Add(agentUri);
+            AnyBatch |= uris.Count > 1;
+        }
+
+        public bool IsBatched(TKey key) => _uris.TryGetValue(key, out var uris) && uris.Count > 1;
+
+        public IEnumerable<(TKey Key, List<Uri> Uris)> Batches
+            => _keys.Select(key => (key, _uris[key])).Where(x => x.Item2.Count > 1);
     }
 }

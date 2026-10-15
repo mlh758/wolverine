@@ -17,7 +17,6 @@ internal class DurableSendingAgent : SendingAgent
     private readonly ILogger _logger;
     private readonly IMessageOutbox _outbox;
     private readonly SemaphoreSlim _queueLock = new(1, 1);
-    private readonly RetryBlock<Envelope> _storeAndForward;
 
     // GH-4319. Null when the batch sizes are 1. The store gates the send, so these coalescers are
     // strictly timer-free: a lone envelope is written immediately and batches only ever form behind a
@@ -54,8 +53,8 @@ internal class DurableSendingAgent : SendingAgent
         if (settings.StoreOutgoingBatchSize > 1)
         {
             _storeCoalescer = new EnvelopeStoreCoalescer(
-                envelopes => _outbox.StoreOutgoingAsync(envelopes, settings.AssignedNodeNumber),
-                envelope => _outbox.StoreOutgoingAsync(envelope, settings.AssignedNodeNumber),
+                envelopes => _outbox.StoreOutgoingAsync(envelopes, settings.OutgoingOwnerId),
+                envelope => _outbox.StoreOutgoingAsync(envelope, settings.OutgoingOwnerId),
                 settings.StoreOutgoingBatchSize, endpoint.Uri, logger);
 
             // GH-4319. The success path already had a many-envelope DELETE -- OutgoingMessageBatch has
@@ -68,19 +67,6 @@ internal class DurableSendingAgent : SendingAgent
                 settings.StoreOutgoingBatchSize, endpoint.Uri, logger);
         }
 
-        _storeAndForward = new RetryBlock<Envelope>(async (e, _) =>
-        {
-            if (_storeCoalescer != null)
-            {
-                await _storeCoalescer.StoreAsync(e);
-            }
-            else
-            {
-                await _outbox.StoreOutgoingAsync(e, _settings.AssignedNodeNumber);
-            }
-
-            await _sending.PostAsync(e);
-        }, _logger, settings.Cancellation);
     }
 
     public override bool IsDurable => true;
@@ -102,7 +88,6 @@ internal class DurableSendingAgent : SendingAgent
         await _deleteOutgoingMany.DrainAsync();
         await _deleteOutgoingOne.DrainAsync();
         await _enqueueForRetry.DrainAsync();
-        await _storeAndForward.DrainAsync();
     }
 
     public override async ValueTask DisposeAsync()
@@ -111,7 +96,6 @@ internal class DurableSendingAgent : SendingAgent
         _deleteOutgoingMany.Dispose();
         _deleteOutgoingOne.Dispose();
         _enqueueForRetry.Dispose();
-        _storeAndForward.Dispose();
         _queueLock.Dispose();
     }
 
@@ -252,7 +236,83 @@ internal class DurableSendingAgent : SendingAgent
     protected override async Task storeAndForwardAsync(Envelope envelope)
     {
         using var activity = Endpoint.TelemetryEnabled ? WolverineTracing.StartSending(envelope) : null;
-        await _storeAndForward.PostAsync(envelope);
+
+        await storeOutgoingAsync(envelope);
+
+        // GH-5016: a send with no outbox transaction behind it, like a Wolverine.HTTP endpoint without
+        // transactional middleware. Nothing can be trusted to run after a serverless request completes, so
+        // send it right now instead of handing it to the background sending block
+        if (_settings.Mode == DurabilityMode.ServerlessWithOutbox && !Latched &&
+            !envelope.IsScheduledForLater(DateTimeOffset.UtcNow))
+        {
+            await sendInlineAsync(envelope);
+        }
+        else
+        {
+            await _sending.PostAsync(envelope);
+        }
+
         activity?.Stop();
+    }
+
+    // The outbox row was written first, so a failed send -- or a function frozen mid-send -- leaves it for the
+    // next durability pass to recover
+    private async Task sendInlineAsync(Envelope envelope)
+    {
+        try
+        {
+            await _sender.SendToBrokerAsync(envelope);
+        }
+        catch (Exception e)
+        {
+            _logger.LogError(e,
+                "Unable to send outgoing message {Envelope} inline to {Destination}. It is left in the outbox to be recovered by a later durability pass",
+                envelope, envelope.Destination);
+            return;
+        }
+
+        try
+        {
+            await _outbox.DeleteOutgoingAsync(envelope);
+        }
+        catch (Exception e)
+        {
+            // The message was sent, so the worst case is a duplicate send by a later durability pass
+            _logger.LogError(e,
+                "Unable to delete the outbox row of message {Envelope} that was already sent inline. A later durability pass may send it again",
+                envelope);
+        }
+    }
+
+    /// <summary>
+    ///     GH-4824. The store half of <see cref="storeAndForwardAsync" />, on its own, so a caller that
+    ///     has to settle other durable state between the store and the send can do that. The outbox row is
+    ///     what makes the envelope recoverable, and this hands it back the moment that row exists.
+    /// </summary>
+    public override async ValueTask<bool> TryStoreOutgoingAsync(Envelope envelope)
+    {
+        // The same defaults StoreAndForwardAsync applies before storing -- Status, OwnerId, ReplyUri --
+        // because they are part of the row that gets written. Idempotent, so the second application
+        // inside EnqueueOutgoingAsync changes nothing.
+        setDefaults(envelope);
+
+        await storeOutgoingAsync(envelope);
+
+        return true;
+    }
+
+    // GH-4662: the outbox row is this envelope's only durable home, so its write is retried inline
+    // and, on exhaustion, thrown to whoever called PublishAsync/SendAsync. A RetryBlock handed the
+    // caller a completed task after the first failed attempt and then discarded the envelope with an
+    // Information line -- the message was neither persisted nor sent, and the caller was told it was
+    // sent. SendingAgent.StoreAndForwardAsync only logs Sent after this returns, so a throw here
+    // makes its "a store that throws still reports no send" comment true.
+    private Task storeOutgoingAsync(Envelope envelope)
+    {
+        return DurableWriteRetry.ExecuteAsync(
+            () => _storeCoalescer != null
+                ? _storeCoalescer.StoreAsync(envelope)
+                : _outbox.StoreOutgoingAsync(envelope, _settings.OutgoingOwnerId),
+            envelope, _logger, _settings.Cancellation);
     }
 }

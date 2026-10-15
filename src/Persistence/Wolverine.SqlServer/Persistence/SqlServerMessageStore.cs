@@ -1,3 +1,4 @@
+using Wolverine.Persistence.Sagas;
 ﻿using System.Data;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
@@ -21,7 +22,7 @@ using Wolverine.RDBMS.Transport;
 using Wolverine.Runtime;
 using Wolverine.Runtime.Agents;
 using Wolverine.Runtime.WorkerQueues;
-using Wolverine.SqlServer.Sagas;
+using Wolverine.SqlServer.Internals;
 using Wolverine.SqlServer.Schema;
 using Wolverine.SqlServer.Util;
 using Wolverine.Transports;
@@ -31,8 +32,34 @@ using Table = Weasel.SqlServer.Tables.Table;
 
 namespace Wolverine.SqlServer.Persistence;
 
-public class SqlServerMessageStore : MessageDatabase<SqlConnection>, IConnectionBudgetProbe
+public partial class SqlServerMessageStore : MessageDatabase<SqlConnection>, IConnectionBudgetProbe, ISagaStorageCodeSource
 {
+    /// <summary>
+    /// GH-4902. SQL Server compares a uniqueidentifier from its last six bytes, and the envelope tables are
+    /// clustered on the id, so SQL Server-ordered ids keep them from fragmenting. Used automatically when every
+    /// message store in the application agrees and nothing was set explicitly.
+    /// </summary>
+    public override EnvelopeIdGeneration? PreferredEnvelopeIdGeneration => EnvelopeIdGeneration.NewIdSqlServerOrder;
+
+    /// <summary>
+    ///     GH-4805. Lets generated saga code construct <c>DatabaseSagaSchema<TId, TSaga></c> itself, which is the only way the
+    ///     saga path runs in a native image — <c>SagaSchemaFor</c> is an abstract generic method, and ILC
+    ///     cannot dispatch one.
+    /// </summary>
+    /// <remarks>
+    ///     <c>MakeGenericType</c> is safe here and nowhere near the runtime path: called once per saga
+    ///     chain while the chain model is built, under the JIT, and the <see cref="Type" /> it returns is
+    ///     only rendered as source text. <b>Note the argument order</b> — this store's schema is
+    ///     <c>DatabaseSagaSchema<TId, TSaga></c>, and the five relational stores do not agree on it, which is exactly why each
+    ///     answers this for itself rather than a shared helper guessing.
+    /// </remarks>
+    [UnconditionalSuppressMessage("AOT", "IL3050",
+        Justification = "GH-4805. The closed type is RENDERED AS SOURCE TEXT by EnrollAndFetchSagaStorageFrame and never instantiated from this Type. Called at codegen time under the JIT, so it does not execute in a native image at all -- the generated code that replaces it is what runs there.")]
+    public SagaSchemaCodegen? SagaSchemaCodegenFor(Type sagaType, Type idType)
+    {
+        return new SagaSchemaCodegen(typeof(DatabaseSagaSchema<,>).MakeGenericType(idType, sagaType), typeof(RelationalSagaStorage));
+    }
+
     /// <summary>
     /// GH-4375. SQL Server's hard limit, and the tightest of any provider Wolverine ships. Measured:
     /// 349 outgoing envelopes in one transaction succeed (2,095 parameters) and 350 fail (2,101); 233
@@ -140,7 +167,7 @@ public class SqlServerMessageStore : MessageDatabase<SqlConnection>, IConnection
     protected override INodeAgentPersistence? buildNodeStorage(DatabaseSettings databaseSettings,
         DbDataSource dataSource)
     {
-        return new SqlServerNodePersistence(databaseSettings, this);
+        return new SqlServerNodePersistence(databaseSettings, this, Durability);
     }
 
     protected override bool isExceptionFromDuplicateEnvelope(Exception ex)
@@ -155,6 +182,59 @@ public class SqlServerMessageStore : MessageDatabase<SqlConnection>, IConnection
         return false;
     }
 
+    /// <summary>
+    /// GH-4565. Whether <paramref name="ex"/> is a unique-constraint violation raised by the INBOX table
+    /// specifically, as opposed to anywhere else in the transaction.
+    /// </summary>
+    /// <remarks>
+    /// <para>Distinct from <see cref="isExceptionFromDuplicateEnvelope"/>, which is deliberately
+    /// table-agnostic: its caller has already established that the failing insert was the inbox one, and it
+    /// is reused for the deduplication table and the dynamic listener registry. This predicate is for
+    /// callers with no such context — the <c>Discard()</c> rule in <c>PolecatIntegration</c>, which sees
+    /// every exception a handler's transaction can raise.</para>
+    ///
+    /// <para><c>SqlException</c> carries no table name, but 2627 / 2601 always name the object in the
+    /// message: <c>Violation of PRIMARY KEY constraint 'pkey_x'. Cannot insert duplicate key in object
+    /// 'schema.table'.</c> Nothing but the message will say, so the message is what is read.</para>
+    /// </remarks>
+    public static bool IsDuplicateIncomingEnvelope(Exception ex)
+    {
+        for (var current = ex; current != null; current = current.InnerException)
+        {
+            if (current is SqlException sqlEx
+                && (sqlEx.Number == 2627 || sqlEx.Number == 2601)
+                && IncomingTableNaming.IsIncomingTable(objectNameFrom(sqlEx.Message)))
+            {
+                return true;
+            }
+
+            if (current is AggregateException aggregate
+                && aggregate.InnerExceptions.Any(IsDuplicateIncomingEnvelope))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// The object name out of <c>Cannot insert duplicate key in object 'schema.table'</c>, or null when the
+    /// message is not that shape.
+    /// </summary>
+    private static string? objectNameFrom(string message)
+    {
+        const string marker = "in object '";
+
+        var start = message.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (start < 0) return null;
+
+        start += marker.Length;
+        var end = message.IndexOf('\'', start);
+
+        return end < 0 ? null : message.Substring(start, end - start);
+    }
+
     public override string? BatchedDeleteExpiredHandledEnvelopesSql(int batchSize)
     {
         // DELETE TOP bounds each statement so locks are held only briefly, reducing contention
@@ -167,7 +247,16 @@ public class SqlServerMessageStore : MessageDatabase<SqlConnection>, IConnection
     public override string? BatchedDeleteExpiredDeduplicationClaimsSql(int batchSize)
     {
         return
-            $"delete top ({batchSize}) from {SchemaName}.{DatabaseConstants.DeduplicationTableName} " +
+            // GH-4757: whichever table the configured mode provisioned.
+            $"delete top ({batchSize}) from {SchemaName}.{DeduplicationTableNameFor(Durability)} " +
+            $"where {DatabaseConstants.Expires} <= @now;";
+    }
+
+    /// <summary>GH-4742. As <see cref="BatchedDeleteExpiredDeduplicationClaimsSql" />.</summary>
+    public override string? BatchedDeleteExpiredDeduplicatedResponsesSql(int batchSize)
+    {
+        return
+            $"delete top ({batchSize}) from {SchemaName}.{DatabaseConstants.DeduplicatedResponsesTableName} " +
             $"where {DatabaseConstants.Expires} <= @now;";
     }
 
@@ -207,6 +296,9 @@ public class SqlServerMessageStore : MessageDatabase<SqlConnection>, IConnection
         }
     }
 
+    // GH-5022: the same clock as the inbox timestamp column default
+    protected override string currentTimestampSql => "GETUTCDATE()";
+
     protected override string toTopClause(DeadLetterEnvelopeQuery query)
     {
         if (query.PageSize > 0 && query.PageNumber <= 1)
@@ -242,6 +334,9 @@ public class SqlServerMessageStore : MessageDatabase<SqlConnection>, IConnection
             var counts = await tryFetchCountsFromPartitionStatsAsync();
             if (counts != null)
             {
+        // GH-4499 follow-up: the head of the outbox, so a stuck outbox can be told from a busy one
+        await fetchOldestOutgoingAsync(counts);
+
                 return counts;
             }
         }
@@ -464,7 +559,7 @@ group by o.name, ps.index_id, i.name";
             clauses.Add($"(id = @id_{i} and {DatabaseConstants.ReceivedAt} = @uri_{i})");
         }
 
-        return $"update {SchemaName}.{DatabaseConstants.IncomingTable} set owner_id = @owner, status = '{EnvelopeStatus.Incoming}' " +
+        return $"update {SchemaName}.{DatabaseConstants.IncomingTable} set owner_id = @owner, status = '{EnvelopeStatus.Incoming}'{restartIncomingStaleClock} " +
                $"where status = '{EnvelopeStatus.Scheduled}' and ({string.Join(" or ", clauses)})";
     }
 
@@ -485,7 +580,7 @@ group by o.name, ps.index_id, i.name";
         await conn.CloseAsync();
     }
 
-    public override async Task PublishMessageToExternalTableAsync(ExternalMessageTable table, string messageTypeName, byte[] json,
+    public override async Task PublishMessageToExternalTableAsync(ExternalMessageTable table, string? messageTypeName, byte[] json,
         CancellationToken token)
     {
         await using var conn = CreateConnection();
@@ -505,14 +600,14 @@ group by o.name, ps.index_id, i.name";
                     $"insert into {table.TableName.QualifiedName} ({table.IdColumnName}, {table.JsonBodyColumnName}, {table.MessageTypeColumnName}) values (@id, @json, @message)")
                 .With("id", Guid.NewGuid())
                 .With("json", json)
-                .With("message", messageTypeName)
+                .With("message", messageTypeName!)
                 .ExecuteNonQueryAsync(token);
         }
         
         await conn.CloseAsync();
     }
 
-    public override ISchemaObject AddExternalMessageTable(ExternalMessageTable definition)
+    public override ITable AddExternalMessageTable(ExternalMessageTable definition)
     {
         var table = new Table(definition.TableName);
         table.AddColumn<Guid>(definition.IdColumnName).AsPrimaryKey();
@@ -530,7 +625,7 @@ group by o.name, ps.index_id, i.name";
         return table;
     }
 
-    protected override async Task deleteMany(DbTransaction tx, Guid[] ids, DbObjectName tableName, string idColumnName)
+    protected override async Task deleteManyAsync(DbTransaction tx, Guid[] ids, DbObjectName tableName, string idColumnName, CancellationToken token)
     {
         var builder = new BatchBuilder();
 
@@ -545,7 +640,7 @@ group by o.name, ps.index_id, i.name";
         batch.Connection = (SqlConnection)tx.Connection!;
         batch.Transaction = (SqlTransaction)tx;
 
-        await batch.ExecuteNonQueryAsync();
+        await batch.ExecuteNonQueryAsync(token);
     }
 
     protected override Task<bool> TryAttainLockAsync(int lockId, SqlConnection connection, CancellationToken token)
@@ -598,7 +693,9 @@ group by o.name, ps.index_id, i.name";
                     return;
                 }
 
-                if (Durability.MessageIdentity == MessageIdentity.IdOnly)
+                // GH-5022: the stored procedure cannot restart the InboxStaleTime clock, so a store that keeps
+                // one promotes with the inline statement instead
+                if (Durability.MessageIdentity == MessageIdentity.IdOnly && !Durability.InboxStaleTime.HasValue)
                 {
                     await using var reassign =
                         conn.CreateCommand($"{_settings.SchemaName}.uspMarkIncomingOwnership", tx);
@@ -620,13 +717,10 @@ group by o.name, ps.index_id, i.name";
 
                 await tx.CommitAsync(cancellationToken);
 
-                // Stamp the envelope's owning store on each row so the rest of the
-                // pipeline (DelegatingMessageInbox, DurableReceiver._markAsHandled)
-                // routes its writes back to THIS store. See GH-2576.
-                foreach (var envelope in envelopes)
-                {
-                    envelope.Store = this;
-                }
+                // Mirror onto the in-memory envelopes what the UPDATE above just did to their rows:
+                // owning store (GH-2576) and promoted status (GH-4673).
+                DatabasePersistence.MarkPromotedFromScheduled(envelopes, this,
+                    durabilitySettings.AssignedNodeNumber);
 
                 // Judging that there's very little chance of errors here
                 await runtime.EnqueueDirectlyAsync(envelopes);
@@ -732,9 +826,21 @@ group by o.name, ps.index_id, i.name";
         yield return new WolverineStoredProcedure("uspMarkOutgoingOwnership.sql", this);
 
         // GH-4180. Every store role, not just Main -- see the PostgreSQL twin.
-        if (Durability.EnableMessageDeduplication)
+        // GH-4757: exactly one of the two, never both. The hash mode's key is a binary column, which
+        // cannot be reached from the original table by any migration Weasel can express.
+        if (Durability.MessageDeduplicationMode == MessageDeduplicationMode.CompareByString)
         {
             yield return new DeduplicationTable(SchemaName);
+        }
+        else if (Durability.MessageDeduplicationMode == MessageDeduplicationMode.CompareByHash)
+        {
+            yield return new HashedDeduplicationTable(SchemaName);
+        }
+
+        // GH-4742. Every store role, behind its own opt-in.
+        if (Durability.EnableDeduplicatedResponses)
+        {
+            yield return new DeduplicatedResponsesTable(SchemaName);
         }
 
         // Recurring-message tracking — Main store only, behind the opt-in. See the PostgreSQL twin.
@@ -762,6 +868,14 @@ group by o.name, ps.index_id, i.name";
             // unbounded varchar. 500 is the width the rest of this node-table family already uses.
             nodeTable.AddColumn("version", "varchar(500)");
             nodeTable.AddColumn("capabilities", "nvarchar(max)").AllowNulls();
+
+            // GH-4593, mirroring the PostgreSQL gate from GH-3959: provisioned only behind the opt-in so
+            // an upgrade migrates nothing, and SqlServerNodePersistence gates every statement naming it on
+            // the same flag. `float` is T-SQL's IEEE double.
+            if (Durability.CapacityAwareAssignment)
+            {
+                nodeTable.AddColumn(DatabaseConstants.LoadFactor, "float").AllowNulls();
+            }
 
             yield return nodeTable;
 

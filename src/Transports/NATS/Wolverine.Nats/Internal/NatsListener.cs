@@ -2,6 +2,7 @@ using JasperFx.Blocks;
 using Microsoft.Extensions.Logging;
 using NATS.Client.Core;
 using NATS.Client.JetStream;
+using Wolverine.Configuration;
 using Wolverine.Runtime;
 using Wolverine.Transports;
 using Wolverine.Transports.Sending;
@@ -84,6 +85,11 @@ public class NatsListener : IListener, ISupportDeadLetterQueue, IReportConnectio
 
     public bool NativeDeadLetterQueueEnabled => _subscriber.SupportsNativeDeadLetterQueue;
 
+    /// <summary>
+    /// How long JetStream holds back the redelivery of a message whose dead-letter copy could not be stored
+    /// </summary>
+    internal static readonly TimeSpan DeadLetterRedeliveryDelay = TimeSpan.FromSeconds(5);
+
     public async Task MoveToErrorsAsync(Envelope envelope, Exception exception)
     {
         if (envelope is not NatsEnvelope natsEnvelope || !NativeDeadLetterQueueEnabled ||
@@ -92,30 +98,86 @@ public class NatsListener : IListener, ISupportDeadLetterQueue, IReportConnectio
             return;
         }
 
+        // Wolverine only gets here once its error handling has decided this message goes to the dead letter
+        // queue -- after its retries, or at once for MoveToErrorQueue(). That can be well before the consumer's
+        // MaxDeliver is used up, and it must not be second-guessed here: a Buffered listener acknowledged the
+        // delivery on receipt, so JetStream will never deliver it again and this is the last chance to keep it;
+        // an Inline or native-ack listener keeps the delivery unsettled until the copy is confirmed.
         var metadata = natsEnvelope.JetStreamMsg.Metadata;
-        if (metadata?.NumDelivered < (ulong)_endpoint.EffectiveMaxDeliveryAttempts)
-        {
-            return;
-        }
-
         var attempts = (int)(metadata?.NumDelivered ?? 1);
 
-        // Retain the poison message by forwarding a copy to the dead-letter subject BEFORE terminating,
-        // so a terminate failure can't lose it. Terminating without a configured dead-letter subject drops
-        // the message, so warn loudly in that case.
+        // Retain the poison message by forwarding a copy to the dead-letter subject BEFORE terminating, and
+        // only terminate once the stream has confirmed the copy. Terminating without a configured dead-letter
+        // subject drops the message, so warn loudly in that case.
         if (!string.IsNullOrEmpty(_endpoint.DeadLetterSubject))
         {
             envelope.Attempts = attempts;
             DeadLetterQueueConstants.StampFailureMetadata(envelope, exception);
             envelope.Headers["x-dlq-original-subject"] = _endpoint.Subject;
 
-            await _deadLetterSender.SendAsync(envelope);
+            // The copy carries the original's headers, Nats-Msg-Id included. With the dead-letter subject in the
+            // same stream as the original, the server would discard it as a duplicate within the stream's
+            // duplicate window -- and the original is terminated right below. A key derived from the original's
+            // keeps the copy distinct while a retried forward of this same message still deduplicates.
+            var originalMsgId = envelope.Headers.TryGetValue(JetStreamPublisher.NatsMsgIdHeader, out var msgId) &&
+                                !string.IsNullOrEmpty(msgId)
+                ? msgId
+                : envelope.Id.ToString();
+
+            // The other headers the server acts on -- Nats-Expected-*, Nats-TTL, Nats-Rollup, Nats-Schedule* --
+            // would apply again, now to the dead-letter stream: a failed expectation or a TTL that stream does not
+            // allow refused the copy, and a rollup purged the dead letters before it. All of them start with
+            // "Nats-", unlike the lowercase nats-stream, nats-consumer, ... diagnostics of the delivery, which stay
+            foreach (var key in envelope.Headers.Keys.Where(x => x.StartsWith("Nats-", StringComparison.Ordinal))
+                         .ToArray())
+            {
+                envelope.Headers.Remove(key);
+            }
+
+            envelope.Headers[JetStreamPublisher.NatsMsgIdHeader] = $"{originalMsgId}.dead-letter";
+
+            // A copy to store now, not a message to schedule
+            envelope.ScheduledTime = null;
+
+            try
+            {
+                // A JetStream publish whose PubAck is checked, see NatsEndpoint.BuildDeadLetterSender
+                await _deadLetterSender.SendAsync(envelope);
+            }
+            catch (Exception forwardFailure)
+            {
+                if (_endpoint.Mode == EndpointMode.BufferedInMemory)
+                {
+                    // Acknowledged on receipt, so this was the only copy left
+                    _logger.LogError(forwardFailure,
+                        "Message {MessageId} is lost: it could not be forwarded to the dead-letter subject {DeadLetter}, and the buffered listener on subject {Subject} acknowledged it on receipt",
+                        envelope.Id, _endpoint.DeadLetterSubject, _endpoint.Subject);
+                    throw;
+                }
+
+                // Still unacknowledged, so hand it back to JetStream for another attempt rather than letting go
+                // of the only copy. The redelivery counts against MaxDeliver.
+                try
+                {
+                    await natsEnvelope.JetStreamMsg.NakAsync(new AckOpts { NakDelay = DeadLetterRedeliveryDelay },
+                        _cancellation.Token);
+                }
+                catch (Exception nakFailure)
+                {
+                    // Not acknowledged either way, so JetStream redelivers it once AckWait has passed
+                    _logger.LogError(nakFailure, "Could not hand message {MessageId} back to JetStream", envelope.Id);
+                }
+
+                throw new DeadLetterMoveFailedException(
+                    $"Message {envelope.Id} could not be forwarded to the dead-letter subject '{_endpoint.DeadLetterSubject}'; it was handed back to JetStream for redelivery in {DeadLetterRedeliveryDelay}",
+                    forwardFailure);
+            }
         }
         else
         {
             _logger.LogWarning(
                 exception,
-                "Message {MessageId} exceeded {Attempts} delivery attempts on subject {Subject} but no dead-letter subject is configured; it will be terminated and dropped. Use DeadLetterTo(...) / ConfigureDeadLetterQueue(...) to retain poison messages.",
+                "Message {MessageId} was moved to the dead letter queue after {Attempts} delivery attempt(s) on subject {Subject}, but no dead-letter subject is configured; it will be terminated and dropped. Use DeadLetterTo(...) / ConfigureDeadLetterQueue(...) to retain poison messages.",
                 envelope.Id,
                 attempts,
                 _endpoint.Subject
@@ -125,13 +187,13 @@ public class NatsListener : IListener, ISupportDeadLetterQueue, IReportConnectio
         // Terminate delivery on the JetStream consumer with a reason so the server stops redelivering and
         // records why the message was dead-lettered.
         await natsEnvelope.JetStreamMsg.AckTerminateAsync(
-            $"wolverine: exceeded {attempts} delivery attempts ({exception.GetType().Name})",
+            $"wolverine: moved to the dead letter queue after {attempts} delivery attempt(s) ({exception.GetType().Name})",
             cancellationToken: _cancellation.Token
         );
 
         _logger.LogError(
             exception,
-            "Message {MessageId} terminated after {Attempts} delivery attempts. Subject: {Subject}, DeadLetter: {DeadLetter}",
+            "Message {MessageId} terminated after {Attempts} delivery attempt(s). Subject: {Subject}, DeadLetter: {DeadLetter}",
             envelope.Id,
             attempts,
             _endpoint.Subject,

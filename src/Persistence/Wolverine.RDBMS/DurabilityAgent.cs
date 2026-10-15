@@ -34,6 +34,7 @@ internal class DurabilityAgent : IAgent
     private Timer? _nodeRecordPruningTimer;
     private Timer? _orphanSweepTimer;
     private Timer? _deduplicationCleanupTimer;
+    private Timer? _deduplicatedResponsesCleanupTimer;
 
     private readonly DurabilityHealthSignals _health;
     private DateTime _lastHealthCheck = DateTime.UtcNow;
@@ -147,11 +148,20 @@ internal class DurabilityAgent : IAgent
         // message -- so enabling the feature without a reaper trades duplicate work for a table that
         // grows without bound. Its own timer, its own transaction, for the same reason as the handled
         // cleanup above. Created only when the feature is on, so nothing changes for anyone else.
-        if (_settings.EnableMessageDeduplication)
+        if (_settings.MessageDeduplicationMode != MessageDeduplicationMode.None)
         {
             _deduplicationCleanupTimer = new Timer(_ =>
             {
                 _runningBlock.Post(new DeleteExpiredDeduplicationClaimsCommand(_database, _logger));
+            }, _settings, _settings.DeduplicationCleanupPollingTime, _settings.DeduplicationCleanupPollingTime);
+        }
+
+        // GH-4742. The same cadence for the [DeduplicatedWithResponse] claims, behind their own opt-in.
+        if (_settings.EnableDeduplicatedResponses)
+        {
+            _deduplicatedResponsesCleanupTimer = new Timer(_ =>
+            {
+                _runningBlock.Post(new DeleteExpiredDeduplicatedResponsesCommand(_database, _logger));
             }, _settings, _settings.DeduplicationCleanupPollingTime, _settings.DeduplicationCleanupPollingTime);
         }
 
@@ -216,6 +226,11 @@ internal class DurabilityAgent : IAgent
         if (_deduplicationCleanupTimer != null)
         {
             await _deduplicationCleanupTimer.DisposeAsync();
+        }
+
+        if (_deduplicatedResponsesCleanupTimer != null)
+        {
+            await _deduplicatedResponsesCleanupTimer.DisposeAsync();
         }
 
         Status = AgentStatus.Stopped;

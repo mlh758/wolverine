@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Threading.Channels;
 using JasperFx.Core;
 using Microsoft.Extensions.Logging;
+using Wolverine.Util;
 
 namespace Wolverine.Runtime.Agents;
 
@@ -63,6 +64,19 @@ internal class AgentCommandDispatcher : IAsyncDisposable
     // command it is waiting on had any chance to finish.
     private readonly ConcurrentDictionary<Uri, Guid> _moving = new();
 
+    // GH-4901: starts a lane has handed to its node (no longer withdrawable), and queued starts a reassignment
+    // took off a lane, which that lane skips. _claims orders a lane taking a start up against a withdrawal.
+    private readonly object _claims = new();
+    private readonly Dictionary<Uri, Guid> _starting = new();
+    private readonly HashSet<(Uri Agent, Guid Lane)> _withdrawn = [];
+
+    // Starts a lane has handed to its node at some point, by (agent, node). A later start for the same pair is
+    // a RE-DRIVE -- the leader re-sending a start whose assignment row has not surfaced yet -- and the agent
+    // may well be running there already, so a reassignment must stop it at the source rather than withdraw
+    // the queued re-drive as if nothing had ever run (found by the laned fleet_chaos_soak). Cleared when a
+    // move or stop away from that node executes.
+    private readonly HashSet<(Uri Agent, Guid Node)> _handedOver = [];
+
     // GH-3781: latched by DisposeAsync so a lane stops picking work up. Completing a channel writer does
     // NOT discard what is already buffered -- ReadAsync keeps handing it out -- so without this, shutdown
     // executed every command still queued for a node that had already gone, one reply window at a time.
@@ -97,14 +111,26 @@ internal class AgentCommandDispatcher : IAsyncDisposable
     internal IReadOnlyDictionary<Uri, Guid> InFlightAgents => _inFlight;
 
     /// <summary>
+    ///     Each lane's command currently handed to the executor, if any, and how many are queued behind it.
+    ///     Lets a test drive the lanes deterministically. Exposed for tests.
+    /// </summary>
+    internal IEnumerable<(Guid Destination, IAgentCommand? Executing, int Queued)> LaneStates
+        => _lanes.Select(pair => (pair.Key, pair.Value.Executing, Volatile.Read(ref pair.Value.Queued)));
+
+    /// <summary>
     ///     Is a start for this agent still queued or executing, and if so against which node? This is the
     ///     leader's "confirmed or failed" signal: an entry lives from the moment a command is queued until its
     ///     lane has finished with it, however it finished. GH-3698 — the pending-assignment ledger holds an
     ///     agent on its destination for exactly as long as this says the dispatch is still outstanding, rather
     ///     than for a fixed TTL that a wave of slow starts trivially outlives.
     /// </summary>
+    //
+    // A pending MOVE answers ahead of a start still in flight for the same agent: the move supersedes that
+    // start (its stop is queued behind it), and the ledger entry the leader is asking about is the move's
+    // destination. Answering the start's node instead made the move look lost the moment its TTL lapsed,
+    // and a long start outlives the TTL routinely (found by the laned fleet_chaos_soak).
     public bool TryFindPendingDestination(Uri agentUri, out Guid nodeId)
-        => _inFlight.TryGetValue(agentUri, out nodeId) || _moving.TryGetValue(agentUri, out nodeId);
+        => _moving.TryGetValue(agentUri, out nodeId) || _inFlight.TryGetValue(agentUri, out nodeId);
 
     /// <summary>
     ///     Queue a command for its destination's lane, unless equivalent work is already queued or running.
@@ -113,6 +139,9 @@ internal class AgentCommandDispatcher : IAsyncDisposable
     public void Enqueue(IAgentCommand command)
     {
         if (_cancellation.IsCancellationRequested || _disposing) return;
+
+        if (withdrawQueuedStarts(command) is not { } remaining) return;
+        command = remaining;
 
         var destination = command.DestinationNodeId ?? SharedLane;
 
@@ -156,11 +185,126 @@ internal class AgentCommandDispatcher : IAsyncDisposable
         }
 
         var lane = laneFor(destination);
+        Interlocked.Increment(ref lane.Queued);
         if (!lane.Queue.Writer.TryWrite(command))
         {
+            Interlocked.Decrement(ref lane.Queued);
             // The lane is closed (shutdown). Let go of the claims so nothing is suppressed by a command that
             // will never run.
             release(command, destination);
+        }
+    }
+
+    /// <summary>
+    ///     GH-4901. A reassignment runs in its SOURCE node's lane so its stop lands behind any start still queued
+    ///     there. A start that is only queued has not run anywhere, though, so moving it needs no stop -- and
+    ///     waiting in the source lane held the move behind that node's whole backlog. Such starts are taken off
+    ///     the source (its lane skips them) and sent straight to the destination's lane; only what the source has
+    ///     already begun starting stays in the reassignment. Null when nothing is left of it.
+    /// </summary>
+    private IAgentCommand? withdrawQueuedStarts(IAgentCommand command)
+    {
+        if (MovedAgentsOf(command) is not { } move || command.DestinationNodeId is not { } source)
+        {
+            return command;
+        }
+
+        Uri[] withdrawn;
+        lock (_claims)
+        {
+            withdrawn = move.Agents
+                .Where(uri => _inFlight.TryGetValue(uri, out var owner) && owner == source && !_starting.ContainsKey(uri)
+                              && !_handedOver.Contains((uri, source)))
+                .ToArray();
+
+            foreach (var uri in withdrawn)
+            {
+                _inFlight.TryRemove(uri, out _);
+                _withdrawn.Add((uri, source));
+            }
+        }
+
+        if (withdrawn.Length == 0)
+        {
+            return command;
+        }
+
+        var (original, active) = command switch
+        {
+            ReassignAgent one => (one.OriginalNode, one.ActiveNode),
+            ReassignAgents many => (many.OriginalNode, many.ActiveNode),
+            _ => throw new InvalidOperationException($"Unexpected reassignment {command}")
+        };
+
+        Enqueue(withdrawn.Length == 1 ? new AssignAgent(withdrawn[0], active) : new AssignAgents(active, withdrawn));
+
+        var rest = AgentUriSet.Missing(move.Agents, withdrawn);
+        return rest.Length switch
+        {
+            0 => null,
+            1 => new ReassignAgent(rest[0], original, active),
+            _ => new ReassignAgents(original, active, rest)
+        };
+    }
+
+    // GH-4901: a start command less whatever a reassignment withdrew from it while it was queued, marked as
+    // handed to the node so it can no longer be withdrawn. Null if nothing is left to start.
+    //
+    // An agent a NEWER start owns elsewhere is not claimed. A start queued for a node that has since gone (the
+    // leader re-targets its agents the moment the node leaves the snapshot) reaches its lane long after a
+    // newer start for the same agent was queued elsewhere and overwrote _inFlight; claiming it here anyway
+    // overwrote the live start's _starting entry, and releasing it afterwards removed that entry, so the live
+    // start looked merely queued to the next reassignment, which withdrew it and started the agent a second
+    // time (found by the laned fleet_chaos_soak). An agent with NO _inFlight entry is still claimed: a
+    // withdrawal clears the entry and relies on its re-enqueue to restore it, and that re-enqueue can be
+    // collapsed as a duplicate of a start already queued here, leaving the only queued start for the agent
+    // without an entry -- skipping it then strands the agent on a pending move no command will ever land.
+    private IAgentCommand? claimStarts(IAgentCommand command, Guid destination)
+    {
+        var agents = StartedAgentsOf(command);
+        if (agents.Length == 0)
+        {
+            return command;
+        }
+
+        Uri[] owned;
+        lock (_claims)
+        {
+            owned = agents
+                .Where(uri => !_withdrawn.Remove((uri, destination)))
+                .Where(uri => !(_inFlight.TryGetValue(uri, out var owner) && owner != destination))
+                .ToArray();
+
+            foreach (var uri in owned)
+            {
+                _starting[uri] = destination;
+                _handedOver.Add((uri, destination));
+            }
+        }
+
+        if (owned.Length == agents.Length)
+        {
+            return command;
+        }
+
+        return owned.Length switch
+        {
+            0 => null,
+            _ when command is AssignAgents batch => new AssignAgents(batch.Destination, owned),
+            _ => command
+        };
+    }
+
+    private void releaseStarts(IAgentCommand? claimed, Guid destination)
+    {
+        if (claimed == null) return;
+
+        lock (_claims)
+        {
+            foreach (var uri in StartedAgentsOf(claimed))
+            {
+                if (_starting.TryGetValue(uri, out var owner) && owner == destination) _starting.Remove(uri);
+            }
         }
     }
 
@@ -216,6 +360,25 @@ internal class AgentCommandDispatcher : IAsyncDisposable
                 }
             }
         }
+
+        // A move or a stop that has run at its node means the agent is no longer running there, so a later
+        // start for it on that node is a first start again, not a re-drive.
+        (Guid Node, Uri[]? Agents) stoppedAt = command switch
+        {
+            ReassignAgent one => (one.OriginalNode.NodeId, [one.AgentUri]),
+            ReassignAgents many => (many.OriginalNode.NodeId, many.AgentUris),
+            StopRemoteAgent one => (one.Destination.NodeId, [one.AgentUri]),
+            StopRemoteAgents many => (many.Destination.NodeId, many.AgentIds),
+            _ => (Guid.Empty, null)
+        };
+
+        if (stoppedAt.Agents != null)
+        {
+            lock (_claims)
+            {
+                foreach (var uri in stoppedAt.Agents) _handedOver.Remove((uri, stoppedAt.Node));
+            }
+        }
     }
 
     private Lane laneFor(Guid destination)
@@ -227,14 +390,60 @@ internal class AgentCommandDispatcher : IAsyncDisposable
         return lane;
     }
 
+    /// <summary>
+    ///     The node behind <paramref name="nodeId" /> has left the cluster -- ejected as stale, or gone from the
+    ///     node table on its own -- so nothing queued or executing in its lane can succeed any more. Everything
+    ///     queued is dropped, the executing command is cancelled, and the lane is removed so a node that comes
+    ///     back under the same id gets a fresh one.
+    ///
+    ///     <para>Without this a reassignment whose SOURCE had been killed sat in that node's lane for its whole
+    ///     reply window -- <c>AgentBatchTimeouts.ReplyWindowFor</c>, twenty-five minutes at a batch of fifty --
+    ///     because a dead node answers neither the stop nor the presence polls, and for all of that time the
+    ///     leader's pending-assignment ledger held the agents as "moving", so nothing re-placed them. Ejection
+    ///     had already freed the dead node's agents in the grid after about a minute; this makes the lane agree.
+    ///     The shape mlh758 found in PR #4537.</para>
+    /// </summary>
+    public void AbandonLane(Guid nodeId)
+    {
+        if (nodeId == SharedLane) return;
+        if (!_lanes.TryRemove(nodeId, out var lane)) return;
+
+        lane.Queue.Writer.TryComplete();
+        while (lane.Queue.Reader.TryRead(out var abandoned))
+        {
+            Interlocked.Decrement(ref lane.Queued);
+            release(abandoned, nodeId);
+        }
+
+        // Whatever the lane's executing command claimed is released by its own finally once the cancellation
+        // unwinds it. The hand-over record is this node's alone, and the node is gone.
+        lock (_claims)
+        {
+            _handedOver.RemoveWhere(x => x.Node == nodeId);
+            _withdrawn.RemoveWhere(x => x.Lane == nodeId);
+        }
+
+        lane.Abandon();
+
+        _logger.LogInformation(
+            "Abandoned the agent command lane for departed node {NodeId}; anything it was still working on will be re-evaluated",
+            nodeId);
+    }
+
     private async Task runLaneAsync(Lane lane, Guid destination)
     {
-        while (!_cancellation.IsCancellationRequested && !_disposing)
+        var token = lane.Token;
+
+        while (!_cancellation.IsCancellationRequested && !_disposing && !lane.Abandoned)
         {
             IAgentCommand command;
             try
             {
-                command = await lane.Queue.Reader.ReadAsync(_cancellation);
+                command = await lane.Queue.Reader.ReadAsync(token);
+
+                // Executing first, so the lane never looks idle while it holds a command
+                lane.Executing = command;
+                Interlocked.Decrement(ref lane.Queued);
             }
             catch (OperationCanceledException)
             {
@@ -251,13 +460,25 @@ internal class AgentCommandDispatcher : IAsyncDisposable
             if (_disposing)
             {
                 release(command, destination);
+                lane.Executing = null;
                 return;
             }
 
+            var claimed = claimStarts(command, destination);
+            if (claimed == null)
+            {
+                // Every agent in it was withdrawn and re-targeted while it was queued
+                release(command, destination);
+                lane.Executing = null;
+                continue;
+            }
+
+            lane.Executing = claimed;
+
             try
             {
-                var cascaded = await _executor(command, _cancellation);
-                if (cascaded != null)
+                var cascaded = await _executor(claimed, token);
+                if (cascaded != null && !lane.Abandoned)
                 {
                     // Route a cascade back through Enqueue rather than executing it here, so it lands in the
                     // lane of the node it actually targets -- e.g. ReassignAgent runs in the source node's
@@ -265,7 +486,7 @@ internal class AgentCommandDispatcher : IAsyncDisposable
                     foreach (var next in cascaded) Enqueue(next);
                 }
             }
-            catch (OperationCanceledException) when (_cancellation.IsCancellationRequested)
+            catch (OperationCanceledException) when (_cancellation.IsCancellationRequested || lane.Abandoned)
             {
                 return;
             }
@@ -279,7 +500,11 @@ internal class AgentCommandDispatcher : IAsyncDisposable
             }
             finally
             {
+                // In-flight ownership first: a start whose claim is gone but whose ownership is not would look
+                // queued, and a reassignment could withdraw it without stopping the copy that just came up.
                 release(command, destination);
+                releaseStarts(claimed, destination);
+                lane.Executing = null;
             }
         }
     }
@@ -297,6 +522,7 @@ internal class AgentCommandDispatcher : IAsyncDisposable
             // minutes -- and they are aimed at a cluster this node is in the middle of leaving.
             while (pair.Value.Queue.Reader.TryRead(out var abandoned))
             {
+                Interlocked.Decrement(ref pair.Value.Queued);
                 release(abandoned, pair.Key);
             }
         }
@@ -330,17 +556,34 @@ internal class AgentCommandDispatcher : IAsyncDisposable
         _queued.Clear();
         _inFlight.Clear();
         _moving.Clear();
+        lock (_claims)
+        {
+            _starting.Clear();
+            _withdrawn.Clear();
+            _handedOver.Clear();
+        }
     }
 
     private class Lane
     {
         private Task? _worker;
         private readonly object _gate = new();
+        private CancellationTokenSource? _cancellation;
 
         public Channel<IAgentCommand> Queue { get; } =
             Channel.CreateUnbounded<IAgentCommand>(new UnboundedChannelOptions { SingleReader = true });
 
         public Task? Worker => _worker;
+
+        public volatile IAgentCommand? Executing;
+        public int Queued;
+
+        // Latched by AbandonLane. The lane's own token is what unwinds the executing command, and this is
+        // what the worker checks so an abandonment is never mistaken for the dispatcher shutting down.
+        public volatile bool Abandoned;
+
+        // The lane's token: the dispatcher's, plus this lane's own abandonment. Only meaningful once started.
+        public CancellationToken Token => _cancellation?.Token ?? CancellationToken.None;
 
         public void Start(AgentCommandDispatcher parent, Guid destination)
         {
@@ -348,7 +591,21 @@ internal class AgentCommandDispatcher : IAsyncDisposable
 
             lock (_gate)
             {
-                _worker ??= Task.Run(() => parent.runLaneAsync(this, destination));
+                _cancellation ??= CancellationTokenSource.CreateLinkedTokenSource(parent._cancellation);
+
+                // GH-4650. Detached, so the lane never inherits whatever activity was current at the
+                // first Enqueue for this destination -- today that is executeHealthChecks, outside any
+                // span, but only by call ordering.
+                _worker ??= DetachedTask.Run(() => parent.runLaneAsync(this, destination));
+            }
+        }
+
+        public void Abandon()
+        {
+            Abandoned = true;
+            lock (_gate)
+            {
+                _cancellation?.Cancel();
             }
         }
     }

@@ -9,12 +9,15 @@ using Marten;
 using JasperFx.Events;
 using Marten.Events;
 using Marten.Storage.Metadata;
+using Weasel.Core;
 using Wolverine.Configuration;
 using Wolverine.Marten.Codegen;
 using Wolverine.Marten.Requirements;
 using Wolverine.Persistence;
+using Wolverine.Persistence.Codegen;
 using Wolverine.Persistence.Sagas;
 using Wolverine.Runtime;
+using Wolverine.Runtime.Handlers;
 using IRevisioned = JasperFx.IRevisioned;
 
 namespace Wolverine.Marten.Persistence.Sagas;
@@ -76,6 +79,57 @@ internal partial class MartenPersistenceFrameProvider : IPersistenceFrameProvide
         return container.GetInstance<IDocumentStore>();
     }
 
+    /// <inheritdoc />
+    /// <remarks>
+    ///     GH-4505. Marten can honour this whenever its store is single-database: Wolverine's message store
+    ///     is then built from <c>store.Storage.Database.DataSource</c> — literally Marten's own
+    ///     <c>NpgsqlDataSource</c>, in the same database and, by default, the same schema
+    ///     (<c>WolverineOptionsMartenExtensions.BuildSinglePostgresqlMessageStore</c>). Queuing the claim
+    ///     onto the session is then the same move Wolverine already makes for its inbox rows.
+    ///     <para>
+    ///     Database-per-tenant falls through to the claim-and-release path deliberately: that composition
+    ///     builds the main message store from <c>MainDatabaseConnectionString</c> / <c>MasterDataSource</c>,
+    ///     which is a different database from the tenant one the session commits to, so a queued claim would
+    ///     be riding the wrong transaction.
+    ///     </para>
+    /// </remarks>
+    public bool TryBuildTransactionalDeduplication(IChain chain, Variable deduplicationId,
+        DeduplicationRequirement requirement, IServiceContainer container,
+        [NotNullWhen(true)] out TransactionalDeduplication? deduplication)
+    {
+        deduplication = null;
+
+        // Not CanApply -- that answers "could this provider own the chain's transaction?", and a chain that
+        // merely takes an IDocumentSession satisfies it without ever committing one. Riding a transaction
+        // that is never committed writes no claim at all, so the endpoint silently loses deduplication
+        // entirely: every replay runs. Ask for the commit frame itself, which is the thing the claim has to
+        // ride. A chain without one genuinely has nothing to ride and belongs on the claim-and-release path.
+        if (!chain.Middleware.OfType<CreateDocumentSessionFrame>().Any()) return false;
+        if (!chain.Postprocessors.OfType<DocumentSessionSaveChanges>().Any()) return false;
+
+        if (resolveStore(chain, container).As<DocumentStore>().Tenancy.Cardinality !=
+            JasperFx.Descriptors.DatabaseCardinality.Single)
+        {
+            return false;
+        }
+
+        var marker = chain.DetermineAncillaryStoreType();
+        var check = new MartenDeduplicationClaimExistsFrame(deduplicationId, marker, requirement.Required);
+
+        deduplication = new TransactionalDeduplication
+        {
+            Check = check,
+            IsDuplicate = check.Variable,
+            Claim = new QueueMartenDeduplicationClaimFrame(deduplicationId, check.Variable, marker,
+                requirement.Window),
+            CommitRaceWrapper = new RefuseDuplicateClaimAtCommitFrame(
+                MartenDeduplicationFailures.Classifier,
+                lost => chain.BuildDeduplicationStopCondition(lost, DeduplicationOutcome.Duplicate, requirement))
+        };
+
+        return true;
+    }
+
     public void ApplyTransactionSupport(IChain chain, IServiceContainer container)
     {
         if (!chain.Middleware.OfType<CreateDocumentSessionFrame>().Any())
@@ -118,6 +172,15 @@ internal partial class MartenPersistenceFrameProvider : IPersistenceFrameProvide
         ApplyTransactionSupport(chain, container);
     }
 
+    /// <summary>
+    /// GH-4631. Marten is designated by one of its own store or session interfaces, which is also what an
+    /// ancillary store marker type (<c>AddMartenStore&lt;IMyStore&gt;()</c>) derives from.
+    /// </summary>
+    public bool OwnsStorageType(Type storageType, IServiceContainer container)
+    {
+        return storageType.CanBeCastTo<IDocumentStore>() || storageType.CanBeCastTo<IQuerySession>();
+    }
+
     public bool CanApply(IChain chain, IServiceContainer container)
     {
         if (chain is SagaChain)
@@ -157,13 +220,40 @@ internal partial class MartenPersistenceFrameProvider : IPersistenceFrameProvide
         // handler could already declare one and have it bind -- it just never got a commit.
         // IDocumentReadOperations is deliberately probed but NOT matched here, exactly as IQuerySession
         // has always been: a read-only parameter is not evidence that the chain writes anything.
-        return serviceDependencies.Any(x => x == typeof(IDocumentSession) || x == typeof(IDocumentOperations)
+        if (serviceDependencies.Any(x => x == typeof(IDocumentSession) || x == typeof(IDocumentOperations)
                                             || x.Closes(typeof(IEventStream<>))
                                             || x == typeof(global::JasperFx.Events.IEventOperations)
                                             || x == typeof(global::JasperFx.Events.IEventStoreOperations)
                                             || x == typeof(global::Marten.Events.IEventStoreOperations)
                                             || x == typeof(global::JasperFx.Events.Documents.IDocumentSessionOperations)
-                                            || x == typeof(global::JasperFx.Events.Documents.IDocumentWriteOperations));
+                                            || x == typeof(global::JasperFx.Events.Documents.IDocumentWriteOperations)))
+        {
+            return true;
+        }
+
+        // GH-4907: the IQuerySession permutation of GH-2941. A read-only parameter is served by casting the
+        // outbox-enrolled IDocumentSession, so a chain that reads AND sends messages queues its envelopes on a
+        // session nothing commits: a scheduled message is never handled, and a durable local one only ever
+        // runs from memory. Reading alone still does not claim the chain; reading plus sending does.
+        return serviceDependencies.Any(x => x == typeof(IQuerySession)
+                                            || x == typeof(global::JasperFx.Events.Documents.IDocumentReadOperations))
+               && chainCanSendMessages(chain, container);
+    }
+
+    private static bool chainCanSendMessages(IChain chain, IServiceContainer container)
+    {
+        if (chain.ServiceDependencies(container, new[] { typeof(IMessageBus), typeof(IMessageContext) })
+            .Any(x => x == typeof(IMessageBus) || x == typeof(IMessageContext)))
+        {
+            return true;
+        }
+
+        if (chain.ReturnVariablesOfType<OutgoingMessages>().Any()) return true;
+
+        // A message handler cascades whatever its handler methods return. An HTTP endpoint writes its first
+        // return value as the response, so only the ones after it cascade.
+        var firstCascadingReturn = chain is HandlerChain ? 0 : 1;
+        return chain.HandlerCalls().Any(call => call.Creates.Skip(firstCascadingReturn).Any());
     }
 
     private static bool ChainHasMartenSessionAttributes(IChain chain)

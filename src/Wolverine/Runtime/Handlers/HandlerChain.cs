@@ -157,7 +157,7 @@ public class HandlerChain : Chain<HandlerChain, ModifyHandlerChainAttribute>, IW
         if (illegalSagas.Any())
         {
             throw new InvalidSagaException(
-                $"Illegal static method {illegalSagas.Select(x => x.ToString()).Join(", ")}. Handler methods for existing saga data mush be instance methods");
+                $"Illegal static method {illegalSagas.Select(x => x.ToString()).Join(", ")}. Handler methods for existing saga data must be instance methods");
         }
     }
 
@@ -229,8 +229,15 @@ public class HandlerChain : Chain<HandlerChain, ModifyHandlerChainAttribute>, IW
         {
             if (handler.Creates.Any(x => x.VariableType == typeof(Envelope)))
             {
+                // GH-4532: people write this because they want to control delivery of a cascading
+                // message, which Wolverine supports three other ways. Naming them is the whole point --
+                // "you cannot do this" without "do this instead" leaves the reader stuck.
                 throw new InvalidHandlerException(
-                    $"Invalid Wolverine handler signature. Method {handler} creates a {typeof(Envelope).FullNameInCode()}");
+                    $"Invalid Wolverine handler signature: {handler} returns or creates a {typeof(Envelope).FullNameInCode()}. " +
+                    "Handlers return the message itself; to control how a cascading message is delivered, return " +
+                    $"new DeliveryMessage<T>(message, new {nameof(DeliveryOptions)} {{ ... }}), implement {nameof(ISendMyself)} on the message, " +
+                    $"or return an {nameof(OutgoingMessages)} collection. To send with full control from inside the handler, " +
+                    $"take {nameof(IMessageBus)} as a parameter.");
             }
         }
 
@@ -294,23 +301,27 @@ public class HandlerChain : Chain<HandlerChain, ModifyHandlerChainAttribute>, IW
         return Task.FromResult(found);
     }
 
-    // AttachTypesSynchronously walks Assembly.ExportedTypes on the *generated*
-    // handler assembly (or the pre-compiled one in TypeLoadMode.Static) to
-    // resolve the generated handler class by name. Trim removal of the
-    // generated handler class would already break Wolverine at runtime; the
-    // ExportedTypes walk is finding a type that's known by construction.
+    // AttachTypesSynchronously resolves the generated handler class by name in the *generated*
+    // handler assembly (or the pre-compiled one in TypeLoadMode.Static). Trim removal of the
+    // generated handler class would already break Wolverine at runtime; the lookup is finding a
+    // type that's known by construction.
     [UnconditionalSuppressMessage("Trimming", "IL2026",
-        Justification = "ExportedTypes walk over the generated handler assembly to attach the generated handler type; the type is known by construction at codegen time. See AOT guide.")]
+        Justification = "Name lookup (Assembly.GetType, then an ExportedTypes walk) over the generated handler assembly to attach the generated handler type; the type is known by construction at codegen time. See AOT guide.")]
     [UnconditionalSuppressMessage("Trimming", "IL2074",
-        Justification = "_handlerType assignment from ExportedTypes.FirstOrDefault — the generated handler type carries its codegen-emitted public constructor; trim preserves it because the type itself is rooted by the assembly load. See AOT guide.")]
+        Justification = "_handlerType assignment from Assembly.GetType / ExportedTypes.FirstOrDefault — the generated handler type carries its codegen-emitted public constructor; trim preserves it because the type itself is rooted by the assembly load. See AOT guide.")]
     [UnconditionalSuppressMessage("Trimming", "IL2077",
-        Justification = "_handlerType is populated by ExportedTypes scan on the generated assembly; the resolved Type's constructors are emitted by the same codegen step that produced the type, so trimming preserves them in any practical setup.")]
+        Justification = "_handlerType is populated by a name lookup on the generated assembly; the resolved Type's constructors are emitted by the same codegen step that produced the type, so trimming preserves them in any practical setup.")]
     [UnconditionalSuppressMessage("AOT", "IL3050",
         Justification = "QuickBuild closes IFinder<TParameter> via MakeGenericType + Activator.CreateInstance; AOT consumers run pre-generated handlers via TypeLoadMode.Static so the reflective close never fires.")]
     bool ICodeFile.AttachTypesSynchronously(GenerationRules rules, Assembly assembly, IServiceProvider? services,
         string containingNamespace)
     {
-        _handlerType = assembly.ExportedTypes.FirstOrDefault(x => x.Name == TypeName);
+        // GH-4625: resolve the generated handler by its full name (a targeted lookup, as HttpChain has done
+        // since GH-2908); fall back to the ExportedTypes walk only if it misses. The walk ran once per handler
+        // chain from AssertPreBuiltTypesExist, and under Native AOT every walk rebuilds runtime type
+        // information for each exported type, so it was most of WolverineRuntime.StartAsync.
+        _handlerType = assembly.GetType($"{containingNamespace}.{TypeName}")
+                       ?? assembly.ExportedTypes.FirstOrDefault(x => x.Name == TypeName);
 
         if (_handlerType == null)
         {
@@ -485,18 +496,15 @@ public class HandlerChain : Chain<HandlerChain, ModifyHandlerChainAttribute>, IW
             $"Could not find a public static method '{methodName}' returning {returnType.FullNameInCode()} on handler types: {handlerTypes.Select(t => t.FullNameInCode()).Join(", ")}");
     }
 
-    // typeof(EntityIsNotNullGuardFrame<>).CloseAndBuildAs<MethodCall>(...)
-    // closes the guard-frame generic over the entity type at codegen time.
-    // Same chunk D / I / J / K CloseAndBuildAs pattern.
-    [UnconditionalSuppressMessage("Trimming", "IL2026",
-        Justification = "EntityIsNotNullGuardFrame<> closed over runtime entity type at codegen time; user types statically rooted. See AOT guide.")]
-    [UnconditionalSuppressMessage("AOT", "IL3050",
-        Justification = "EntityIsNotNullGuardFrame<> closed over runtime entity type at codegen time; user types statically rooted. See AOT guide.")]
+    // GH-4752: constructed DIRECTLY rather than closed over the entity type through CloseAndBuildAs.
+    // The chain model is built at startup even under TypeLoadMode.Static, so the Activator call this
+    // replaces ran inside Native AOT applications against a closed generic frame ILC had never seen
+    // instantiated, and threw "EntityIsNotNullGuardFrame`1[TEntity] is missing native code or metadata".
     public override Frame[] AddStopConditionIfNull(Variable variable)
     {
-        var frame = typeof(EntityIsNotNullGuardFrame<>).CloseAndBuildAs<MethodCall>(variable, variable.VariableType);
+        var frame = new EntityIsNotNullGuardFrame(variable);
 
-        return [frame, new HandlerContinuationFrame(frame)];
+        return [frame, new HandlerContinuationFrame(frame, NextContinuationVariableIndex())];
     }
 
     /// <inheritdoc />
@@ -530,10 +538,7 @@ public class HandlerChain : Chain<HandlerChain, ModifyHandlerChainAttribute>, IW
         };
     }
 
-    [UnconditionalSuppressMessage("Trimming", "IL2026",
-        Justification = "EntityIsNotNullGuardFrame<> closed over runtime entity type at codegen time; user types statically rooted. See AOT guide.")]
-    [UnconditionalSuppressMessage("AOT", "IL3050",
-        Justification = "EntityIsNotNullGuardFrame<> closed over runtime entity type at codegen time; user types statically rooted. See AOT guide.")]
+    // GH-4752: see the overload above - the frame is constructed directly rather than reflectively.
     public override Frame[] AddStopConditionIfNull(Variable data, Variable? identity, IDataRequirement requirement)
     {
         switch (requirement.OnMissing)
@@ -545,10 +550,9 @@ public class HandlerChain : Chain<HandlerChain, ModifyHandlerChainAttribute>, IW
             // to Simple404. Leaving it out of this group would drop it into the `default:` below and
             // start throwing on message handlers that share an [Entity] configuration with an endpoint.
             case OnMissing.EmptyContentWith204:
-                var frame = typeof(EntityIsNotNullGuardFrame<>).CloseAndBuildAs<MethodCall>(data, data.VariableType);
-                if (frame is IEntityIsNotNullGuard guard) guard.Requirement = requirement;
-                
-                return [frame, new HandlerContinuationFrame(frame)];
+                var frame = new EntityIsNotNullGuardFrame(data) { Requirement = requirement };
+
+                return [frame, new HandlerContinuationFrame(frame, NextContinuationVariableIndex())];
                 
             default:
                 // AddStopConditionIfNull declares the identity nullable, so an entity addressed by
@@ -579,6 +583,17 @@ public class HandlerChain : Chain<HandlerChain, ModifyHandlerChainAttribute>, IW
                 continue;
             }
 
+            // GH-4840. A return type that is never routed is not a published type: ISideEffect and the
+            // other INotToBeRouted return types are consumed by their policies inside the chain and never
+            // cascade. Listing them here put every side-effect interface through PrepopulateRoutingCache
+            // at startup, which closes EmptyMessageRouter<T> over it reflectively -- and the Fisher native
+            // lane crashed on exactly that the first time it returned a side-effect interface declared in
+            // the application, since nothing roots a router for a type that can never be routed.
+            if (variable.VariableType.CanBeCastTo<INotToBeRouted>())
+            {
+                continue;
+            }
+
             yield return variable.VariableType;
         }
     }
@@ -596,8 +611,16 @@ public class HandlerChain : Chain<HandlerChain, ModifyHandlerChainAttribute>, IW
     // documents the requirement explicitly. Test-helper API surface — caller
     // sites pass concrete types so the cascade stops here.
     public static HandlerChain For<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods | DynamicallyAccessedMemberTypes.NonPublicMethods)] T>(string methodName, HandlerGraph parent)
+        => For(typeof(T), methodName, parent);
+
+    /// <summary>
+    ///     The chain for <paramref name="methodName" /> on <paramref name="handlerType" />, which may be a
+    ///     <c>static</c> class — the shape the scaffold writes, and one a generic type argument cannot name.
+    /// </summary>
+    public static HandlerChain For(
+        [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods | DynamicallyAccessedMemberTypes.NonPublicMethods)] Type handlerType,
+        string methodName, HandlerGraph parent)
     {
-        var handlerType = typeof(T);
         var method = handlerType.GetMethod(methodName,
             BindingFlags.Public | BindingFlags.Static | BindingFlags.Instance);
 
@@ -781,7 +804,7 @@ public class HandlerChain : Chain<HandlerChain, ModifyHandlerChainAttribute>, IW
         // IsTransactional is only final once [Transactional] and the stores' own policies have both had
         // their say. Reading either one earlier produced a chain that silently wove nothing in.
         // Idempotent, so a chain reached twice is woven once.
-        this.ApplyDeduplication();
+        this.ApplyDeduplication(rules, container);
 
         // Use Wolverine Parameter Attribute on any middleware
         foreach (var methodCall in Middleware.OfType<MethodCall>().ToArray())
@@ -840,16 +863,35 @@ internal interface IEntityIsNotNullGuard
     IDataRequirement? Requirement { get; set; }
 }
 
-internal class EntityIsNotNullGuardFrame<T> : MethodCall, IEntityIsNotNullGuard
+/// <remarks>
+/// GH-4752: the entity type is a constructor argument rather than a generic parameter. Closing this
+/// frame through <c>CloseAndBuildAs</c> put an <see cref="Activator" /> call on a startup path that runs
+/// even under <c>TypeLoadMode.Static</c>, which is how a Native AOT application died with
+/// "EntityIsNotNullGuardFrame`1[TEntity] is missing native code or metadata" - ILC has no reason to
+/// emit an instantiation nothing references statically. The static <see cref="EntityIsNotNullGuard{T}" />
+/// it targets IS referenced, by the generated code that calls <c>Assert</c>, so closing THAT over the
+/// entity type is safe where closing the frame was not.
+/// </remarks>
+internal class EntityIsNotNullGuardFrame : MethodCall, IEntityIsNotNullGuard
 {
-    [UnconditionalSuppressMessage("Trimming", "IL2026",
-        Justification = "MethodCall reflects EntityIsNotNullGuard<T>.GetMethod(\"Assert\"); the Assert method is statically referenced via nameof-style binding in the EntityIsNotNullGuard<T> class and survives trimming. The closed-generic EntityIsNotNullGuard<T> is rooted at codegen time per the AOT guide.")]
-    public EntityIsNotNullGuardFrame(Variable variable) : base(typeof(EntityIsNotNullGuard<T>), "Assert")
+    // Resolved off the OPEN generic definition, which is statically referenced by the typeof() below and
+    // therefore keeps its reflection metadata. Looking Assert up on the CLOSED EntityIsNotNullGuard<T>
+    // instead returns null in a native image - ILC emits the instantiation's CODE, because the generated
+    // source calls it, but not reflection metadata for it - and MethodCall then NREs inside IsAsync.
+    private static readonly MethodInfo _assertMethod =
+        typeof(EntityIsNotNullGuard<>).GetMethod(nameof(EntityIsNotNullGuard<object>.Assert))!;
+
+    public EntityIsNotNullGuardFrame(Variable variable) : base(GuardTypeFor(variable.VariableType),
+        _assertMethod)
     {
         Arguments[0] = variable;
         Arguments[2] = Constant.For(variable.Usage);
     }
-    
+
+    [UnconditionalSuppressMessage("AOT", "IL3050",
+        Justification = "MakeGenericType closes EntityIsNotNullGuard<TEntity> at codegen time; the closed static class is rooted by the generated code that calls its Assert method.")]
+    private static Type GuardTypeFor(Type entityType) => typeof(EntityIsNotNullGuard<>).MakeGenericType(entityType);
+
     public IDataRequirement? Requirement { get; set; }
 }
 

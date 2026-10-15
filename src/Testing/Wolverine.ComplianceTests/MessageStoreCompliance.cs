@@ -125,6 +125,93 @@ public abstract class MessageStoreCompliance : IAsyncLifetime
         (await thePersistence.Inbox.ExistsAsync(envelope, CancellationToken.None)).ShouldBeTrue();
     }
     
+    // GH-5049. IMessageInbox.IsHandledAsync: the push receiver claims a message id with an Incoming row before running
+    // the handler, and has to tell that claim apart from a message the inbox has finished with
+
+    private static Envelope incomingEnvelope(EnvelopeStatus status = EnvelopeStatus.Incoming)
+    {
+        var envelope = ObjectMother.Envelope();
+        envelope.Status = status;
+        envelope.SentAt = ((DateTimeOffset)DateTime.Today).ToUniversalTime();
+        return envelope;
+    }
+
+    [Fact]
+    public async Task is_handled_is_false_with_no_row()
+    {
+        (await thePersistence.Inbox.IsHandledAsync(incomingEnvelope(), CancellationToken.None)).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task an_incoming_row_is_only_handled_once_it_is_marked_handled()
+    {
+        var envelope = incomingEnvelope();
+
+        await thePersistence.Inbox.StoreIncomingAsync(envelope);
+        (await thePersistence.Inbox.IsHandledAsync(envelope, CancellationToken.None)).ShouldBeFalse();
+
+        await thePersistence.Inbox.MarkIncomingEnvelopeAsHandledAsync(envelope);
+        (await thePersistence.Inbox.IsHandledAsync(envelope, CancellationToken.None)).ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task a_row_stored_as_handled_is_handled()
+    {
+        // As the push receiver and the inbox deduplication record a message they have finished with
+        var envelope = incomingEnvelope(EnvelopeStatus.Handled);
+
+        await thePersistence.Inbox.StoreIncomingAsync(envelope);
+
+        (await thePersistence.Inbox.IsHandledAsync(envelope, CancellationToken.None)).ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task a_scheduled_row_is_not_handled()
+    {
+        var envelope = incomingEnvelope(EnvelopeStatus.Scheduled);
+        envelope.ScheduledTime = DateTimeOffset.UtcNow.AddMinutes(5);
+
+        await thePersistence.Inbox.StoreIncomingAsync(envelope);
+
+        (await thePersistence.Inbox.IsHandledAsync(envelope, CancellationToken.None)).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task a_dead_lettered_message_is_not_handled()
+    {
+        var envelope = incomingEnvelope();
+        await thePersistence.Inbox.StoreIncomingAsync(envelope);
+
+        await thePersistence.Inbox.MoveToDeadLetterStorageAsync(envelope, new InvalidOperationException("Boom"));
+
+        (await thePersistence.Inbox.IsHandledAsync(envelope, CancellationToken.None)).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task is_handled_uses_the_same_identity_rule_as_exists()
+    {
+        var handled = incomingEnvelope(EnvelopeStatus.Handled);
+        await thePersistence.Inbox.StoreIncomingAsync(handled);
+
+        // The same id received at another address
+        var elsewhere = incomingEnvelope();
+        elsewhere.Id = handled.Id;
+        elsewhere.Destination = new Uri("stub://elsewhere");
+
+        var exists = await thePersistence.Inbox.ExistsAsync(elsewhere, CancellationToken.None);
+        var isHandled = await thePersistence.Inbox.IsHandledAsync(elsewhere, CancellationToken.None);
+
+        // Whatever the store's own identity rule finds, both answer the same. (Under IdOnly a relational store finds
+        // the same id at another address, while Cosmos DB, which partitions by destination, does not)
+        isHandled.ShouldBe(exists);
+
+        // Under IdAndDestination it is a different message on every store
+        if (identityStyle() == MessageIdentity.IdAndDestination)
+        {
+            isHandled.ShouldBeFalse();
+        }
+    }
+
     [Fact]
     public async Task store_a_single_incoming_envelope_that_is_handled()
     {
@@ -159,6 +246,34 @@ public abstract class MessageStoreCompliance : IAsyncLifetime
         await Should.ThrowAsync<DuplicateIncomingEnvelopeException>(async () =>
         {
             await thePersistence.Inbox.StoreIncomingAsync(envelope);
+        });
+    }
+
+    /// <summary>
+    /// GH-5059. Under <see cref="MessageIdentity.IdOnly"/> a message's identity is its id alone, so the same id
+    /// received at another address is the same message, and storing it again is a duplicate. Skipped under
+    /// IdAndDestination, where it is a different message
+    /// </summary>
+    [Fact]
+    public async Task under_id_only_the_same_id_at_another_destination_is_a_duplicate()
+    {
+        if (identityStyle() != MessageIdentity.IdOnly) return;
+
+        var envelope = ObjectMother.Envelope();
+        envelope.Destination = new Uri("stub://incoming");
+        envelope.Status = EnvelopeStatus.Incoming;
+        await thePersistence.Inbox.StoreIncomingAsync(envelope);
+
+        var elsewhere = ObjectMother.Envelope();
+        elsewhere.Id = envelope.Id;
+        elsewhere.Destination = new Uri("stub://elsewhere");
+        elsewhere.Status = EnvelopeStatus.Incoming;
+
+        (await thePersistence.Inbox.ExistsAsync(elsewhere, CancellationToken.None)).ShouldBeTrue();
+
+        await Should.ThrowAsync<DuplicateIncomingEnvelopeException>(async () =>
+        {
+            await thePersistence.Inbox.StoreIncomingAsync(elsewhere);
         });
     }
 
@@ -343,6 +458,143 @@ public abstract class MessageStoreCompliance : IAsyncLifetime
         counts.Handled.ShouldBe(4);
     }
 
+    /// <summary>
+    /// GH-4701. The mark-as-handled that transactional middleware (EF Core's <c>EfCoreEnvelopeTransaction</c>) issues
+    /// on the application's own connection and transaction. Runs on every store and identity shape, including the
+    /// partitioned PostgreSQL inbox.
+    /// </summary>
+    [Fact]
+    public virtual async Task mark_envelope_as_handled_in_transaction()
+    {
+        if (thePersistence is not IMessageDatabase database) return;
+
+        var envelope = ObjectMother.Envelope();
+        envelope.Status = EnvelopeStatus.Incoming;
+        await thePersistence.Inbox.StoreIncomingAsync(envelope);
+
+        await markAsHandledInTransactionAsync(database, envelope);
+
+        var counts = await thePersistence.Admin.FetchCountsAsync();
+        counts.Incoming.ShouldBe(0);
+        counts.Handled.ShouldBe(1);
+    }
+
+    /// <summary>
+    /// GH-4701. Under <see cref="MessageIdentity.IdAndDestination"/> a row sharing the id at another destination is a
+    /// different message: the copy of a fanned-out message whose own handler may not have run yet. Marking it handled
+    /// here means a node that stops before that handler runs loses the copy for good, because the durability agent only
+    /// recovers Incoming rows. The same identity rule as <c>MarkAsHandledSql</c>, and the twin of the GH-4216 promotion
+    /// tests. Skipped under IdOnly, where a shared id at another destination is by definition the same identity.
+    /// </summary>
+    [Fact]
+    public virtual async Task mark_as_handled_in_transaction_leaves_a_shared_id_at_another_destination_alone()
+    {
+        if (thePersistence is not IMessageDatabase database) return;
+        if (identityStyle() != MessageIdentity.IdAndDestination) return;
+
+        var handled = ObjectMother.Envelope();
+        handled.Status = EnvelopeStatus.Incoming;
+        await thePersistence.Inbox.StoreIncomingAsync(handled);
+
+        var elsewhere = ObjectMother.Envelope();
+        elsewhere.Id = handled.Id;
+        elsewhere.Destination = new Uri("stub://elsewhere");
+        elsewhere.Status = EnvelopeStatus.Incoming;
+        await thePersistence.Inbox.StoreIncomingAsync(elsewhere);
+
+        await markAsHandledInTransactionAsync(database, handled);
+
+        var rows = await thePersistence.Admin.AllIncomingAsync();
+
+        rows.Single(x => x.Id == handled.Id && x.Destination == handled.Destination)
+            .Status.ShouldBe(EnvelopeStatus.Handled);
+
+        rows.Single(x => x.Id == elsewhere.Id && x.Destination == elsewhere.Destination)
+            .Status.ShouldBe(EnvelopeStatus.Incoming,
+                "Matching on the id alone retires a copy whose own handler has not run yet, and a Handled row is never recovered.");
+    }
+
+    /// <summary>
+    /// GH-4739. A Handled row is kept only for idempotency and nothing recovers it, so it has no owner -- the same as
+    /// a row inserted already Handled (<c>Envelope.ForPersistedHandled</c>). Left owned by the node that handled it,
+    /// every later release of that node's ownership (listener drain, node departure, orphan sweep) rewrites the
+    /// retained rows, and they fill the owner index the release statements seek.
+    ///
+    /// GH-4784/GH-4785: this is a contract on every store, not only the relational ones -- the assertion reads
+    /// through <c>Admin.AllIncomingAsync()</c> and needs nothing of <c>IMessageDatabase</c>. Only the
+    /// in-transaction sibling below is genuinely relational.
+    /// </summary>
+    [Fact]
+    public virtual async Task mark_envelope_as_handled_releases_its_owner()
+    {
+        var envelope = ObjectMother.Envelope();
+        await thePersistence.Inbox.StoreIncomingAsync(envelope);
+
+        await thePersistence.Inbox.MarkIncomingEnvelopeAsHandledAsync(envelope);
+
+        await theOwnerShouldBeReleasedAsync(envelope);
+    }
+
+    /// <summary>
+    /// GH-4739. The batched mark-as-handled builds its own statement, so it has to release the owner as well.
+    /// </summary>
+    [Fact]
+    public virtual async Task mark_several_envelopes_as_handled_releases_their_owner()
+    {
+        var envelope1 = ObjectMother.Envelope();
+        var envelope2 = ObjectMother.Envelope();
+        await thePersistence.Inbox.StoreIncomingAsync(envelope1);
+        await thePersistence.Inbox.StoreIncomingAsync(envelope2);
+
+        await thePersistence.Inbox.MarkIncomingEnvelopeAsHandledAsync([envelope1, envelope2]);
+
+        await theOwnerShouldBeReleasedAsync(envelope1);
+        await theOwnerShouldBeReleasedAsync(envelope2);
+    }
+
+    /// <summary>
+    /// GH-4739. The in-transaction mark-as-handled (EF Core, and the statement Marten, Polecat and Fisher queue).
+    /// This one keeps its <c>IMessageDatabase</c> guard: it takes a <c>DbConnection</c> and <c>DbTransaction</c>,
+    /// so there is nothing for a document store to run.
+    /// </summary>
+    [Fact]
+    public virtual async Task mark_envelope_as_handled_in_transaction_releases_its_owner()
+    {
+        if (thePersistence is not IMessageDatabase database) return;
+
+        var envelope = ObjectMother.Envelope();
+        await thePersistence.Inbox.StoreIncomingAsync(envelope);
+
+        await markAsHandledInTransactionAsync(database, envelope);
+
+        await theOwnerShouldBeReleasedAsync(envelope);
+    }
+
+    private async Task theOwnerShouldBeReleasedAsync(Envelope envelope)
+    {
+        var stored = (await thePersistence.Admin.AllIncomingAsync())
+            .Single(x => x.Id == envelope.Id && x.Destination == envelope.Destination);
+
+        stored.Status.ShouldBe(EnvelopeStatus.Handled);
+        stored.OwnerId.ShouldBe(TransportConstants.AnyNode,
+            "A Handled row is never recovered, so leaving it owned only makes every release of that owner rewrite it.");
+    }
+
+    /// <summary>
+    /// Mark the envelope handled the way <c>EfCoreEnvelopeTransaction.CommitAsync</c> does: on a caller-owned
+    /// connection, inside a caller-owned transaction, then commit.
+    /// </summary>
+    protected async Task markAsHandledInTransactionAsync(IMessageDatabase database, Envelope envelope)
+    {
+        await using var conn = await database.DataSource.OpenConnectionAsync();
+        await using var tx = await conn.BeginTransactionAsync();
+
+        await database.MarkIncomingEnvelopeAsHandledInTransactionAsync(conn, tx, envelope,
+            DateTimeOffset.UtcNow.AddMinutes(5), CancellationToken.None);
+
+        await tx.CommitAsync();
+    }
+
     [Fact]
     public async Task schedule_execution()
     {
@@ -377,6 +629,94 @@ public abstract class MessageStoreCompliance : IAsyncLifetime
         stored.Single(x => x.Id == list[9].Id).ScheduledTime.HasValue.ShouldBeTrue();
     }
 
+
+    /// <summary>
+    /// GH-4216, workstream 2, decided: a retry booking that lands AFTER the message was marked handled must not
+    /// resurrect it. ScheduleExecutionAsync runs from a RetryBlock in DurableReceiver, so it is free to land after
+    /// mark-as-handled for the same identity, and every store used to flip the retained Handled row straight back
+    /// to Scheduled with its body intact -- a second, fully executable copy of a message that already completed.
+    /// </summary>
+    [Fact]
+    public async Task a_late_retry_booking_does_not_resurrect_a_handled_row()
+    {
+        var envelope = ObjectMother.Envelope();
+        envelope.Status = EnvelopeStatus.Incoming;
+
+        await thePersistence.Inbox.StoreIncomingAsync(envelope);
+        await thePersistence.Inbox.MarkIncomingEnvelopeAsHandledAsync(envelope);
+
+        envelope.ScheduledTime = DateTimeOffset.UtcNow.AddMinutes(5);
+        await thePersistence.Inbox.ScheduleExecutionAsync(envelope);
+
+        var counts = await thePersistence.Admin.FetchCountsAsync();
+        counts.Handled.ShouldBe(1);
+        counts.Scheduled.ShouldBe(0);
+        counts.Incoming.ShouldBe(0);
+    }
+
+    /// <summary>
+    /// The other entry point for a late retry booking. On the relational stores its "no row matched" fallback is an
+    /// insert, which collided with the retained Handled row's primary key; on the document stores the whole method
+    /// was insert-only. Either way the answer is the same: the message already completed, the retry is discarded.
+    /// </summary>
+    [Fact]
+    public async Task rescheduling_for_retry_after_the_message_was_handled_is_discarded()
+    {
+        var envelope = ObjectMother.Envelope();
+        envelope.Status = EnvelopeStatus.Incoming;
+
+        await thePersistence.Inbox.StoreIncomingAsync(envelope);
+        await thePersistence.Inbox.MarkIncomingEnvelopeAsHandledAsync(envelope);
+
+        envelope.ScheduledTime = DateTimeOffset.UtcNow.AddMinutes(5);
+        envelope.Attempts = 2;
+        await thePersistence.Inbox.RescheduleExistingEnvelopeForRetryAsync(envelope);
+
+        var counts = await thePersistence.Admin.FetchCountsAsync();
+        counts.Handled.ShouldBe(1);
+        counts.Scheduled.ShouldBe(0);
+        counts.Incoming.ShouldBe(0);
+    }
+
+    /// <summary>
+    /// GH-4216. The normal case RescheduleExistingEnvelopeForRetryAsync exists for (GH-2462 / GH-2823): the row is
+    /// already in the inbox and is moved to Scheduled in place. RavenDb and CosmosDb used to throw
+    /// DuplicateIncomingEnvelopeException here, because their implementation was a bare insert.
+    /// </summary>
+    [Fact]
+    public async Task rescheduling_for_retry_moves_an_existing_incoming_row_to_scheduled()
+    {
+        var envelope = ObjectMother.Envelope();
+        envelope.Status = EnvelopeStatus.Incoming;
+
+        await thePersistence.Inbox.StoreIncomingAsync(envelope);
+
+        envelope.ScheduledTime = DateTimeOffset.UtcNow.AddMinutes(5);
+        envelope.Attempts = 2;
+        await thePersistence.Inbox.RescheduleExistingEnvelopeForRetryAsync(envelope);
+
+        var stored = await thePersistence.Admin.AllIncomingAsync();
+        var row = stored.Single(x => x.Id == envelope.Id);
+        row.Status.ShouldBe(EnvelopeStatus.Scheduled);
+        row.ScheduledTime.HasValue.ShouldBeTrue();
+        row.Attempts.ShouldBe(2);
+    }
+
+    /// <summary>
+    /// ...and when nothing is in the inbox yet (ProcessInline retry #1, a buffered scheduled publish), the row is
+    /// inserted as Scheduled.
+    /// </summary>
+    [Fact]
+    public async Task rescheduling_for_retry_inserts_when_no_row_exists()
+    {
+        var envelope = ObjectMother.Envelope();
+        envelope.ScheduledTime = DateTimeOffset.UtcNow.AddMinutes(5);
+
+        await thePersistence.Inbox.RescheduleExistingEnvelopeForRetryAsync(envelope);
+
+        var stored = await thePersistence.Admin.AllIncomingAsync();
+        stored.Single(x => x.Id == envelope.Id).Status.ShouldBe(EnvelopeStatus.Scheduled);
+    }
 
     [Fact]
     public async Task discard_and_reassign_outgoing()
@@ -1050,6 +1390,28 @@ public abstract class MessageStoreCompliance : IAsyncLifetime
     }
 
     [Fact]
+    public async Task query_scheduled_messages_carries_each_envelopes_tenant()
+    {
+        var tenanted = ObjectMother.Envelope();
+        tenanted.Status = EnvelopeStatus.Scheduled;
+        tenanted.ScheduledTime = DateTimeOffset.UtcNow.AddMinutes(10);
+        tenanted.TenantId = "tenant-a";
+
+        var untenanted = ObjectMother.Envelope();
+        untenanted.Status = EnvelopeStatus.Scheduled;
+        untenanted.ScheduledTime = DateTimeOffset.UtcNow.AddMinutes(11);
+        untenanted.TenantId = null;
+
+        await thePersistence.Inbox.StoreIncomingAsync([tenanted, untenanted]);
+
+        var results = await thePersistence.ScheduledMessages.QueryAsync(
+            new ScheduledMessageQuery(), CancellationToken.None);
+
+        results.Messages.Single(x => x.Id == tenanted.Id).TenantId.ShouldBe("tenant-a");
+        results.Messages.Single(x => x.Id == untenanted.Id).TenantId.ShouldBeNull();
+    }
+
+    [Fact]
     public async Task cancel_scheduled_message_by_id()
     {
         var list = new List<Envelope>();
@@ -1236,6 +1598,60 @@ public abstract class MessageStoreCompliance : IAsyncLifetime
             "Polled envelopes must be stamped with the store they came from so " +
             "downstream mark-as-handled / inbox writes route back to the correct store. " +
             "See GH-2576.");
+    }
+
+    /// <summary>
+    /// Contract test for https://github.com/JasperFx/wolverine/issues/4673.
+    ///
+    /// The promotion UPDATE sets the row to <c>Incoming</c> owned by this node. The in-memory envelope has
+    /// to say the same thing, because it was READ while the row still said <c>Scheduled</c> and nothing
+    /// else re-reads it.
+    ///
+    /// <para>This is not cosmetic. <see cref="Envelope.IsScheduledForLater"/> answers true on
+    /// <c>Status</c> ALONE, regardless of the clock, so a stale <c>Scheduled</c> makes
+    /// <c>Envelope.MarkReceived</c> re-assert it — and <c>DurableReceiver.receiveOneAsync</c> only enqueues
+    /// an envelope whose status is <c>Incoming</c>. The message is then dropped with nothing logged, while
+    /// its row sits <c>Incoming</c> under a LIVE owner that no recovery path can reclaim: inbox recovery
+    /// takes only <c>owner_id = 0</c>, and the orphan sweep only releases nodes proven dead.</para>
+    /// </summary>
+    [Fact]
+    public virtual async Task scheduled_poll_marks_the_envelope_promoted()
+    {
+        if (thePersistence is not IMessageDatabase database) return;
+
+        var envelope = ObjectMother.Envelope();
+        envelope.Status = EnvelopeStatus.Incoming;
+        envelope.ScheduledTime = DateTimeOffset.UtcNow.AddMinutes(-1); // already due
+        await thePersistence.Inbox.StoreIncomingAsync(envelope);
+        await thePersistence.Inbox.ScheduleExecutionAsync(envelope);
+
+        var capturedEnvelopes = new List<Envelope>();
+        var spyRuntime = Substitute.For<IWolverineRuntime>();
+        spyRuntime
+            .EnqueueDirectlyAsync(Arg.Do<IReadOnlyList<Envelope>>(es => capturedEnvelopes.AddRange(es)))
+            .Returns(ValueTask.CompletedTask);
+
+        var durabilitySettings = theHost.Services.GetRequiredService<DurabilitySettings>();
+
+        await database.PollForScheduledMessagesAsync(
+            spyRuntime, NullLogger.Instance, durabilitySettings, CancellationToken.None);
+
+        var captured = capturedEnvelopes.SingleOrDefault(x => x.Id == envelope.Id);
+        captured.ShouldNotBeNull("Expected the just-scheduled envelope to be picked up by the poller.");
+
+        captured.Status.ShouldBe(EnvelopeStatus.Incoming,
+            "A promoted envelope must not still claim to be Scheduled -- IsScheduledForLater keys on " +
+            "status alone, so MarkReceived would re-assert it and the message would never execute. " +
+            "See GH-4673.");
+
+        captured.OwnerId.ShouldBe(durabilitySettings.AssignedNodeNumber,
+            "The promotion UPDATE claimed the row for this node, so the in-memory envelope has to agree. " +
+            "See GH-4673.");
+
+        // The envelope is what MarkReceived will be asked about, so assert the actual predicate rather
+        // than only the field it reads -- that is the thing that was wrong.
+        captured.IsScheduledForLater(DateTimeOffset.UtcNow).ShouldBeFalse(
+            "A due, promoted envelope must not report itself as scheduled for later. See GH-4673.");
     }
 
     /// <summary>

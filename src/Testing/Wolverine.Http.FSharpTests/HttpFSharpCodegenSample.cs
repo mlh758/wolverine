@@ -8,6 +8,7 @@ using JasperFx.CodeGeneration.Services;
 using Microsoft.Extensions.DependencyInjection;
 using Wolverine.Http.CodeGen;
 using Wolverine.Http.FSharpContracts;
+using Wolverine.Http.Runtime;
 using Wolverine.Http.Runtime.MultiTenancy;
 using Wolverine.Runtime;
 
@@ -31,9 +32,17 @@ public static class HttpFSharpCodegenSample
         // Register a placeholder so the ServiceCollectionServerVariableSource can resolve the type;
         // the F# fixture only compiles the generated code, it never executes it.
         registry.AddSingleton<IWolverineRuntime>(_ => null!);
+        // GH-4742: [DeduplicatedWithResponse] resolves DeduplicatedResponses as an injected dependency of
+        // the generated handler, so the container has to know the type. Same placeholder reasoning.
+        registry.AddSingleton<DeduplicatedResponses>(_ => null!);
 
         var container = new ServiceContainer(registry, registry.BuildServiceProvider());
-        var httpGraph = new HttpGraph(new WolverineOptions { ApplicationAssembly = typeof(ThingEndpoints).Assembly }, container);
+        // GH-4741: exercise the F# emit of the user relay.
+        var httpGraph = new HttpGraph(new WolverineOptions
+        {
+            ApplicationAssembly = typeof(ThingEndpoints).Assembly,
+            EnableRelayOfUserName = true
+        }, container);
 
         // GET (static string response) + POST (JSON body bind + JSON response). The JSON path calls
         // the inherited instance HttpHandler methods ReadJsonAsync/WriteJsonAsync, now qualified with
@@ -57,6 +66,20 @@ public static class HttpFSharpCodegenSample
         // individual query-string variables and passed to the record constructor.
         var filterChain  = HttpChain.ChainFor<ThingEndpoints>(x => x.Filter(null!), httpGraph);
 
+        // ReadMultipartBody.GenerateFSharpCode — a MultipartReader parameter streams the request
+        // body instead of buffering the form. GH-4680.
+        var uploadChain  = HttpChain.ChainFor<ThingEndpoints>(x => ThingEndpoints.Upload(null!), httpGraph);
+
+        // GH-4742: all six DeduplicatedResponseFrames -- EnableRequestBufferingFrame,
+        // ScopeDeduplicationIdFrame, DeduplicationFingerprintFrame, ClaimDeduplicatedResponseFrame,
+        // ReleaseUnansweredDeduplicatedResponseFrame and RecordDeduplicatedResponseFrame.
+        var dedupChain   = HttpChain.ChainFor<ThingEndpoints>(x => x.Deduplicated(null!), httpGraph);
+
+        // GH-4978: a single-value wrapper (record struct ThingId(Guid Value)) bound from a route value and
+        // one around a string (ThingCode) bound from the query string
+        var thingIdChain   = HttpChain.ChainFor<ThingEndpoints>(x => x.GetByThingId(default), httpGraph);
+        var thingCodeChain = HttpChain.ChainFor<ThingEndpoints>(x => x.GetByThingCode(default), httpGraph);
+
         // MaybeEndWithResultFrame.GenerateFSharpCode — a static auth-check call whose IResult
         // return is wrapped in MaybeEndWithResultFrame to short-circuit when the check fails.
         var authedChain  = HttpChain.ChainFor<AuthedEndpoints>(x => x.Get(), httpGraph);
@@ -68,7 +91,8 @@ public static class HttpFSharpCodegenSample
         var chains = new[]
         {
             helloChain, createChain, getByIdChain, searchChain, getItemsChain,
-            pagedChain, resultChain, deleteChain, publishChain, filterChain, authedChain
+            pagedChain, resultChain, deleteChain, publishChain, filterChain, uploadChain, dedupChain,
+            thingIdChain, thingCodeChain, authedChain
         };
 
         // TagHttpHandlerFrame.GenerateFSharpCode — applied to all chains via TagHttpHandlerPolicy.

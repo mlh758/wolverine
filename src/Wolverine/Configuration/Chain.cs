@@ -14,6 +14,7 @@ using Wolverine.Attributes;
 using Wolverine.Logging;
 using Wolverine.Middleware;
 using Wolverine.Persistence;
+using Wolverine.Persistence.Codegen;
 using Wolverine.Runtime;
 using Wolverine.Runtime.Handlers;
 
@@ -51,6 +52,15 @@ public abstract class Chain<TChain, TModifyAttribute> : IChain
         DeduplicationRequirement requirement)
         => throw new NotSupportedException(
             $"{GetType().FullNameInCode()} does not support logical message deduplication (GH-4180)");
+
+    /// <inheritdoc />
+    /// <remarks>
+    ///     Mirrors the <see cref="IChain" /> default as a <c>virtual</c>, for the same reason
+    ///     <see cref="ResolveDeduplicationId" /> does: a default interface member cannot be overridden from
+    ///     within the class hierarchy.
+    /// </remarks>
+    public virtual Frame BuildDeduplicationReleaseFrame(Variable deduplicationId)
+        => new ReleaseDeduplicationIdOnFailureFrame(deduplicationId, AncillaryStoreType);
 
     /// <inheritdoc />
     /// <remarks>
@@ -93,17 +103,37 @@ public abstract class Chain<TChain, TModifyAttribute> : IChain
 
     public abstract bool TryInferMessageIdentity(out PropertyInfo? property);
 
+    private int _continuationVariableCount;
+
+    /// <summary>
+    /// GH-4714. The suffix for the next continuation variable generated into THIS chain's method. Index 0
+    /// takes the bare name, so the overwhelmingly common single-frame chain generates a stable
+    /// <c>handlerContinuation</c> forever.
+    /// </summary>
+    /// <remarks>
+    /// These frames used to number from a process-wide <c>static int _count</c>, so a variable's name
+    /// depended on how many frames of that kind had been constructed EARLIER IN THE PROCESS, in other
+    /// chains. Adding one DI singleton renumbered ~48 unrelated generated handlers, which is a steady source
+    /// of merge conflicts in committed <c>Internal/Generated</c> code and makes drift gates fire on files the
+    /// author never touched. The static was also not atomic, so chains compiled concurrently could race on it.
+    /// A chain's generated code now depends only on that chain.
+    /// </remarks>
+    public virtual int NextContinuationVariableIndex()
+    {
+        return _continuationVariableCount++;
+    }
+
     /// <summary>
     /// Default implementation for message handlers: log validation messages and return
     /// </summary>
     public virtual Frame? CreateSimpleValidationFrame(Variable variable)
     {
-        return new SimpleValidationHandlerFrame(variable);
+        return new SimpleValidationHandlerFrame(variable, NextContinuationVariableIndex());
     }
 
     public virtual Frame? CreateRequirementResultFrame(Variable variable)
     {
-        return new RequirementResultHandlerFrame(variable);
+        return new RequirementResultHandlerFrame(variable, NextContinuationVariableIndex());
     }
 
     public bool IsTransactional { get; set; }
@@ -539,15 +569,32 @@ public abstract class Chain<TChain, TModifyAttribute> : IChain
 
     public abstract void UseForResponse(MethodCall methodCall);
 
-    // typeof(Applier<>).CloseAndBuildAs<IApplier> closes the internal Applier<T>
-    // shape over a runtime-resolved IResponseAware type so the generic static-
-    // virtual ConfigureResponse hook can be invoked. Same chunk D / I / J / K
-    // CloseAndBuildAs pattern. IResponseAware is opt-in; user types are
-    // statically rooted via handler return-type discovery.
+    // Closes Applier<T> over the chain's IResponseAware return type so the static abstract
+    // ConfigureResponse hook can be invoked -- there is no non-generic way to reach a static abstract
+    // interface member, so this generic is the dispatch mechanism and cannot be replaced by taking the
+    // type as a constructor argument the way GH-4752/#4764 did for frames that only need a type identity.
+    //
+    // GH-4778: this runs at STARTUP, while the chain model is built, and it runs under
+    // TypeLoadMode.Static with the generated code already compiled in. The suppression that used to sit
+    // here claimed the opposite -- "closed ... at codegen time; user types statically rooted via handler
+    // return discovery" -- and both halves were false: the type needing the root is Applier<T> itself,
+    // which no return-type discovery ever names. That false justification is why this site survived
+    // #4764. Deleted rather than reworded, as #4764 did with its own.
+    //
+    // What makes it safe now is that `codegen write` emits a [DynamicDependency] for each closed
+    // Applier<T> into the AotRoots block (see HandlerRegistryCodeFile.buildAotRoots), so ILC has the
+    // instantiation and this close resolves. The same technique GH-4287 used for MessageRouter<T>, until
+    // GH-4848 de-genericized the routers and removed that close altogether.
+    //
+    // The suppressions stay because the call stays -- #4764 could delete its own only because it removed
+    // the CloseAndBuildAs entirely, which a static abstract member does not allow. They are justified by
+    // the emitted root, not by a claim that the close never runs.
     [UnconditionalSuppressMessage("Trimming", "IL2026",
-        Justification = "Applier<TResponseAware> closed over runtime IResponseAware type at codegen time; user types statically rooted via handler return discovery. See AOT guide.")]
+        Justification =
+            "The only instantiation closed here is Applier<T> over a type from ReturnVariablesOfType(typeof(IResponseAware)), and `codegen write` emits a [DynamicDependency] root for exactly those closed types (HandlerRegistryCodeFile.buildAotRoots), so the trimmer keeps them. An AOT app with no pre-generated code has no roots -- and is already unsupported, because runtime Roslyn codegen cannot run in a native image at all.")]
     [UnconditionalSuppressMessage("AOT", "IL3050",
-        Justification = "Applier<TResponseAware> closed over runtime IResponseAware type at codegen time; user types statically rooted via handler return discovery. See AOT guide.")]
+        Justification =
+            "MakeGenericType over the closed Applier<T> needs no runtime code generation once ILC has emitted that instantiation, which the [DynamicDependency] root from `codegen write` guarantees. The arrangement MessageRouter<T> used from GH-4287 until GH-4848 removed its close.")]
     protected internal void tryApplyResponseAware()
     {
         var responseAwares = ReturnVariablesOfType(typeof(IResponseAware)).ToArray();
@@ -653,7 +700,15 @@ internal interface IApplier
     void Apply();
 }
 
-internal class Applier<T> : IApplier where T : IResponseAware
+/// <summary>
+///     Invokes <see cref="IResponseAware.ConfigureResponse" /> — a static abstract interface member, which can
+///     only be reached through a type parameter. GH-4778: public, not internal, solely so that
+///     <c>codegen write</c> can name a closed <c>Applier&lt;T&gt;</c> inside the <c>[DynamicDependency]</c>
+///     rooting block it emits. A type the generated file cannot see cannot appear inside a <c>typeof()</c>,
+///     and without that root ILC never emits the instantiation, so closing it at startup throws in a native
+///     image. Not intended for use by application code.
+/// </summary>
+public class Applier<T> : IApplier where T : IResponseAware
 {
     private readonly IChain _chain;
 

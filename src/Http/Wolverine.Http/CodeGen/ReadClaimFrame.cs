@@ -1,4 +1,5 @@
 using System.Security.Claims;
+using System.Text.RegularExpressions;
 using JasperFx.CodeGeneration;
 using JasperFx.CodeGeneration.Frames;
 using JasperFx.CodeGeneration.Model;
@@ -23,8 +24,12 @@ internal class ReadClaimFrame : SyncFrame
         _valueType = valueType;
         _isNullable = valueType.IsNullable();
         _rawType = _isNullable ? valueType.GetInnerTypeFromNullable() : valueType;
-        Variable = new Variable(valueType, $"claim_{claimType.Replace("-", "_").Replace(":", "_").Replace("/", "_")}", this);
+        Variable = new Variable(valueType, $"claim_{toIdentifier(claimType)}", this);
     }
+
+    // Claim types can be URIs (e.g. ClaimTypes.NameIdentifier), so replace every non-identifier character.
+    // TODO: replace with JasperFx's Variable.SanitizeVariableName once it handles this
+    private static string toIdentifier(string claimType) => Regex.Replace(claimType, @"\W", "_");
 
     public Variable Variable { get; }
 
@@ -50,27 +55,12 @@ internal class ReadClaimFrame : SyncFrame
 
     private void writeTypedValue(ISourceWriter writer)
     {
-        var typeName = _rawType.FullNameInCode();
-
         writer.Write(
             $"var {Variable.Usage}_raw = httpContext.User?.FindFirst(\"{_claimType}\")?.Value;");
         writer.Write($"{_valueType.FullNameInCode()} {Variable.Usage} = default;");
 
-        if (_rawType.IsEnum)
-        {
-            writer.Write(
-                $"BLOCK:if ({Variable.Usage}_raw != null && {typeName}.TryParse<{typeName}>({Variable.Usage}_raw, true, out var {Variable.Usage}_parsed))");
-        }
-        else if (_rawType.IsBoolean())
-        {
-            writer.Write(
-                $"BLOCK:if ({Variable.Usage}_raw != null && {typeName}.TryParse({Variable.Usage}_raw, out var {Variable.Usage}_parsed))");
-        }
-        else
-        {
-            writer.Write(
-                $"BLOCK:if ({Variable.Usage}_raw != null && {typeName}.TryParse({Variable.Usage}_raw, System.Globalization.CultureInfo.InvariantCulture, out var {Variable.Usage}_parsed))");
-        }
+        writer.Write(
+            $"BLOCK:if ({Variable.Usage}_raw != null && {ParsingCode.TryParse(_rawType, $"{Variable.Usage}_raw", $"var {Variable.Usage}_parsed")})");
 
         writer.Write($"{Variable.Usage} = {Variable.Usage}_parsed;");
         writer.FinishBlock();

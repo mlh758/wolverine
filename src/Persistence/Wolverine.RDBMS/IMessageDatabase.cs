@@ -103,21 +103,43 @@ public interface IMessageDatabase : IMessageStoreWithAgentSupport, ITenantDataba
     /// <summary>
     /// Mark an already-persisted incoming envelope as handled on a caller-supplied connection and
     /// transaction — used by <c>EfCoreEnvelopeTransaction.CommitAsync</c> to close out a durable-inbox
-    /// message inside the application's own EF Core transaction. Provider-aware: the default binds the
-    /// envelope id through the generic Weasel path (fine for every provider whose driver accepts
-    /// <c>DbType.Guid</c>), and Oracle overrides it because its <c>RAW(16)</c> id columns require the
-    /// Guid to be bound as <c>byte[]</c> (GH-3581 — the generic path throws "Value does not fall within
-    /// the expected range" on ODP.NET).
+    /// message inside the application's own EF Core transaction. Matches the whole inbox identity, <c>id</c>
+    /// AND <c>received_at</c>: under <see cref="MessageIdentity.IdAndDestination"/> one message fanned out to
+    /// several durable listeners has a row per destination, and each handler may only retire its own.
+    /// <c>MessageDatabase&lt;T&gt;</c> implements this with the same partition-aware statement as
+    /// <c>MarkIncomingEnvelopeAsHandledAsync</c>; Oracle overrides it because its <c>RAW(16)</c> id columns
+    /// require the Guid to be bound as <c>byte[]</c> (GH-3581). This default is for other implementations.
     /// </summary>
     Task MarkIncomingEnvelopeAsHandledInTransactionAsync(DbConnection conn, DbTransaction? tx, Envelope envelope,
         DateTimeOffset keepUntil, CancellationToken cancellation)
     {
         var cmd = conn.CreateCommand(
-                $"update {this.TableNameFor(DatabaseConstants.IncomingTable)} set {DatabaseConstants.Status} = '{EnvelopeStatus.Handled}', {DatabaseConstants.KeepUntil} = @keep where id = @id")
+                $"update {this.TableNameFor(DatabaseConstants.IncomingTable)} set {DatabaseConstants.Status} = '{EnvelopeStatus.Handled}', {DatabaseConstants.KeepUntil} = @keep, {DatabaseConstants.OwnerId} = {TransportConstants.AnyNode} where id = @id and {DatabaseConstants.ReceivedAt} = @uri")
             .With("id", envelope.Id)
-            .With("keep", keepUntil);
+            .With("keep", keepUntil)
+            .With("uri", envelope.Destination!.ToString());
         cmd.Transaction = tx;
         return cmd.ExecuteNonQueryAsync(cancellation);
+    }
+
+    /// <summary>
+    /// GH-4705. The mark-as-handled statement as TEXT, for the stores that queue it into somebody else's
+    /// batch instead of executing it themselves — Marten's <c>QueueSqlCommand</c>, Polecat's and Fisher's
+    /// <c>ITransactionParticipant</c>. All three hand-wrote <c>... where id = ?</c>, which retires every
+    /// destination's copy of a fanned-out message under
+    /// <see cref="MessageIdentity.IdAndDestination"/> and misses the partition-aware shape entirely — on
+    /// Marten, whose store is PostgreSQL, the one provider where <c>EnableInboxPartitioning</c> exists.
+    /// <c>MessageDatabase&lt;T&gt;</c> answers with the very statement it runs itself, so the two cannot
+    /// drift apart again. This default is the unpartitioned identity-matching form, for other
+    /// implementations.
+    /// </summary>
+    MarkAsHandledCommand BuildMarkIncomingAsHandled(Envelope envelope, DateTimeOffset keepUntil,
+        string idExpression, string uriExpression, string keepUntilExpression)
+    {
+        var sql =
+            $"update {this.TableNameFor(DatabaseConstants.IncomingTable)} set {DatabaseConstants.Status} = '{EnvelopeStatus.Handled}', {DatabaseConstants.KeepUntil} = {keepUntilExpression}, {DatabaseConstants.OwnerId} = {TransportConstants.AnyNode} where id = {idExpression} and {DatabaseConstants.ReceivedAt} = {uriExpression}";
+
+        return new MarkAsHandledCommand(sql, [keepUntil, envelope.Id, envelope.Destination!.ToString()]);
     }
 
     /// <summary>
@@ -169,14 +191,4 @@ public interface IMessageDatabase : IMessageStoreWithAgentSupport, ITenantDataba
         CancellationToken cancellationToken);
 
     IAdvisoryLock AdvisoryLock { get; }
-
-    Task PollForMessagesFromExternalTablesAsync(IListener listener,
-        IWolverineRuntime settings, ExternalMessageTable externalTable,
-        IReceiver receiver,
-        CancellationToken token);
-
-    Task MigrateExternalMessageTable(ExternalMessageTable messageTable);
-
-    Task PublishMessageToExternalTableAsync(ExternalMessageTable table, string messageTypeName, byte[] json, CancellationToken token);
-    
 }

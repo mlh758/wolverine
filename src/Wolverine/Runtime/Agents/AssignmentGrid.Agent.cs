@@ -71,6 +71,20 @@ public partial class AssignmentGrid
         internal bool PendingRetryDue { get; set; }
 
         /// <summary>
+        ///     GH-4901. The dispatch to <see cref="PendingNode" /> is a move rather than a first start. Until it
+        ///     resolves, the agent may be stopped at its source and started at PendingNode at any moment, so any
+        ///     other move issued now would race it and could leave a copy on both destinations.
+        /// </summary>
+        internal bool PendingMove { get; set; }
+
+        /// <summary>
+        ///     The node a pending move (<see cref="PendingMove" />) is taking the agent from, if it is still in the
+        ///     cluster. A re-drive of that move is a stop there followed by a start, never a bare start: the copy
+        ///     at the source may still be coming up, invisible, when the move went unconfirmed past its TTL.
+        /// </summary>
+        internal Node? PendingSource { get; set; }
+
+        /// <summary>
         /// Possible nodes that can support this agent. NOTE: this is only applied through
         /// MatchAgentsToNodesFor()
         /// </summary>
@@ -119,15 +133,31 @@ public partial class AssignmentGrid
                             return false;
                         }
 
-                        command = new AssignAgent(Uri, AssignedNode.ToDestination());
+                        // A move gone unconfirmed is driven again as the stop-then-start it was. A bare start
+                        // here skipped the stop at the source, whose copy of the agent was still starting --
+                        // its row not visible yet -- and started a second copy (GH-4901 follow-up, found by
+                        // the laned fleet_chaos_soak once the TTL could lapse during a long start).
+                        command = PendingMove && PendingSource != null
+                            ? new ReassignAgent(Uri, PendingSource.ToDestination(), AssignedNode.ToDestination())
+                            : new AssignAgent(Uri, AssignedNode.ToDestination());
                         return true;
+                    }
+
+                    if (PendingMove && !PendingRetryDue)
+                    {
+                        // Already being moved there; re-decide once that move has landed (GH-4901)
+                        return false;
                     }
 
                     // Being moved before the first start was confirmed. Stop-then-start, sequenced through
                     // the pending node's lane, so whichever of the two nodes ends up with it, only one does.
                     // ReassignAgent always runs in its source's lane (GH-3749), which is exactly the ordering
-                    // this case needs: the stop queues behind the start it is cancelling.
-                    command = new ReassignAgent(Uri, PendingNode.ToDestination(), AssignedNode.ToDestination());
+                    // this case needs: the stop queues behind the start it is cancelling. If that start is
+                    // still only queued, the dispatcher re-targets it instead (GH-4901).
+                    // Same for a move being re-decided to a third node: the stop belongs at the source it is
+                    // leaving, not at the destination it never reached.
+                    var stopAt = PendingMove && PendingSource != null ? PendingSource : PendingNode;
+                    command = new ReassignAgent(Uri, stopAt.ToDestination(), AssignedNode.ToDestination());
                     return true;
                 }
 
@@ -162,6 +192,13 @@ public partial class AssignmentGrid
             // dispatch stops being outstanding without the agent turning up there, PendingRetryDue re-drives
             // it as a fresh reassignment from wherever it is actually running now.
             if (AssignedNode == PendingNode && !PendingRetryDue)
+            {
+                return false;
+            }
+
+            // GH-4901: a move elsewhere that is still on its way. A second move from OriginalNode would queue
+            // behind the first in the same lane, find the agent already gone and start it on a second node.
+            if (PendingNode != null && PendingMove && !PendingRetryDue)
             {
                 return false;
             }

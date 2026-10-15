@@ -102,6 +102,16 @@ public static class HostBuilderExtensions
         var options = new WolverineOptions();
         options.UseRegistrationCallingAssembly(registeredFrom);
 
+        // The process-wide application assembly is pinned by the FIRST host to register, and AddJasperFx() below
+        // pins it from its own stack walk when nothing has yet. Here that walk runs inside Build(), so in a
+        // harness whose hosts are built by a shared helper in another assembly it pinned the HELPER's assembly,
+        // and every later host in the process scanned that assembly for handlers instead of its own. Seed the pin
+        // with the assembly this registration was actually made from. ??= leaves an existing pin alone.
+        if (registeredFrom != null)
+        {
+            JasperFxOptions.RememberedApplicationAssembly ??= registeredFrom;
+        }
+
         return AddWolverine(services, options, discovery, configure);
     }
 
@@ -235,6 +245,12 @@ public static class HostBuilderExtensions
         if (services.All(x => x.ImplementationType != typeof(WolverineEventModelSource)))
         {
             services.AddSingleton<IEventModelDefinitionSource, WolverineEventModelSource>();
+        }
+
+        // GH-4916: every EventModelDefinition in the application's assemblies, from the generated manifest
+        if (services.All(x => x.ImplementationType != typeof(DiscoveredEventModelDefinitions)))
+        {
+            services.AddSingleton<IEventModelDefinitionSource, DiscoveredEventModelDefinitions>();
         }
 
         services.AddSingleton<IFaultPublisher>(sp =>

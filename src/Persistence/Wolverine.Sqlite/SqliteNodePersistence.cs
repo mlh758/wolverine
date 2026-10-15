@@ -22,12 +22,17 @@ internal class SqliteNodePersistence : DatabaseConstants, INodeAgentPersistence
 
     private readonly DatabaseSettings _settings;
     private readonly DbObjectName _restrictionTable;
+    private readonly DurabilitySettings _durability;
+    private readonly DbObjectName _incomingTable;
+    private readonly DbObjectName _outgoingTable;
+    private readonly DbObjectName _nodeRecordTable;
 
     public SqliteNodePersistence(DatabaseSettings settings, SqliteMessageStore database,
         DbDataSource dataSource)
     {
         _settings = settings;
         _database = database;
+        _durability = database.Durability;
         _dataSource = dataSource ?? throw new ArgumentNullException(nameof(dataSource));
         var schemaName = settings.SchemaName ?? TablePrefixing.DefaultSqliteSchemaName;
 
@@ -38,8 +43,27 @@ internal class SqliteNodePersistence : DatabaseConstants, INodeAgentPersistence
             new SqliteObjectName(TablePrefixing.Apply(schemaName, DatabaseConstants.AgentRestrictionsTableName));
         _assignmentTable = new SqliteObjectName(TablePrefixing.Apply(schemaName, NodeAssignmentsTableName));
 
+        // GH-4668: these three were left as the bare DatabaseConstants names when GH-3943 routed
+        // everything else through the prefix, so on a prefixed store they named tables that do not
+        // exist -- DeleteAsync failed before it could release the departing node's envelopes, and the
+        // node record table could be written but never read or trimmed.
+        _incomingTable = new SqliteObjectName(TablePrefixing.Apply(schemaName, DatabaseConstants.IncomingTable));
+        _outgoingTable = new SqliteObjectName(TablePrefixing.Apply(schemaName, DatabaseConstants.OutgoingTable));
+        _nodeRecordTable =
+            new SqliteObjectName(TablePrefixing.Apply(schemaName, DatabaseConstants.NodeRecordTableName));
+
         _lockId = schemaName.GetDeterministicHashCode();
     }
+
+    // GH-4593: load_factor is only provisioned behind this flag (SqliteMessageStore.AllObjects), so every
+    // statement naming it is gated on it too -- otherwise an un-migrated database (AutoCreate.None, or no
+    // DDL rights) fails node startup on "no such column". Read live rather than captured: this is
+    // constructed before the flag is reliably set.
+    private bool advertisesLoad => _durability.CapacityAwareAssignment;
+
+    private string nodeColumns => advertisesLoad ? $"{NodeColumns}, {LoadFactor}" : NodeColumns;
+
+    public bool AdvertisesNodeLoad => true;
 
     public async Task ClearAllAsync(CancellationToken cancellationToken)
     {
@@ -97,7 +121,9 @@ internal class SqliteNodePersistence : DatabaseConstants, INodeAgentPersistence
 
         // GH-3986: same missing cascade as ClearAllAsync -- delete this node's assignments by hand.
         await conn.CreateCommand(
-                $"delete from {_assignmentTable} where {NodeId} = @id;delete from {_nodeTable} where id = @id;update {IncomingTable} set {OwnerId} = 0 where {OwnerId} = @number;update {OutgoingTable} set {OwnerId} = 0 where {OwnerId} = @number;")
+                // GH-4739: `owner_id <> 0` for parity with the other providers. Sqlite has no owner index at
+                // all, so it changes nothing here beyond keeping the statements identical across providers.
+                $"delete from {_assignmentTable} where {NodeId} = @id;delete from {_nodeTable} where id = @id;update {_incomingTable} set {OwnerId} = 0 where {OwnerId} = @number and {OwnerId} <> 0;update {_outgoingTable} set {OwnerId} = 0 where {OwnerId} = @number and {OwnerId} <> 0;")
             .With("id", nodeId.ToString())
             .With("number", assignedNodeNumber)
             .ExecuteNonQueryAsync();
@@ -111,7 +137,7 @@ internal class SqliteNodePersistence : DatabaseConstants, INodeAgentPersistence
 
         // Execute first query for nodes
         await using var cmd1 = conn.CreateCommand();
-        cmd1.CommandText = $"select {NodeColumns} from {_nodeTable}";
+        cmd1.CommandText = $"select {nodeColumns} from {_nodeTable}";
         await using var reader = await cmd1.ExecuteReaderAsync(cancellationToken);
 
         while (await reader.ReadAsync(cancellationToken))
@@ -184,7 +210,7 @@ internal class SqliteNodePersistence : DatabaseConstants, INodeAgentPersistence
         // Load nodes
         await using (var cmd = conn.CreateCommand())
         {
-            cmd.CommandText = $"select {NodeColumns} from {_nodeTable}";
+            cmd.CommandText = $"select {nodeColumns} from {_nodeTable}";
             await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
             while (await reader.ReadAsync(cancellationToken))
             {
@@ -249,7 +275,7 @@ internal class SqliteNodePersistence : DatabaseConstants, INodeAgentPersistence
 
         WolverineNode? returnValue = null;
 
-        await using (var cmd = conn.CreateCommand($"select {NodeColumns} from {_nodeTable} where id = @id")
+        await using (var cmd = conn.CreateCommand($"select {nodeColumns} from {_nodeTable} where id = @id")
             .With("id", nodeId.ToString()))
         {
             await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
@@ -342,8 +368,20 @@ internal class SqliteNodePersistence : DatabaseConstants, INodeAgentPersistence
     public async Task<bool> MarkHealthCheckAsync(WolverineNode node, CancellationToken token)
     {
         await using var conn = await _dataSource.OpenConnectionAsync(token).ConfigureAwait(false);
-        var count = await conn.CreateCommand($"update {_nodeTable} set health_check = datetime('now') where id = @id")
-            .With("id", node.NodeId.ToString()).ExecuteNonQueryAsync(token);
+        // GH-4593: the load advertisement rides the same single-statement heartbeat write, so the leader
+        // never places agents against a reading older than one HealthCheckPollingTime.
+        var cmd = conn.CreateCommand(advertisesLoad
+                ? $"update {_nodeTable} set health_check = datetime('now'), {LoadFactor} = @load where id = @id"
+                : $"update {_nodeTable} set health_check = datetime('now') where id = @id")
+            .With("id", node.NodeId.ToString());
+
+        if (advertisesLoad)
+        {
+            // bound as a real double, not a string: this column is compared numerically
+            cmd = cmd.With("load", (object?)node.LoadFactor ?? DBNull.Value);
+        }
+
+        var count = await cmd.ExecuteNonQueryAsync(token);
 
         // GH-3604 / D2: a miss means a peer deleted this still-live node's row; report it to the caller
         // instead of blindly re-inserting a skeleton (empty capabilities) here.
@@ -360,15 +398,27 @@ internal class SqliteNodePersistence : DatabaseConstants, INodeAgentPersistence
 
         await using var conn = await _dataSource.OpenConnectionAsync(token).ConfigureAwait(false);
 
-        await conn.CreateCommand(
-                $"insert into {_nodeTable} (id, uri, capabilities, description, version, node_number, health_check) values (@id, @uri, @capabilities, @description, @version, @node_number, datetime('now')) on conflict(id) do update set uri = @uri, capabilities = @capabilities, description = @description, version = @version, node_number = @node_number, health_check = datetime('now')")
+        // GH-4593: an upsert, so the load column is spliced into three places -- column list, values list,
+        // and the do-update set list.
+        var loadColumn = advertisesLoad ? $", {LoadFactor}" : string.Empty;
+        var loadValue = advertisesLoad ? ", @load" : string.Empty;
+        var loadUpdate = advertisesLoad ? $", {LoadFactor} = @load" : string.Empty;
+
+        var cmd = conn.CreateCommand(
+                $"insert into {_nodeTable} (id, uri, capabilities, description, version, node_number, health_check{loadColumn}) values (@id, @uri, @capabilities, @description, @version, @node_number, datetime('now'){loadValue}) on conflict(id) do update set uri = @uri, capabilities = @capabilities, description = @description, version = @version, node_number = @node_number, health_check = datetime('now'){loadUpdate}")
             .With("id", node.NodeId.ToString())
             .With("uri", (node.ControlUri ?? TransportConstants.LocalUri).ToString())
             .With("description", node.Description)
             .With("version", node.Version.ToString())
             .With("capabilities", capabilitiesJson)
-            .With("node_number", node.AssignedNodeNumber)
-            .ExecuteNonQueryAsync(token);
+            .With("node_number", node.AssignedNodeNumber);
+
+        if (advertisesLoad)
+        {
+            cmd = cmd.With("load", (object?)node.LoadFactor ?? DBNull.Value);
+        }
+
+        await cmd.ExecuteNonQueryAsync(token);
     }
 
     public Task LogRecordsAsync(params NodeRecord[] records)
@@ -392,7 +442,7 @@ internal class SqliteNodePersistence : DatabaseConstants, INodeAgentPersistence
         var records = new List<NodeRecord>();
 
         await using var conn = await _dataSource.OpenConnectionAsync(CancellationToken.None).ConfigureAwait(false);
-        await using var cmd = conn.CreateCommand($"select node_number, event_name, timestamp, description from {NodeRecordTableName} order by id desc LIMIT @limit")
+        await using var cmd = conn.CreateCommand($"select node_number, event_name, timestamp, description from {_nodeRecordTable} order by id desc LIMIT @limit")
             .With("limit", count);
 
         await using var reader = await cmd.ExecuteReaderAsync();
@@ -418,7 +468,7 @@ internal class SqliteNodePersistence : DatabaseConstants, INodeAgentPersistence
 
         await using var conn = await _dataSource.OpenConnectionAsync(CancellationToken.None).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand(
-                $"delete from {NodeRecordTableName} where id not in (select id from {NodeRecordTableName} order by id desc limit @retain)")
+                $"delete from {_nodeRecordTable} where id not in (select id from {_nodeRecordTable} order by id desc limit @retain)")
             .With("retain", retainCount);
 
         await cmd.ExecuteNonQueryAsync();
@@ -466,6 +516,19 @@ internal class SqliteNodePersistence : DatabaseConstants, INodeAgentPersistence
             if (capabilities != null)
             {
                 node.Capabilities.AddRange(capabilities.Select(x => new Uri(x)));
+            }
+        }
+
+        // GH-4593: resolved by name -- a select that stops appending the column should fail loudly here
+        // rather than read a wrong hard-coded ordinal. Convert rather than GetFieldValue<double>, in the
+        // house style for this store: SQLite is dynamically typed and the reader reports whatever storage
+        // class the value actually landed in.
+        if (advertisesLoad)
+        {
+            var loadFactor = reader.GetOrdinal(LoadFactor);
+            if (!await reader.IsDBNullAsync(loadFactor))
+            {
+                node.LoadFactor = Convert.ToDouble(reader.GetValue(loadFactor));
             }
         }
 

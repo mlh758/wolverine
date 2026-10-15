@@ -10,6 +10,7 @@ using Wolverine.Attributes;
 using Wolverine.Logging;
 using Wolverine.Middleware;
 using Wolverine.Persistence;
+using Wolverine.Persistence.Codegen;
 using Wolverine.Runtime;
 
 namespace Wolverine.Configuration;
@@ -150,6 +151,19 @@ public interface IChain
         DeduplicationRequirement requirement)
         => throw new NotSupportedException(
             $"{GetType().FullNameInCode()} does not support logical message deduplication (GH-4180)");
+
+    /// <summary>
+    ///     GH-4501. Build the frame that gives a logical deduplication claim back when execution failed.
+    ///
+    ///     <para>
+    ///     The default compensates for a throw, which is the only way a message handler or a gRPC method
+    ///     fails. HTTP endpoints override it: a chain refused by a <c>ProblemDetails</c> 400 or a 404 on a
+    ///     missing aggregate did no work and did not throw, and a claim that outlives it turns the caller's
+    ///     retry into a false duplicate.
+    ///     </para>
+    /// </summary>
+    Frame BuildDeduplicationReleaseFrame(Variable deduplicationId)
+        => new ReleaseDeduplicationIdOnFailureFrame(deduplicationId, AncillaryStoreType);
 
     /// <summary>
     ///     GH-4180. Find the variable holding this chain's logical deduplication id.
@@ -363,6 +377,13 @@ public interface IChain
     /// </summary>
     /// <param name="variable">The variable containing validation messages</param>
     /// <returns>A frame that checks for validation messages and aborts if any exist, or null if not supported</returns>
+    /// <summary>
+    /// GH-4714. The suffix for the next continuation variable generated into this chain's method. Index 0
+    /// takes the bare name. Defaulted so an implementation outside this repository keeps compiling; every
+    /// chain Wolverine ships derives from <c>Chain&lt;,&gt;</c>, which counts per chain.
+    /// </summary>
+    int NextContinuationVariableIndex() => 0;
+
     Frame? CreateSimpleValidationFrame(Variable variable);
 
     /// <summary>

@@ -1,3 +1,4 @@
+using Wolverine.Persistence.Sagas;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using ImTools;
@@ -26,11 +27,31 @@ using Wolverine.Transports;
 using CascadeAction = Weasel.Postgresql.CascadeAction;
 using DbCommandBuilder = Weasel.Core.DbCommandBuilder;
 using Table = Weasel.Postgresql.Tables.Table;
+using Wolverine.Postgresql.Internals;
 
 namespace Wolverine.Postgresql;
 
-internal partial class PostgresqlMessageStore : MessageDatabase<NpgsqlConnection>, IConnectionBudgetProbe
+internal partial class PostgresqlMessageStore : MessageDatabase<NpgsqlConnection>, IConnectionBudgetProbe, ISagaStorageCodeSource
 {
+    /// <summary>
+    ///     GH-4805. Lets generated saga code construct <c>DatabaseSagaSchema<TSaga, TId></c> itself, which is the only way the
+    ///     saga path runs in a native image — <c>SagaSchemaFor</c> is an abstract generic method, and ILC
+    ///     cannot dispatch one.
+    /// </summary>
+    /// <remarks>
+    ///     <c>MakeGenericType</c> is safe here and nowhere near the runtime path: called once per saga
+    ///     chain while the chain model is built, under the JIT, and the <see cref="Type" /> it returns is
+    ///     only rendered as source text. <b>Note the argument order</b> — this store's schema is
+    ///     <c>DatabaseSagaSchema<TSaga, TId></c>, and the five relational stores do not agree on it, which is exactly why each
+    ///     answers this for itself rather than a shared helper guessing.
+    /// </remarks>
+    [UnconditionalSuppressMessage("AOT", "IL3050",
+        Justification = "GH-4805. The closed type is RENDERED AS SOURCE TEXT by EnrollAndFetchSagaStorageFrame and never instantiated from this Type. Called at codegen time under the JIT, so it does not execute in a native image at all -- the generated code that replaces it is what runs there.")]
+    public SagaSchemaCodegen? SagaSchemaCodegenFor(Type sagaType, Type idType)
+    {
+        return new SagaSchemaCodegen(typeof(DatabaseSagaSchema<,>).MakeGenericType(sagaType, idType), typeof(RelationalSagaStorage));
+    }
+
     /// <summary>
     /// Row-count threshold below which <see cref="FetchCountsAsync"/> abandons the cheap
     /// <c>pg_class.reltuples</c> estimate for the outgoing and dead letter tables and issues a
@@ -51,7 +72,8 @@ internal partial class PostgresqlMessageStore : MessageDatabase<NpgsqlConnection
     private readonly string _deleteOutgoingEnvelopesSql;
     private readonly string _discardAndReassignOutgoingSql;
     private readonly string _findAtLargeEnvelopesSql;
-    private readonly string _reassignIncomingSql;
+    private readonly string _reassignIncomingSqlPrefix;
+    private readonly string _reassignIncomingSqlSuffix;
     private readonly string _discardSupersededScheduledSql;
     private DatabaseServerId? _serverId;
 
@@ -69,6 +91,9 @@ internal partial class PostgresqlMessageStore : MessageDatabase<NpgsqlConnection
     /// is shared, including the partition-aware form that inbox partitioning requires.
     /// </summary>
     protected override string MarkAsHandledTableName => $"{QuotedSchemaName}.{DatabaseConstants.IncomingTable}";
+
+    // GH-5022: the same clock as the inbox timestamp column default
+    protected override string currentTimestampSql => "now()";
 
 
     public PostgresqlMessageStore(DatabaseSettings databaseSettings, DurabilitySettings settings, NpgsqlDataSource dataSource,
@@ -108,10 +133,13 @@ internal partial class PostgresqlMessageStore : MessageDatabase<NpgsqlConnection
 
         // With partitioning the same identity can also hold a Handled row, which the identity match on its
         // own would sweep into the incoming partition alongside the scheduled row.
-        _reassignIncomingSql =
+        // Built around the GH-5022 stale-clock restart, which is added per poll: InboxStaleTime is not
+        // reliably settled at construction (GH-4216)
+        _reassignIncomingSqlPrefix =
             $"update {QuotedSchemaName}.{DatabaseConstants.IncomingTable} target " +
-            $"set owner_id = @owner, status = '{EnvelopeStatus.Incoming}' " +
-            $"from unnest(@ids, @uris) as due(id, {DatabaseConstants.ReceivedAt}) " +
+            $"set owner_id = @owner, status = '{EnvelopeStatus.Incoming}'";
+        _reassignIncomingSqlSuffix =
+            $" from unnest(@ids, @uris) as due(id, {DatabaseConstants.ReceivedAt}) " +
             $"where {identityMatchClause("target", "due")} " +
             $"and target.status = '{EnvelopeStatus.Scheduled}'";
 
@@ -229,10 +257,20 @@ internal partial class PostgresqlMessageStore : MessageDatabase<NpgsqlConnection
 
     public override string? BatchedDeleteExpiredDeduplicationClaimsSql(int batchSize)
     {
-        var table = $"{QuotedSchemaName}.{DatabaseConstants.DeduplicationTableName}";
+        // GH-4757: whichever table the configured mode provisioned.
+        var table = $"{QuotedSchemaName}.{DeduplicationTableNameFor(Durability)}";
 
         // Bounded via ctid, the same shape as BatchedDeleteExpiredHandledEnvelopesSql, so each
         // statement holds locks briefly instead of taking out a day's worth of claims at once.
+        return
+            $"delete from {table} where ctid in (select ctid from {table} where {DatabaseConstants.Expires} <= :now limit {batchSize});";
+    }
+
+    /// <summary>GH-4742. As <see cref="BatchedDeleteExpiredDeduplicationClaimsSql" />.</summary>
+    public override string? BatchedDeleteExpiredDeduplicatedResponsesSql(int batchSize)
+    {
+        var table = $"{QuotedSchemaName}.{DatabaseConstants.DeduplicatedResponsesTableName}";
+
         return
             $"delete from {table} where ctid in (select ctid from {table} where {DatabaseConstants.Expires} <= :now limit {batchSize});";
     }
@@ -274,14 +312,14 @@ select {owner} from owners where {owner} is not null";
             $"(select ctid from {table} where {owner} in ({deadOwnerList}) limit {batchSize});";
     }
 
-    public override ISchemaObject AddExternalMessageTable(ExternalMessageTable definition)
+    public override ITable AddExternalMessageTable(ExternalMessageTable definition)
     {
         var table = new Table(definition.TableName);
         table.AddColumn<Guid>(definition.IdColumnName).AsPrimaryKey();
         table.AddColumn(definition.JsonBodyColumnName, "jsonb").NotNull();
         if (definition.TimestampColumnName.IsNotEmpty())
         {
-            table.AddColumn<DateTimeOffset>(definition.TimestampColumnName).DefaultValueByExpression("((now() at time zone 'utc'))");
+            table.AddColumn<DateTimeOffset>(definition.TimestampColumnName).DefaultValueByExpression("now()");
         }
 
         if (definition.MessageTypeColumnName.IsNotEmpty())
@@ -301,11 +339,82 @@ select {owner} from owners where {owner} is not null";
         await conn.CloseAsync();
     }
 
-    protected override Task deleteMany(DbTransaction tx, Guid[] ids, DbObjectName tableName,
-        string idColumnName)
+    /// <summary>
+    /// GH-4663. The envelope tables' <c>timestamp</c> column was declared with the default
+    /// <c>(now() at time zone 'utc')</c>. That expression yields a <c>timestamp</c> WITHOUT a time zone
+    /// holding the UTC wall clock, which PostgreSQL then coerces into the <c>timestamptz</c> column using
+    /// the *inserting session's* zone -- so on a server whose <c>timezone</c> is not UTC every row was
+    /// stored offset by that many hours. <c>BumpStaleIncomingEnvelopesOperation</c> compares against a true
+    /// UTC cutoff, so a server ahead of UTC handed back envelopes that were still running, and one behind
+    /// UTC never handed back a stranded envelope at all.
+    ///
+    /// <para>
+    /// The declaration is fixed, but a corrected DEFAULT is invisible to Weasel's delta, so this repairs
+    /// tables that are already out there. Only the two envelope tables are repaired: they are the ones the
+    /// stale-time sweeps read. The transport queue tables carry the same column, but their cutoffs compare
+    /// <c>execution_time</c> and <c>keep_until</c>, both written from .NET parameters rather than a default.
+    /// </para>
+    ///
+    /// <para>
+    /// GH-5056. The outgoing table's default is clock_timestamp() rather than now() (see
+    /// <see cref="OutgoingEnvelopeTable.TimestampDefault" />), so a table created with now() is repaired the same
+    /// way. A SET DEFAULT only changes the catalog: no table rewrite, and existing rows keep their values.
+    /// </para>
+    /// </summary>
+    protected override async Task repairLegacyColumnDefaultsAsync(DbConnection conn)
+    {
+        if (Durability.InboxStaleTime.HasValue)
+        {
+            await repairTimestampDefaultAsync(conn, DatabaseConstants.IncomingTable, "now()", false);
+        }
+
+        if (Durability.OutboxStaleTime.HasValue)
+        {
+            await repairTimestampDefaultAsync(conn, DatabaseConstants.OutgoingTable, OutgoingEnvelopeTable.TimestampDefault,
+                true);
+        }
+    }
+
+    private async Task repairTimestampDefaultAsync(DbConnection conn, string tableName, string expected,
+        bool replaceNow)
+    {
+        // GH-5056: on the outgoing table any default other than clock_timestamp() is replaced too, the plain now()
+        // included. The incoming table keeps now()
+        var orNotClockTimestamp = replaceNow ? " or lower(existing) not like '%clock_timestamp%'" : "";
+
+        // Reads the catalog first and only ALTERs a default that is actually the old one, so a healthy
+        // database does not take an ACCESS EXCLUSIVE lock on its inbox table on every single startup.
+        //
+        // Match both spellings PostgreSQL hands this expression back as: 17 renders it
+        // `(now() AT TIME ZONE 'utc'::text)`, and the `timezone('utc'::text, now())` form also occurs.
+        // That version-dependent rendering is exactly why a textual default comparison cannot be the
+        // migration mechanism here, which is what Weasel's DetectColumnDrift warning is about.
+        await conn.CreateCommand(
+                $"""
+                 do $$
+                 declare
+                     existing text;
+                 begin
+                     select pg_get_expr(d.adbin, d.adrelid) into existing
+                     from pg_attrdef d
+                     join pg_attribute a on a.attrelid = d.adrelid and a.attnum = d.adnum
+                     where d.adrelid = to_regclass('{SchemaName}.{tableName}')
+                       and a.attname = '{DatabaseConstants.Timestamp}';
+
+                     if existing is not null
+                        and (lower(existing) like '%at time zone%' or lower(existing) like '%timezone(%'{orNotClockTimestamp}) then
+                         execute 'alter table {SchemaName}.{tableName} alter column "{DatabaseConstants.Timestamp}" set default {expected}';
+                     end if;
+                 end $$;
+                 """)
+            .ExecuteNonQueryAsync(_cancellation);
+    }
+
+    protected override Task deleteManyAsync(DbTransaction tx, Guid[] ids, DbObjectName tableName,
+        string idColumnName, CancellationToken token)
     {
         return tx.CreateCommand($"delete from {tableName.QualifiedName} where {idColumnName} = ANY(@ids)")
-            .As<NpgsqlCommand>().With("ids", ids).ExecuteNonQueryAsync();
+            .As<NpgsqlCommand>().With("ids", ids).ExecuteNonQueryAsync(token);
 
     }
 
@@ -340,6 +449,9 @@ select {owner} from owners where {owner} is not null";
 
         counts.Outgoing = await estimateTableCount(DatabaseConstants.OutgoingTable);
         counts.DeadLetter = await estimateTableCount(DatabaseConstants.DeadLetterTable);
+
+        // GH-4499 follow-up: the head of the outbox, so a stuck outbox can be told from a busy one
+        await fetchOldestOutgoingAsync(counts);
 
         return counts;
     }
@@ -659,7 +771,7 @@ join pg_catalog.pg_namespace n on n.oid = c.relnamespace and n.nspname = '{Schem
 
                 var (promotableIds, promotableUris) = toIdAndUriArrays(envelopes);
 
-                await using var reassign = conn.CreateCommand(_reassignIncomingSql);
+                await using var reassign = conn.CreateCommand(_reassignIncomingSqlPrefix + restartIncomingStaleClock + _reassignIncomingSqlSuffix);
                 reassign.Transaction = tx;
                 await reassign
                     .With("owner", durabilitySettings.AssignedNodeNumber)
@@ -672,17 +784,10 @@ join pg_catalog.pg_namespace n on n.oid = c.relnamespace and n.nspname = '{Schem
 
                 announceSupersededScheduledEnvelopes(logger, superseded);
 
-                // Stamp the envelope's owning store on each row so the rest of the
-                // pipeline (DelegatingMessageInbox, FlushOutgoingMessagesOnCommit,
-                // DurableReceiver._markAsHandled) routes its writes back to THIS
-                // store. Without this, an ancillary store's scheduled message wakes
-                // up with envelope.Store == null and the mark-as-handled SQL goes
-                // to the main store, leaving the row stuck Incoming.
-                // See https://github.com/JasperFx/wolverine/issues/2576.
-                foreach (var envelope in envelopes)
-                {
-                    envelope.Store = this;
-                }
+                // Mirror onto the in-memory envelopes what the UPDATE above just did to their rows:
+                // owning store (GH-2576) and promoted status (GH-4673).
+                DatabasePersistence.MarkPromotedFromScheduled(envelopes, this,
+                    durabilitySettings.AssignedNodeNumber);
 
                 // Judging that there's very little chance of errors here
                 await runtime.EnqueueDirectlyAsync(envelopes);
@@ -771,7 +876,7 @@ join pg_catalog.pg_namespace n on n.oid = c.relnamespace and n.nspname = '{Schem
         }
     }
 
-    public override async Task PublishMessageToExternalTableAsync(ExternalMessageTable table, string messageTypeName, byte[] json,
+    public override async Task PublishMessageToExternalTableAsync(ExternalMessageTable table, string? messageTypeName, byte[] json,
         CancellationToken token)
     {
         await using var conn = CreateConnection();
@@ -791,7 +896,7 @@ join pg_catalog.pg_namespace n on n.oid = c.relnamespace and n.nspname = '{Schem
                     $"insert into {table.TableName.QualifiedName} ({table.IdColumnName}, {table.JsonBodyColumnName}, {table.MessageTypeColumnName}) values (@id, @json, @message)")
                 .With("id", Guid.NewGuid())
                 .With("json", json, NpgsqlDbType.Jsonb)
-                .With("message", messageTypeName)
+                .With("message", messageTypeName!)
                 .ExecuteNonQueryAsync(token);
         }
         
@@ -924,9 +1029,21 @@ join pg_catalog.pg_namespace n on n.oid = c.relnamespace and n.nspname = '{Schem
 
         // GH-4180. Every store role, not just Main: a handler chain with an AncillaryStoreType claims
         // its logical id in that store so the claim and the work land in one transaction.
-        if (Durability.EnableMessageDeduplication)
+        // GH-4757: exactly one of the two, never both. The hash mode's key is a binary column, which
+        // cannot be reached from the original table by any migration Weasel can express.
+        if (Durability.MessageDeduplicationMode == MessageDeduplicationMode.CompareByString)
         {
             yield return new DeduplicationTable(SchemaName);
+        }
+        else if (Durability.MessageDeduplicationMode == MessageDeduplicationMode.CompareByHash)
+        {
+            yield return new HashedDeduplicationTable(SchemaName);
+        }
+
+        // GH-4742. Every store role, behind its own opt-in.
+        if (Durability.EnableDeduplicatedResponses)
+        {
+            yield return new DeduplicatedResponsesTable(SchemaName);
         }
 
         // Recurring-message tracking — Main store only (the single cluster-wide agent publishes
@@ -953,6 +1070,13 @@ join pg_catalog.pg_namespace n on n.oid = c.relnamespace and n.nspname = '{Schem
             nodeTable.AddColumn<DateTimeOffset>("health_check").NotNull().DefaultValueByExpression("now()");
             nodeTable.AddColumn<string>("version");
             nodeTable.AddColumn("capabilities", "text[]").AllowNulls();
+
+            // GH-3959: provisioned only behind the opt-in so an upgrade migrates nothing.
+            // PostgresqlNodePersistence gates every statement naming it on the same flag.
+            if (Durability.CapacityAwareAssignment)
+            {
+                nodeTable.AddColumn(DatabaseConstants.LoadFactor, "double precision").AllowNulls();
+            }
 
             yield return nodeTable;
 

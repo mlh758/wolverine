@@ -1,4 +1,5 @@
 using System.Data;
+using ImTools;
 using JasperFx.Events.Daemon;
 using System.Data.Common;
 using JasperFx.Core;
@@ -25,7 +26,7 @@ using DbCommandBuilder = Weasel.Core.DbCommandBuilder;
 namespace Wolverine.RDBMS;
 
 public abstract partial class MessageDatabase<T> : DatabaseBase<T>,
-    IMessageDatabase, IMessageInbox, IMessageOutbox, IMessageStoreAdmin, IDeadLetters, IScheduledMessages, ISagaSupport where T : DbConnection, new()
+    IMessageDatabase, IMessageInbox, IMessageOutbox, IMessageStoreAdmin, IDeadLetters, IScheduledMessages, ISagaSupport, ISagaSchemaSupplier, IExternalDbTransportStore where T : DbConnection, new()
 {
     /// <summary>
     /// GH-4375. The most parameters this provider accepts in one command. Batched durability commands
@@ -102,6 +103,7 @@ public abstract partial class MessageDatabase<T> : DatabaseBase<T>,
 
         IncomingFullName = this.TableNameFor(DatabaseConstants.IncomingTable);
         OutgoingFullName = this.TableNameFor(DatabaseConstants.OutgoingTable);
+        DeduplicationFullName = this.TableNameFor(DeduplicationTableNameFor(settings));
 
         Durability = settings;
         _cancellation = settings.Cancellation;
@@ -158,10 +160,16 @@ public abstract partial class MessageDatabase<T> : DatabaseBase<T>,
         // claims its id in that store, so that the claim and the work it guards land in one
         // transaction; a claim that went to the Main store instead could commit while the ancillary
         // transaction rolled back.
-        if (settings.EnableMessageDeduplication)
+        if (settings.MessageDeduplicationMode != MessageDeduplicationMode.None)
         {
             // ReSharper disable once VirtualMemberCallInConstructor
             Deduplication = BuildDeduplicationStore();
+        }
+
+        // GH-4742. Every store role, like the deduplication store above.
+        if (settings.EnableDeduplicatedResponses)
+        {
+            _deduplicatedResponses = buildDeduplicatedResponseStore();
         }
 
         // Recurring-message tracking (see IRecurringMessageStore) — Main store only, like the
@@ -177,17 +185,49 @@ public abstract partial class MessageDatabase<T> : DatabaseBase<T>,
     }
 
     /// <summary>
+    /// GH-4757. Which of the two deduplication tables <paramref name="settings" />' mode uses.
+    ///
+    /// <para>
+    /// The modes do not share a table, and that is deliberate: the hash mode's arbitrating key is a
+    /// BINARY column, and moving a primary key onto one is the migration Weasel cannot express under
+    /// <c>CreateOrUpdate</c>. Two tables means an application that switches modes leaves the other one
+    /// intact -- its claims expiring on their own schedule -- and can switch back without losing any.
+    /// </para>
+    ///
+    /// <para>
+    /// Returns the original table's name for <see cref="MessageDeduplicationMode.None" /> too. Nothing
+    /// reads it in that mode (no store is built and no table is provisioned), and answering with a name
+    /// rather than null keeps every caller free of a null check.
+    /// </para>
+    /// </summary>
+    protected static string DeduplicationTableNameFor(DurabilitySettings settings)
+    {
+        return settings.MessageDeduplicationMode == MessageDeduplicationMode.CompareByHash
+            ? DatabaseConstants.HashedDeduplicationTableName
+            : DatabaseConstants.DeduplicationTableName;
+    }
+
+    /// <summary>
     /// Factory hook for the per-database <see cref="IDeduplicationStore" /> when
-    /// <see cref="DurabilitySettings.EnableMessageDeduplication" /> is set. The default returns
+    /// <see cref="DurabilitySettings.MessageDeduplicationMode" /> is set. The default returns
     /// <see cref="RdbmsDeduplicationStore" />, which is portable across every provider that uses
     /// <c>@</c>-prefixed bind variables and <see cref="DbDataSource" />-driven command creation
-    /// (Postgres, SqlServer, MySQL, SQLite). Oracle supplies its own.
+    /// (Postgres, SqlServer, MySQL, SQLite).
+    ///
+    /// <para>
+    /// Oracle has NO logical deduplication: <c>OracleMessageStore</c> does not derive from this class and
+    /// supplies no implementation of its own, so it keeps <see cref="NullDeduplicationStore" /> and a
+    /// <c>[Deduplicated]</c> chain on it throws at the first message. That is the intended outcome for an
+    /// unsupported store — see <see cref="IDeduplicationStore.Enabled" /> — but it is a gap rather than a
+    /// design, and it is tracked separately.
+    /// </para>
     /// </summary>
     protected virtual IDeduplicationStore BuildDeduplicationStore()
     {
         return new RdbmsDeduplicationStore(_dataSource,
-            QuotedTableNameFor(DatabaseConstants.DeduplicationTableName), IsUniqueConstraintViolation,
-            BatchedDeleteExpiredDeduplicationClaimsSql, Durability.DeduplicationCleanupBatchSize);
+            QuotedTableNameFor(DeduplicationTableNameFor(Durability)), IsUniqueConstraintViolation,
+            BatchedDeleteExpiredDeduplicationClaimsSql, Durability.DeduplicationCleanupBatchSize,
+            Durability.MessageDeduplicationMode);
     }
 
     /// <inheritdoc />
@@ -230,6 +270,13 @@ public abstract partial class MessageDatabase<T> : DatabaseBase<T>,
 
     public MessageStoreRole Role { get; private set; }
 
+    /// <summary>
+    /// GH-4902. Declared here, where the relational stores implement <see cref="IMessageStore"/>, so a provider can
+    /// override it: a property declared only on a derived class would not replace the interface's default.
+    /// No preference by default.
+    /// </summary>
+    public virtual EnvelopeIdGeneration? PreferredEnvelopeIdGeneration => null;
+
     public override string ToString()
     {
         return $"{Uri} ({Name})";
@@ -260,7 +307,32 @@ public abstract partial class MessageDatabase<T> : DatabaseBase<T>,
 
     public string IncomingFullName { get; private set; }
 
+    /// <summary>
+    /// GH-4505. The rendered identifier for the logical deduplication table, on the same terms as
+    /// <see cref="IncomingFullName" />. Exposed so that a store integration can write a claim inside its
+    /// OWN transaction — Marten queues an INSERT against this name onto the document session's unit of
+    /// work — rather than through <see cref="IDeduplicationStore" />, which opens its own connection and
+    /// therefore commits independently of whatever the handler is doing.
+    /// </summary>
+    public string DeduplicationFullName { get; private set; }
+
     public DurabilitySettings Durability { get; }
+
+    /// <summary>
+    /// GH-5022. The SET fragment that restarts an inbox row's <see cref="DurabilitySettings.InboxStaleTime" />
+    /// clock when a node claims it: recovery reassignment, or promotion of a due scheduled envelope. The stale
+    /// sweep releases owned rows by <c>timestamp</c>, which was only ever the insert default, so a claimed row
+    /// kept the age of its first write and was released again at once. Empty unless InboxStaleTime is set,
+    /// because the column only exists then; read per statement, never baked into a constructor (GH-4216).
+    /// </summary>
+    protected string restartIncomingStaleClock => Durability.InboxStaleTime.HasValue
+        ? $", {DatabaseConstants.Timestamp} = {currentTimestampSql}"
+        : string.Empty;
+
+    /// <summary>
+    /// The database's current time, as this provider's <c>timestamp</c> column default writes it
+    /// </summary>
+    protected virtual string currentTimestampSql => "CURRENT_TIMESTAMP";
 
     public string Name { get; set; } = TransportConstants.Default;
     public void PromoteToMain(IWolverineRuntime runtime)
@@ -299,6 +371,7 @@ public abstract partial class MessageDatabase<T> : DatabaseBase<T>,
 
             IncomingFullName = QuotedTableNameFor(DatabaseConstants.IncomingTable);
             OutgoingFullName = QuotedTableNameFor(DatabaseConstants.OutgoingTable);
+            DeduplicationFullName = QuotedTableNameFor(DeduplicationTableNameFor(Durability));
         }
     }
 
@@ -435,13 +508,27 @@ public abstract partial class MessageDatabase<T> : DatabaseBase<T>,
 
     public abstract Task<bool> ExistsAsync(Envelope envelope, CancellationToken cancellation);
 
+    /// <summary>
+    /// GH-4739. The redundant-looking `owner_id &lt;&gt; 0` is what makes the GH-3971 owner index usable here.
+    /// That index is FILTERED on `owner_id &lt;&gt; 0`, and SQL Server will not use a filtered index for a
+    /// parameterized `owner_id = @owner` because the cached plan has to stay correct for @owner = 0 --
+    /// so without the extra clause this update was a clustered index scan of the whole inbox regardless
+    /// of the data, measured at 6,748 logical reads against 3 with only 20k retained Handled rows. Same
+    /// idiom, same reason, as <see cref="Durability.BumpStaleIncomingEnvelopesOperation"/>. Harmless on
+    /// the providers whose owner index is unfiltered, and free insurance on PostgreSQL, where constant
+    /// folding saves the predicate today but an Npgsql MaxAutoPrepare generic plan would not.
+    ///
+    /// Deliberately NOT short-circuited for ownerId == 0: the InboxHealthRestarter probe
+    /// (<see cref="Wolverine.Transports.ListeningAgent"/>) passes 0 precisely so this stays a real
+    /// round-trip that throws when the store is unreachable.
+    /// </summary>
     public async Task ReleaseIncomingAsync(int ownerId, Uri receivedAt)
     {
         if (HasDisposed) return;
 
         var impacted = await _dataSource
             .CreateCommand(
-                $"update {QuotedTableNameFor(DatabaseConstants.IncomingTable)} set owner_id = 0 where owner_id = @owner and {DatabaseConstants.ReceivedAt} = @uri")
+                $"update {QuotedTableNameFor(DatabaseConstants.IncomingTable)} set owner_id = 0 where owner_id = @owner and owner_id <> 0 and {DatabaseConstants.ReceivedAt} = @uri")
             .With("owner", ownerId)
             .With("uri", receivedAt.ToString())
             .ExecuteNonQueryAsync(_cancellation);
@@ -497,6 +584,18 @@ public abstract partial class MessageDatabase<T> : DatabaseBase<T>,
         return agent;
     }
 
+    protected abstract Task<bool> TryAttainLockAsync(int lockId, T connection, CancellationToken token);
+
+    /// <summary>
+    /// Releases a previously-acquired session-scoped advisory lock. Default
+    /// implementation is a no-op for providers (e.g., SQLite) where the lock
+    /// is automatically released when the connection closes.
+    /// </summary>
+    protected virtual Task ReleaseLockAsync(int lockId, T connection, CancellationToken token)
+    {
+        return Task.CompletedTask;
+    }
+
     public async ValueTask<ISagaStorage<TId, TSaga>> EnrollAndFetchSagaStorage<TId, TSaga>(MessageContext context) where TSaga : Saga
     {
         var conn = CreateConnection();
@@ -519,4 +618,65 @@ public abstract partial class MessageDatabase<T> : DatabaseBase<T>,
     }
 
     public abstract IDatabaseSagaSchema<TId, TSaga> SagaSchemaFor<TSaga, TId>() where TSaga : Saga;
+
+    /// <summary>
+    ///     GH-4805. Keyed by (saga type, identity type) rather than saga type alone: the per-store
+    ///     <c>_sagaStorage</c> caches key on the saga type and then re-check the cast, which silently
+    ///     rebuilds on a mismatch. Nothing stops a saga type being asked for under two identity types in
+    ///     the same process, and a tuple key makes that cheap instead of pathological.
+    /// </summary>
+    private ImHashMap<(Type, Type), IDatabaseSagaSchema> _factoryBuiltSagaSchemas =
+        ImHashMap<(Type, Type), IDatabaseSagaSchema>.Empty;
+
+    /// <summary>
+    ///     GH-4805. The Native AOT-safe twin of <see cref="EnrollAndFetchSagaStorage{TId,TSaga}(MessageContext)" />:
+    ///     identical connection, transaction and outbox handling, but the schema comes from a factory the
+    ///     caller supplies rather than from the <c>abstract</c> generic <see cref="SagaSchemaFor{TSaga,TId}" />,
+    ///     whose generic-virtual dispatch NativeAOT cannot resolve. See <see cref="ISagaSchemaSupplier" />
+    ///     for the measurement behind that.
+    /// </summary>
+    public async ValueTask<ISagaStorage<TId, TSaga>> EnrollAndFetchSagaStorage<TId, TSaga>(
+        MessageContext context,
+        Func<SagaTableDefinition, DatabaseSettings, IDatabaseSagaSchema<TId, TSaga>> factory) where TSaga : Saga
+    {
+        var conn = CreateConnection();
+        await conn.OpenAsync(_cancellation);
+        try
+        {
+            var tx = await conn.BeginTransactionAsync(_cancellation);
+
+            var schema = sagaSchemaFromFactory(factory);
+
+            var transaction = new DatabaseEnvelopeTransaction(this, tx);
+            await context.EnlistInOutboxAsync(transaction);
+            return new DatabaseSagaStorage<TId, TSaga>(conn, tx, schema);
+        }
+        catch (Exception)
+        {
+            await conn.CloseAsync();
+            throw;
+        }
+    }
+
+    private IDatabaseSagaSchema<TId, TSaga> sagaSchemaFromFactory<TId, TSaga>(
+        Func<SagaTableDefinition, DatabaseSettings, IDatabaseSagaSchema<TId, TSaga>> factory) where TSaga : Saga
+    {
+        var key = (typeof(TSaga), typeof(TId));
+
+        if (_factoryBuiltSagaSchemas.TryFind(key, out var cached))
+        {
+            return (IDatabaseSagaSchema<TId, TSaga>)cached;
+        }
+
+        // Same shape the per-store SagaSchemaFor overrides build, so a saga's table is identical whichever
+        // path reached it. The table NAME is part of SagaTableDefinition, so this must stay in sync with
+        // them -- it is deliberately the same two arguments.
+        var schema = factory(new SagaTableDefinition(typeof(TSaga), null), _settings);
+
+        // Plain assignment, not CompareExchange: a race here builds one extra schema object and the loser
+        // is discarded, which is exactly how the per-store caches already behave.
+        _factoryBuiltSagaSchemas = _factoryBuiltSagaSchemas.AddOrUpdate(key, schema);
+
+        return schema;
+    }
 }

@@ -10,6 +10,7 @@ using Wolverine.Runtime.Deduplication;
 using Wolverine.Runtime.Partitioning;
 using Wolverine.Runtime.RemoteInvocation;
 using Wolverine.Runtime.Scheduled;
+using Wolverine.Runtime.Agents;
 using Wolverine.Runtime.Serialization;
 using Wolverine.Transports;
 using Wolverine.Transports.Local;
@@ -25,6 +26,7 @@ public class MessageRoute : IMessageRoute, IMessageInvoker
 
     private readonly IReplyTracker _replyTracker;
     private readonly MessagePartitioningRules _partitioning;
+    private readonly IWolverineRuntime _runtime;
     private protected readonly Endpoint _endpoint;
 
     /// <summary>
@@ -57,14 +59,13 @@ public class MessageRoute : IMessageRoute, IMessageInvoker
         _replyTracker = runtime.Replies;
         _partitioning = runtime.Options.MessagePartitioning;
 
-        if (WolverineSystemPart.WithinDescription)
+        _runtime = runtime;
+
+        if (!WolverineSystemPart.WithinDescription)
         {
-            Sender = endpoint.Agent!;
-        }
-        else
-        {
-            // Might need to force it to build out the sending agent if this is the first time it's been used
-            Sender = endpoint.Agent ?? runtime.Endpoints.GetOrBuildSendingAgent(endpoint.Uri) ?? throw new ArgumentOutOfRangeException(nameof(endpoint), $"Endpoint {endpoint.Uri} does not have an active sending agent. Message type: {messageType.FullNameInCode()}");
+            // Might need to force it to build out the sending agent if this is the first time it's been used.
+            // The agent is deliberately NOT captured here -- see the Sender property.
+            _ = endpoint.Agent ?? runtime.Endpoints.GetOrBuildSendingAgent(endpoint.Uri) ?? throw new ArgumentOutOfRangeException(nameof(endpoint), $"Endpoint {endpoint.Uri} does not have an active sending agent. Message type: {messageType.FullNameInCode()}");
         }
 
         IsLocal = endpoint is LocalQueue;
@@ -76,7 +77,15 @@ public class MessageRoute : IMessageRoute, IMessageInvoker
             // throws MissingMethodException under Native AOT -- and this route is built for
             // FailureAcknowledgement on any app with an external endpoint, so closing it here killed
             // every AOT-published app at startup.
-            Serializer = IntrinsicSerializer.Instance.SerializerFor(messageType);
+            // GH-4720: an agent command is a list of agent URIs, which at cluster scale is both large and
+            // extremely compressible (measured 3.9x-24x). The compressed form is a SEPARATE content type, so
+            // the receiving node selects it by the content type on the envelope rather than by sniffing the
+            // payload -- and a node too old to know that content type fails to find a serializer by name
+            // instead of misparsing gzip bytes as UTF-8.
+            Serializer = runtime.Options.Durability.CompressAgentCommands
+                         && messageType.CanBeCastTo(typeof(IAgentCommand))
+                ? CompressedIntrinsicSerializer.Instance
+                : IntrinsicSerializer.Instance.SerializerFor(messageType);
         }
         else if (WolverineSystemPart.WithinDescription)
         {
@@ -109,7 +118,36 @@ public class MessageRoute : IMessageRoute, IMessageInvoker
     public bool IsLocal { get; }
 
     public IMessageSerializer Serializer { get; } = null!;
-    public ISendingAgent Sender { get; } = null!;
+    /// <summary>
+    ///     The sending agent for this route's endpoint, resolved on every read rather than captured once at
+    ///     construction. GH-4868: the idle sending agent reaper (GH-1908) disposes the agent of any non-durable
+    ///     endpoint that has been quiet for <see cref="DurabilitySettings.SendingAgentIdleTimeout" />, and
+    ///     <c>EndpointCollection.RemoveSendingAgentAsync</c> clears <see cref="Endpoint.Agent" /> so the next use
+    ///     rebuilds it (GH-3955). But this route is cached for the life of the process -- in
+    ///     <see cref="Endpoint.Routes" /> and in <c>MessageRouterBase</c> -- so a captured agent outlived its own
+    ///     disposal, and every later <c>InvokeAsync</c> through it (which is how every node agent command reaches
+    ///     a peer's control queue) was posted onto a completed block and silently dropped. One null check per
+    ///     read is the whole cost.
+    /// </summary>
+    public ISendingAgent Sender
+    {
+        get
+        {
+            var agent = _endpoint.Agent;
+            if (agent != null)
+            {
+                return agent;
+            }
+
+            // Description mode never builds agents, and CreateForSending tolerates the null
+            if (WolverineSystemPart.WithinDescription)
+            {
+                return null!;
+            }
+
+            return _runtime.Endpoints.GetOrBuildSendingAgent(_endpoint.Uri);
+        }
+    }
 
     public IList<IEnvelopeRule> Rules { get; } = new List<IEnvelopeRule>();
 
@@ -205,7 +243,8 @@ public class MessageRoute : IMessageRoute, IMessageInvoker
             else if (!sender.SupportsNativeScheduledSendFor(envelope, utcNow))
             {
                 runtime.Logger.LogDebug("Envelope {EnvelopeId} ({MessageType}) wrapped for durable scheduled send to {Destination} (transport does not support native scheduling for this envelope)", envelope.Id, envelope.MessageType, envelope.Destination);
-                return envelope.ForScheduledSend(localDurableQueue);
+                return envelope.ForScheduledSend(localDurableQueue ?? throw new InvalidOperationException(
+                    $"Unable to schedule a {MessageType.FullNameInCode()} message for later delivery to {envelope.Destination} because that transport does not support native scheduling and there is no local durable queue in Durability.Mode {runtime.Options.Durability.Mode}"));
             }
             else
             {
@@ -214,7 +253,7 @@ public class MessageRoute : IMessageRoute, IMessageInvoker
         }
         else
         {
-            envelope.OwnerId = runtime.Options.Durability.AssignedNodeNumber;
+            envelope.OwnerId = runtime.Options.Durability.OutgoingOwnerId;
         }
 
         return envelope;
@@ -303,6 +342,14 @@ public class MessageRoute : IMessageRoute, IMessageInvoker
     protected virtual async Task<T> sendAndAwaitReplyAsync<T>(Envelope envelope, MessageBus bus,
         CancellationToken cancellation, TimeSpan timeout)
     {
+        // GH-5016: the serverless modes start no listeners, so nothing would ever bring a brokered reply back, and
+        // the caller would set off the remote handler and then wait out the whole timeout
+        if (bus.Runtime.Options.Durability.Mode is DurabilityMode.Serverless or DurabilityMode.ServerlessWithOutbox)
+        {
+            throw new InvalidOperationException(
+                $"Request/reply to {_endpoint.Uri} needs a listener to receive the reply, and DurabilityMode.{bus.Runtime.Options.Durability.Mode} runs no listeners. Use a transport that returns the reply in the same exchange, like Wolverine's HTTP transport, or send the message without waiting for a reply");
+        }
+
         var waiter = _replyTracker.RegisterListener<T>(envelope, cancellation, timeout);
 
         await Sender.EnqueueOutgoingAsync(envelope);

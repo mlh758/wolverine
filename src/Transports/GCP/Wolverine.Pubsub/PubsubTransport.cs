@@ -19,7 +19,40 @@ public class PubsubTransport : BrokerTransport<PubsubEndpoint>, IAsyncDisposable
 
     public readonly LightweightCache<string, PubsubEndpoint> Topics;
 
+    /// <summary>
+    /// GH-4526. Listener endpoints on their own subscription to a topic in <see cref="Topics"/>, one per
+    /// separated handler under MultipleHandlerBehavior.Separated. Keyed by Uri, since several share a topic
+    /// </summary>
+    public readonly List<PubsubEndpoint> Subscriptions = new();
+
+    /// <summary>
+    /// GH-4526. Find or create the endpoint that listens on <paramref name="subscriptionName"/> to the topic
+    /// <paramref name="topicName"/>, distinct from the topic endpoint that publishes to it
+    /// </summary>
+    public PubsubEndpoint SubscriptionFor(string topicName, string subscriptionName)
+    {
+        var existing = Subscriptions.FirstOrDefault(x =>
+            x.Server.Topic.Name.TopicId == topicName && x.Server.Subscription.Name.SubscriptionId == subscriptionName);
+        if (existing != null)
+        {
+            return existing;
+        }
+
+        var endpoint = new PubsubEndpoint(topicName, subscriptionName, this);
+        Subscriptions.Add(endpoint);
+        return endpoint;
+    }
+
     internal int AssignedNodeNumber;
+
+    // Every Solo node is node 1 (#3188), so a Solo node keys on its always-unique UniqueNodeId instead, the same
+    // way the per-node response endpoint does (#3189)
+    internal string? SoloNodeId;
+
+    /// <summary>
+    ///     Suffix for an opted-in per-node subscription (GH-4615)
+    /// </summary>
+    internal string NodeIdentifier => SoloNodeId ?? Math.Abs(AssignedNodeNumber).ToString();
     public PubsubDeadLetterOptions DeadLetter = new();
     public EmulatorDetection EmulatorDetection = EmulatorDetection.None;
 
@@ -141,6 +174,9 @@ public class PubsubTransport : BrokerTransport<PubsubEndpoint>, IAsyncDisposable
             await ConfigureSubscriberApiBuilder(subApiBuilder);
 
         AssignedNodeNumber = runtime.DurabilitySettings.AssignedNodeNumber;
+        SoloNodeId = runtime.Options.Durability.Mode == DurabilityMode.Solo
+            ? runtime.Options.UniqueNodeId.ToString("N")
+            : null;
         PublisherApiClient = await pubBuilder.BuildAsync();
         SubscriberApiClient = await subApiBuilder.BuildAsync();
 
@@ -179,12 +215,12 @@ public class PubsubTransport : BrokerTransport<PubsubEndpoint>, IAsyncDisposable
 
     protected override IEnumerable<Endpoint> explicitEndpoints()
     {
-        return Topics;
+        return Topics.Concat(Subscriptions);
     }
 
     protected override IEnumerable<PubsubEndpoint> endpoints()
     {
-        var dlNames = Topics.Select(x => x.DeadLetterName).Where(x => x.IsNotEmpty()).Distinct().ToArray();
+        var dlNames = Topics.Concat(Subscriptions).Select(x => x.DeadLetterName).Where(x => x.IsNotEmpty()).Distinct().ToArray();
 
         foreach (var dlName in dlNames)
         {
@@ -202,18 +238,33 @@ public class PubsubTransport : BrokerTransport<PubsubEndpoint>, IAsyncDisposable
             dl.Server.Subscription.Options = DeadLetter.Subscription;
         }
 
-        return Topics;
+        return Topics.Concat(Subscriptions);
     }
 
     protected override PubsubEndpoint findEndpointByUri(Uri uri)
     {
         if (uri.Scheme != Protocol)
         {
-            throw new ArgumentOutOfRangeException(nameof(uri));
+            throw new ArgumentOutOfRangeException(nameof(uri),
+                $"Google Cloud Pub/Sub Uris must use the format '{Protocol}://{{projectId}}/{{topicName}}' or '{Protocol}://{{projectId}}/{{topicName}}/{{subscriptionName}}': {uri}");
         }
 
-        return Topics.FirstOrDefault(x => x.Uri.OriginalString == uri.OriginalString) ??
-               Topics[uri.Segments[1].TrimEnd('/')];
+        // GH-4526: a per-handler subscription endpoint shares its topic with a topic endpoint, so a lookup that
+        // fell back to the topic name alone would hand back the wrong one
+        var exact = Topics.FirstOrDefault(x => x.Uri.OriginalString == uri.OriginalString)
+                    ?? Subscriptions.FirstOrDefault(x => x.Uri.OriginalString == uri.OriginalString);
+        if (exact != null)
+        {
+            return exact;
+        }
+
+        var topicName = uri.Segments[1].TrimEnd('/');
+        if (uri.Segments.Length > 2)
+        {
+            return SubscriptionFor(topicName, uri.Segments[2].TrimEnd('/'));
+        }
+
+        return Topics[topicName];
     }
 
     protected override void tryBuildSystemEndpoints(IWolverineRuntime runtime)

@@ -162,6 +162,54 @@ public static class GenerationRulesExtensions
     }
 
     /// <summary>
+    ///     The provider that owns this chain's transaction, for the explicit <c>[Transactional]</c> path.
+    ///     GH-4631.
+    /// </summary>
+    /// <remarks>
+    ///     <see cref="GetPersistenceProviders" /> answers with the first provider in consultation order,
+    ///     which on a chain that depends on two stores is a coin toss the developer never called — the
+    ///     other store's buffered writes are dropped with no diagnostic. This asks for a designation
+    ///     instead, and fails naming both candidates when there is none. Saga chains keep the
+    ///     first-ordered answer, since <see cref="SagaChain" /> resolves its persistence from the saga's
+    ///     own state storage rather than from the chain's dependencies.
+    /// </remarks>
+    internal static IPersistenceFrameProvider SelectTransactionOwner(this GenerationRules rules, IChain chain,
+        IServiceContainer container)
+    {
+        return rules.TrySelectTransactionOwner(chain, container, out var owner) ? owner : _nullo;
+    }
+
+    /// <summary>
+    ///     <see cref="SelectTransactionOwner" />, but saying whether a real owner was found rather than
+    ///     leaving the caller to infer it. GH-4717.
+    /// </summary>
+    /// <remarks>
+    ///     <c>[Transactional]</c> needs to know, because it sets <see cref="IChain.IsTransactional" /> and
+    ///     must not claim a transaction the fallback provider never applied (GH-4716). It used to infer that
+    ///     from the returned provider's own <c>CanApply</c>, which was sound only while <c>CanApply</c> was
+    ///     the single gate. It is not any more: a chain whose store is reachable only through a load
+    ///     attribute is claimed through <see cref="DeclarativeLoadDependencies.ProvidersClaiming" /> by a
+    ///     provider whose <c>CanApply</c> answers false, and inferring from it would apply a real
+    ///     transaction and then report the chain as non-transactional.
+    /// </remarks>
+    internal static bool TrySelectTransactionOwner(this GenerationRules rules, IChain chain,
+        IServiceContainer container, out IPersistenceFrameProvider owner)
+    {
+        // GH-4717: ProvidersClaiming, not a bare CanApply filter. CanApply answers from ServiceDependencies,
+        // which cannot see a store a chain reaches only through [Entity] and its siblings.
+        var potentials = rules.OrderedPersistenceProviders().ProvidersClaiming(chain, container);
+
+        if (potentials.Count > 1 && chain is not SagaChain)
+        {
+            owner = TransactionOwnerResolution.SelectDesignatedOwner(chain, potentials, container);
+            return true;
+        }
+
+        owner = potentials.FirstOrDefault() ?? _nullo;
+        return potentials.Count != 0;
+    }
+
+    /// <summary>
     ///     The currently known strategy for code generating transaction middleware
     /// </summary>
     public static IPersistenceFrameProvider GetPersistenceProviders(this GenerationRules rules, IChain chain,
@@ -169,7 +217,8 @@ public static class GenerationRulesExtensions
     {
         if (rules.Properties.TryGetValue(PersistenceKey, out var raw) && raw is List<IPersistenceFrameProvider>)
         {
-            return rules.OrderedPersistenceProviders().FirstOrDefault(x => x.CanApply(chain, container)) ?? _nullo;
+            // GH-4717: same reason as SelectTransactionOwner above.
+            return rules.OrderedPersistenceProviders().ProvidersClaiming(chain, container).FirstOrDefault() ?? _nullo;
         }
 
         return _nullo;

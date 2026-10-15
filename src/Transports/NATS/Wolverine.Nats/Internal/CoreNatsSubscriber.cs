@@ -1,6 +1,8 @@
 using Microsoft.Extensions.Logging;
 using NATS.Client.Core;
+using Wolverine.Runtime.RemoteInvocation;
 using Wolverine.Transports;
+using Wolverine.Util;
 
 namespace Wolverine.Nats.Internal;
 
@@ -65,6 +67,13 @@ internal class CoreNatsSubscriber : INatsSubscriber
             );
         }
 
+        // The per-request reply subjects (see NatsTransport.WireReplySubjectFor), where NATS delivers its
+        // "no responders" answers
+        if (_endpoint.IsUsedForReplies)
+        {
+            patterns.Add($"{_endpoint.Subject}.>");
+        }
+
         foreach (var pattern in patterns)
         {
             IAsyncDisposable subscription;
@@ -99,9 +108,34 @@ internal class CoreNatsSubscriber : INatsSubscriber
                         {
                             try
                             {
+                                // NATS answers a request that reached no subscriber with an empty 503 status
+                                // message on the request's reply subject
+                                if (msg.HasNoResponders)
+                                {
+                                    if (_endpoint.IsUsedForReplies)
+                                    {
+                                        await failRequestWithoutRespondersAsync(listener, receiver, msg);
+                                    }
+
+                                    continue;
+                                }
+
                                 // Skip messages without data
                                 if (msg.Data == null || msg.Data.Length == 0)
-                                { 
+                                {
+                                    continue;
+                                }
+
+                                // A native scheduling control message published to a stream subject this
+                                // wildcard covers. The server stores the message it materializes at the due
+                                // time in the stream without publishing it to core subscriptions, so there is
+                                // nothing for a core listener to handle
+                                if (msg.Headers?.ContainsKey(JetStreamPublisher.NatsScheduleHeader) == true)
+                                {
+                                    _logger.LogDebug(
+                                        "Skipping the NATS schedule control message on subject {Subject}",
+                                        msg.Subject
+                                    );
                                     continue;
                                 }
 
@@ -120,7 +154,11 @@ internal class CoreNatsSubscriber : INatsSubscriber
                                 }
 
                                 var envelope = new NatsEnvelope(msg, null);
-                                _mapper.MapIncomingToEnvelope(envelope, msg);
+                                _mapper.MapIncoming(envelope, msg);
+
+                                // A request's reply has to go to its exact wire reply subject, which is all a
+                                // responder limited to allow_responses may publish to
+                                _endpoint.RememberWireReplySubject(envelope, msg.ReplyTo);
 
                                 await receiver.ReceivedAsync(listener, envelope);
                             }
@@ -149,17 +187,52 @@ internal class CoreNatsSubscriber : INatsSubscriber
         }
     }
 
+    /// <summary>
+    /// A "no responders" answer on a per-request reply subject ends the waiting <c>InvokeAsync()</c> right away
+    /// with a <see cref="FailureAcknowledgement"/>, exactly as a failure reply from a responder would, instead of
+    /// leaving it to run into its timeout.
+    /// </summary>
+    private async Task failRequestWithoutRespondersAsync(IListener listener, IReceiver receiver, NatsMsg<byte[]> msg)
+    {
+        var prefix = _endpoint.Subject + ".";
+        if (!msg.Subject.StartsWith(prefix, StringComparison.Ordinal) ||
+            !Guid.TryParseExact(msg.Subject.AsSpan(prefix.Length), "N", out var requestId))
+        {
+            _logger.LogDebug("Ignoring a NATS 'no responders' status on {Subject}, which names no request", msg.Subject);
+            return;
+        }
+
+        _logger.LogDebug("NATS reported no responders for request {RequestId}, failing the waiting call", requestId);
+
+        var envelope = new NatsEnvelope(msg, null)
+        {
+            ConversationId = requestId,
+            IsResponse = true,
+            MessageType = typeof(FailureAcknowledgement).ToMessageTypeName(),
+            Message = new FailureAcknowledgement
+            {
+                RequestId = requestId,
+                Message =
+                    $"NATS reported no responders for request {requestId}: no subscriber is listening to the subject it was sent to"
+            }
+        };
+
+        await receiver.ReceivedAsync(listener, envelope);
+    }
+
     public async Task RepublishAsync(NatsEnvelope envelope, CancellationToken cancellation)
     {
         // Increment attempts before republishing for requeue support
         envelope.Attempts++;
         
-        // Republish the message to the same subject for requeue support
+        // Republish the message to the subject it arrived on for requeue support. The listener's own subject would
+        // drop a tenant prefix -- and with it the tenant, when the tenant-id header is not trusted -- and can be a
+        // wildcard nothing can be published to
         var headers = new NatsHeaders();
         _mapper.MapEnvelopeToOutgoing(envelope, headers);
-        
+
         await _connection.PublishAsync(
-            _endpoint.Subject,
+            envelope.CoreMsg?.Subject ?? _endpoint.Subject,
             envelope.Data,
             headers,
             cancellationToken: cancellation
