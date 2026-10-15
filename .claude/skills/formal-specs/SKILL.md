@@ -6,11 +6,14 @@ description: Run, iterate on, and extend the P model-checker specs under formal/
 # Running the P specs under `formal/`
 
 The specs live in `formal/<topic>/` (`leader-election/`, `agent-assignment/`,
-`rolling-deploy/`). Each is a `*Model.p` / `*Spec.p` / `*Test.p` triple plus a README with
-a results table and a **mutant ledger**. See `formal/README.md` for the why; this skill is
-the how. Note `rolling-deploy/` models the GH-3987 *proposal* (stability-gated rebalance +
-assigned-vs-running reconcile), not shipped code — implementing that issue should follow
-the model, and divergence belongs in its README's honesty notes.
+`agent-dispatch/`, `rolling-deploy/`). Each is a `*Model.p` / `*Spec.p` / `*Test.p` triple
+plus a README with a results table and a **mutant ledger**. See `formal/README.md` for the
+why; this skill is the how. `leader-election/` and `agent-assignment/` track the shipped
+code (last synced to `origin/main` at 6.50.2, 2026-10-15 — leadership eligibility, the
+reconcile sweep, the takeover hold); `rolling-deploy/` models the GH-3987 + GH-3959
+*proposal* and its README maps what shipped instead; `agent-dispatch/` is partial. The
+user-facing description of the mechanism, with sequence diagrams, is
+`docs/guide/durability/leadership-and-agent-distribution.md`.
 
 ## Toolchain: always use the nix shell
 
@@ -112,8 +115,11 @@ A passing spec proves nothing until you show breaking the design breaks the mode
 
 ## When to touch these specs
 
-If a change lands in `NodeAgentController` (election, heartbeat, stale-eject, step-down) or on
-the assignment plane (`AssignmentGrid`, `EvaluateAssignments`, the duplicate healer,
-resurrection), update the corresponding model — or, if it's out of the model's stated scope,
-say so in that README's "left out" / honesty notes. A green model that no longer matches the
-code is worse than no model.
+If a change lands in `NodeAgentController` (election, heartbeat, stale-eject, step-down,
+the `CanLead` gate, the takeover/cold-start holds, `ReconcileLocalAgentsAsync`) or on the
+assignment plane (`AssignmentGrid`, `EvaluateAssignments`, the pending ledger, the
+duplicate healer, resurrection), update the corresponding model — or, if it's out of the
+model's stated scope, say so in that README's "left out" / honesty notes — and keep the
+sequence diagrams in `docs/guide/durability/leadership-and-agent-distribution.md` in step.
+A green model that no longer matches the code is worse than no model. A quick way to see
+what moved: `git diff <last-sync-sha>..origin/main --stat -- src/Wolverine/Runtime/Agents/`.

@@ -17,7 +17,9 @@ gap and must be solved together; this spec is that joint design. See
 Unlike the sibling specs, this one is not a model of the code as it stands. It is the
 **written proposal as an executable model**: the committed model includes three design
 changes, the checker shows the design with them is sound, and the mutant ledger shows that
-removing any of them reproduces the reported failures as counterexamples.
+removing any of them reproduces the reported failures as counterexamples. All three have
+since shipped in a different shape — see [What shipped instead](#what-shipped-instead-status-as-of-6-50-2-october-2026)
+before reading the proposal sections as a description of the code.
 
 1. **Stability-gated rebalancing** (GH-3987 asks 1 and 2). Moves of *running* agents —
    rebalance-for-evenness decisions — are gated on "membership has been stable for the
@@ -493,6 +495,25 @@ gate.
 - *Suspension hooks exist but nothing wires them to membership events* — Orleans leaves
   "don't rebalance during a deploy" to the operator. GH-3987's whole point is that the
   operator shouldn't have to; the stability gate automates it.
+
+## What shipped instead (status as of 6.50.2, October 2026)
+
+This spec stays a model of the *proposal*. The code took each of its three fixes in a different
+shape, and the model has deliberately not been rewritten to follow — the
+[`agent-assignment`](../agent-assignment/) spec tracks the shipped single-agent mechanics, and
+this one keeps the capacity-and-churn argument checkable in the form it was made. The mapping:
+
+| Proposal (modelled here) | What shipped | Where it diverges |
+| --- | --- | --- |
+| Fix 1: gate **rebalance moves** on a membership-stability window; urgent placement never gated | `AssignmentSettlePeriod` / `MaxAssignmentSettleTime` / `AssignmentSettleNodeCount` (GH-3987): the leader holds the **whole** assignment pass while nodes keep *joining*; a departure assigns immediately. Plus `LeaderColdStartHoldEvaluations` (GH-4569) and `LeaderTakeoverHoldEvaluations` (GH-4897), each a one-evaluation hold on bare first-time placements | The shipped gate holds placement of unowned agents too (the model's "gate-everything" mutant), bounded by the cap and ended by a departure; the model's orphan-never-gated rule survives only as "a departure cancels the wait" and as the takeover hold's orphan exemption. Default is off |
+| Fix 2: node-side assigned-vs-running reconcile every tick, skipping in-flight stops | `ReconcileLocalAgentsAsync` (GH-3987, GH-4407): both directions, acted on after `LocalAgentReconciliationThreshold` (3) consecutive observations, capped per tick, with a stop stamped after the snapshot winning, and a runner with no row restoring its claim insert-if-absent | Shipped verbatim in spirit, with the observation threshold the model does not have. The modelled `stopping` guard is `_stoppingAgents` / `_startingAgents` in the code |
+| Fix 3: per-node capacity as an advertised **slot count**, placement only into headroom, shed above the ceiling, a kill line one above the ceiling | `CapacityAwareAssignment` (GH-3959): each node advertises a **load percentage** from an `INodeLoadMonitor` on every heartbeat; a node at or above `NodeOverloadThreshold` (90) sheds `OverloadShedBatchSize` (1) agents per evaluation when another node can take them, and receives nothing above the threshold minus 10; an agent with nowhere accepting to go waits unassigned on the even paths and goes to the least-loaded node on the capability-matched paths | The number is a percentage with a hysteresis band, not a slot count; the "waits unassigned" rule is a hard line only in `DistributeEvenly` and a preference elsewhere; the pending-ledger start accounting is as modelled |
+
+Not modelled here and not planned: group affinity (`DistributeByGroupAffinity`, GH-3987's
+consolidation of a split database onto the node running most of it, GH-4999's "a partition
+that fits nowhere stays on its incumbent"), warm-up nodes, and the dispatcher's lane
+abandonment for a departed node (GH-4537) — the last is the [`agent-dispatch`](../agent-dispatch/)
+spec's subject.
 
 ## Honesty notes
 

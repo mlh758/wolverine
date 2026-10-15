@@ -82,6 +82,29 @@ out of the roster and returns (the case the ejection hysteresis is for), and a c
 another lane aimed at the departing node. **Until those are modelled, a green run here is not
 evidence that m1/m3/m4's guards can be removed.**
 
+## What the shipped dispatcher has that this model does not (October 2026)
+
+The model was cut against the GH-4537 review rounds. The dispatcher that shipped afterwards
+carries three more mechanisms, none modelled here:
+
+- **`AbandonLane(nodeId)`** — the health check tells the dispatcher a node has left (ejected
+  as stale, or its row gone since the last tick), and the dispatcher drops everything queued
+  in that lane, cancels the executing command, and removes the lane. This is the abandonment
+  the model's `AbandonOp` stands for, now wired to departures on every node.
+- **GH-4901 start withdrawal** — a reassignment aimed at a source whose start for the same
+  agent is still only *queued* (never handed to the node) withdraws that start and sends it
+  straight to the destination's lane instead of stopping something that never ran. The
+  `_starting` / `_withdrawn` / `_handedOver` sets order a lane taking a start up against a
+  withdrawal, and a start that was ever handed over is a re-drive, not a first start, so a
+  later move must stop it at the source. The model's `m3`/`m1` misses are in exactly this
+  territory.
+- **The admission check is now per command, with claims released before ownership** (the
+  `release(); releaseStarts();` order in the lane's `finally`), which is the model's
+  `m5-no-admission-check` and `m2-claim-after-entry` guards, kept.
+
+Until the withdrawal path and the departure-and-return case are modelled, the ledger's
+2-of-5 stands.
+
 ## What it abstracts
 
 - **One agent.** Claim ownership is per-agent; batching only decides which commands compare

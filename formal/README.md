@@ -18,9 +18,10 @@ of why each guard in the code is load-bearing.
 
 | Directory | Models |
 | --- | --- |
-| [`leader-election/`](leader-election/) | `NodeAgentController`'s advisory-lock leader election — crashes, graceful stops, dropped lock sessions, heartbeat blips, and network partitions — converging to exactly one leader |
-| [`agent-assignment/`](agent-assignment/) | single-agent ownership on the real one-row-per-agent schema — the assignment plane under partition heal and leader handover. Carries a committed **bug ledger**: stock settles into permanent duplicates (the deploy-sim GH-3987 shape — the leader dies with a start in flight and its pending ledger, and the new leader re-places the agent; the table can never show the second copy, so the GH-2602 healer is unreachable), and the GH-4297 node-side reconcile sweep is modelled as the toggle that restores convergence |
-| [`rolling-deploy/`](rolling-deploy/) | the joint GH-3987 + GH-3959 **proposal** as an executable model: multi-agent assignment under a rolling deploy, on nodes with finite capacity — a stability-gated rebalance (one rollout, one rebalance), a node-side assigned-vs-running reconcile sweep (an agent left "assigned in `node_assignments` but not running" is healed instead of settling), and a per-node capacity ceiling with a shed pass (a dead node's share is redistributed within the survivors' ceilings or waits visibly — the overload cascade has a floor) |
+| [`leader-election/`](leader-election/) | `NodeAgentController`'s advisory-lock leader election — crashes, graceful stops, dropped lock sessions, heartbeat blips, network partitions, and (GH-4569) nodes that may not lead or lose that right under a lease — converging to exactly one eligible leader |
+| [`agent-assignment/`](agent-assignment/) | single-agent ownership on the real one-row-per-agent schema — the assignment plane under partition heal and leader handover. Tracks the shipped code: the GH-3987 / GH-4407 node-side reconcile sweep with its observation threshold and insert-if-absent claim, and the GH-4897 takeover hold, both as toggles. Carries a committed **bug ledger** for the code before them (pre-6.36): stock settles into permanent duplicates (the deploy-sim GH-3987 shape — the leader dies with a start in flight and its pending ledger, and the new leader re-places the agent; the table can never show the second copy, so the GH-2602 healer is unreachable), and a case that asks whether the takeover hold alone closes it |
+| [`agent-dispatch/`](agent-dispatch/) | `AgentCommandDispatcher`'s claim bookkeeping — can a dispatch that does not own an agent's claim hold, steal or release it — with the lock-free shipped design and a one-lock alternative side by side. Partial: 2 of 5 review defects reproduced |
+| [`rolling-deploy/`](rolling-deploy/) | the joint GH-3987 + GH-3959 **proposal** as an executable model: multi-agent assignment under a rolling deploy, on nodes with finite capacity — a stability-gated rebalance (one rollout, one rebalance), a node-side assigned-vs-running reconcile sweep (an agent left "assigned in `node_assignments` but not running" is healed instead of settling), and a per-node capacity ceiling with a shed pass (a dead node's share is redistributed within the survivors' ceilings or waits visibly — the overload cascade has a floor). All three shipped in a different shape; its README maps them |
 
 ## Toolchain
 
@@ -39,7 +40,9 @@ Use **`-s N`** (`--schedules`) for the schedule count, **not `-i N`** — a misu
 truncates executions mid-settle and reports false liveness "bugs" on a correct model. The
 `formal-specs` skill (`.claude/skills/formal-specs/`) collects this and the other P gotchas.
 
-Each spec's own README has its exact commands, its results, and — importantly — its
+`formal/check-all.sh` runs the leader-election and agent-assignment suites end to end
+(cases, mutants, bounded PEx), one checker at a time, writing to
+`formal/PCheckerOutput/suite/suite.log`. Each spec's own README has its exact commands, its results, and — importantly — its
 **mutant ledger**: a passing model proves nothing until deliberately breaking the design
 is shown to break the model, so every spec records which mutations it catches and, for
 the ones it doesn't, an honest account of which layer actually absorbs them.
@@ -77,8 +80,9 @@ The maintainer has declined the formal models upstream, so everything in this co
 build output — is deliberately kept on the **`p-models`** branch in the `mine` fork
 (`git@github.com:mlh758/wolverine.git`) and is never pushed to `origin`.
 
-`p-models` is a single commit sitting directly on top of `origin/main`, and that is the
-whole trick: day-to-day work happens on branches cut from `p-models`, so the models and
+`p-models` carries the models as a short run of commits on top of `origin/main`, merged
+forward as `main` moves (a `Merge remote-tracking branch 'origin/main' into p-models` each
+time), and that is the whole trick: day-to-day work happens on branches cut from `p-models`, so the models and
 `nix develop` are always at hand, and producing a clean PR branch is one mechanical step
 that drops exactly that one commit and keeps every real change:
 

@@ -7,7 +7,10 @@ upsert), the live set, and the leader identity, serialized. Because the row name
 owner, the store can never show two owners at once, and the GH-2602 "two rows -> stop one"
 healer is structurally unreachable here — exactly as it is against the RDBMS stores. What
 keeps ownership single is the leader's in-memory pending ledger (GH-3698), which dies with
-the leader, plus (when enabled) the node-side reconcile sweep proposed in GH-4297.
+the leader, plus the node-side reconcile sweep that shipped as GH-3987 / GH-4407
+(`ReconcileLocalAgentsAsync`, on by default with a three-tick observation threshold), and
+the GH-4897 takeover hold a newly elected leader applies to bare first-time placements.
+Both are per-test toggles here so the pre-fix behaviour stays checkable as a bug ledger.
 
 Node = one process: its health-check tick and the local fact of running the agent.
 Leadership correctness is assumed (proved by the leader-election spec); here it can move.
@@ -19,7 +22,10 @@ event eGo;
 
 /* A health-check tick's round trip. owner = the row's node_id, 0 = no row. */
 event eSync: (node: machine, id: int);
-event eSyncReply: (owner: int, live: map[int, bool], amLeader: bool, confirmed: bool);
+/* orphan = the row was taken away by an ejection (the owner died or was cut off), as
+   opposed to never having existed: NodeAgentController.OrphanedByStaleNodes, which the
+   takeover hold exempts. Cleared the moment any row lands. */
+event eSyncReply: (owner: int, live: map[int, bool], amLeader: bool, confirmed: bool, orphan: bool);
 
 /* A node writes its OWN row after it starts the agent and removes it after it stops.
    eAddRow is AddAssignmentAsync: an unconditional upsert, last writer wins.
@@ -27,6 +33,9 @@ event eSyncReply: (owner: int, live: map[int, bool], amLeader: bool, confirmed: 
    stale stop can never delete the new owner's row. */
 event eAddRow: (id: int);
 event eRemoveRow: (id: int);
+/* eClaimRow is TryClaimAssignmentAsync (GH-4407): INSERT ... ON CONFLICT DO NOTHING — takes
+   the row only when nobody owns it, never over a peer's write. */
+event eClaimRow: (id: int);
 /* Leader -> store placement decision (AssignAgent), forwarded over a courier. */
 event eAssignReq: (id: int);
 event eRun: (run: bool, epoch: int, version: int);  // store -> node, over a courier so it interleaves
@@ -75,6 +84,7 @@ machine Store {
      needs identity per assignment, not per term. */
   var rowVersion: int;
   var confirmed: bool;
+  var orphan: bool;
   var live: map[int, bool];
   var members: map[int, machine];
   var leader: int;
@@ -117,7 +127,7 @@ machine Store {
            a former leader that rejoins writes under an epoch the row has moved past. */
         epoch = epoch + 1;
       }
-      send m.node, eSyncReply, (owner = owner, live = live, amLeader = leader == m.id, confirmed = confirmed);
+      send m.node, eSyncReply, (owner = owner, live = live, amLeader = leader == m.id, confirmed = confirmed, orphan = orphan);
       announceStore(0, refills);
     }
 
@@ -136,6 +146,25 @@ machine Store {
       }
       if ((m.id in live) && live[m.id] && owner != m.id) {
         owner = m.id;
+        orphan = false;
+        refills = refillAll();
+        fireOwnerFault(m.id);
+      }
+      announceRowDone(refills);
+    }
+
+    /* TryClaimAssignmentAsync (GH-4407): the reconcile sweep restoring a runner's claim.
+       Insert-if-absent: a row a peer wrote in the meantime is left to its owner, and the
+       sweep's next tick then stops this node's copy instead. */
+    on eClaimRow do (m: (id: int)) {
+      var refills: int;
+      if (epochMode) {
+        announceRowDone(0);
+        return;
+      }
+      if ((m.id in live) && live[m.id] && owner == 0) {
+        owner = m.id;
+        orphan = false;
         refills = refillAll();
         fireOwnerFault(m.id);
       }
@@ -157,6 +186,7 @@ machine Store {
         /* The leader writes the assignment itself, before anything is dispatched, so the
            durable row is the arbiter rather than a record written after the fact. */
         owner = m.id;
+        orphan = false;
         rowEpoch = epoch;
         rowVersion = rowVersion + 1;
         confirmed = false;
@@ -201,7 +231,7 @@ machine Store {
       announce eMFault, (delta = 1,);
       send members[m.id], eCutoff;
       live[m.id] = false;
-      if (owner == m.id) { owner = 0; }
+      if (owner == m.id) { owner = 0; orphan = true; }
       refills = refillAll();
       announceStore(0, refills);
     }
@@ -214,7 +244,7 @@ machine Store {
     on eEjectMember do (m: (id: int, counted: bool)) {
       var refills: int;
       live[m.id] = false;
-      if (owner == m.id) { owner = 0; }
+      if (owner == m.id) { owner = 0; orphan = true; }
       refills = refillAll();
       announceStore(0, refills);
       if (m.counted) {
@@ -311,14 +341,29 @@ machine StrikeCourier {
    on demotion, and above all DIES WITH THE LEADER. A brand-new leader holding no ledger
    and re-placing an in-flight agent is the committed handover counterexample.
 
-   sweep is the GH-4297 node-side reconcile: on every tick, stop my copy if the row names
-   another live node, and start my copy if the row names me and nothing is running. */
+   sweep is the GH-3987 / GH-4407 node-side reconcile (ReconcileLocalAgentsAsync): a
+   divergence between my row and what I run, seen on `threshold` consecutive ticks, is
+   healed — stop my copy if a live peer owns the row (leaving the row alone), restore my
+   claim if nobody does (TryClaimAssignmentAsync, insert-if-absent), start my copy if the
+   row names me and nothing runs here.
+
+   hold is the GH-4897 takeover hold (LeaderTakeoverHoldEvaluations): for its first `hold`
+   evaluations a new leader does not place an agent that is running nowhere and has no
+   start in flight — unless the agent is an orphan of a node that left — so a start its
+   predecessor dispatched gets one snapshot cycle to surface as a row. */
 machine Node {
   var store: machine;
   var id: int;
   var k: int;
   var sweep: bool;
+  var threshold: int;
+  var hold: int;
   var epochMode: bool;
+  /* _reconcileObservations: consecutive ticks the divergence has been seen. */
+  var streak: int;
+  /* EvaluationsSinceElection, capped at `hold` so the state stays finite. */
+  var evalsSinceElection: int;
+  var wasLeader: bool;
   /* The epoch this node last won a confirmation under. */
   var myEpoch: int;
   /* The assignment version this node's outstanding check-in is for. A reply for anything
@@ -334,11 +379,13 @@ machine Node {
   var owesFaultClose: bool;
 
   start state Booting {
-    entry (cfg: (store: machine, id: int, k: int, sweep: bool, epochMode: bool)) {
+    entry (cfg: (store: machine, id: int, k: int, sweep: bool, threshold: int, hold: int, epochMode: bool)) {
       store = cfg.store;
       id = cfg.id;
       k = cfg.k;
       sweep = cfg.sweep;
+      threshold = cfg.threshold;
+      hold = cfg.hold;
       epochMode = cfg.epochMode;
       budget = cfg.k;
       send store, eJoin, (node = this, id = id);
@@ -381,10 +428,12 @@ machine Node {
   }
 
   state AwaitSync {
-    on eSyncReply do (r: (owner: int, live: map[int, bool], amLeader: bool, confirmed: bool)) {
+    on eSyncReply do (r: (owner: int, live: map[int, bool], amLeader: bool, confirmed: bool, orphan: bool)) {
       var target: int;
       var work: bool;
       var unplaced: bool;
+      var mismatch: bool;
+      var holding: bool;
 
       /* GH-3604/D2 re-register after a heal: restore my assignment row for the agent I am
          still running. Faithful detail: this is an unconditional UPSERT, so it tramples
@@ -404,25 +453,58 @@ machine Node {
         }
       }
 
-      /* GH-4297 node-side reconcile sweep. Stop side: my copy is an orphan the moment the
-         row names another live node (never on owner == 0 — my own row write may still be
-         in flight, and stopping then reintroduces the lag the sweep exists to avoid
-         trading for duplicates). Start side: the row names me but nothing runs here —
-         which also heals the row-without-runner state the stop side can leave behind when
-         it races this node's own start. */
+      /* GH-3987 / GH-4407 node-side reconcile sweep (ReconcileLocalAgentsAsync), as
+         shipped. A divergence has to be seen on `threshold` consecutive ticks before it is
+         acted on, so anything legitimately in flight -- a start racing its row, a stop
+         racing its delete -- clears itself within a tick (LocalAgentReconciliationThreshold,
+         default 3). While a divergence is under observation the node keeps ticking.
+           running here, row names a live peer  -> stop my copy; the row is the owner's claim
+                                                  and is left alone (removeAssignment: false)
+           running here, no row anywhere        -> restore my claim, insert-if-absent only
+           row names me, nothing runs here      -> start my copy (StartAgentAsync re-upserts) */
       if (sweep) {
-        if (localRun && r.owner != id && r.owner != 0 && (r.owner in r.live) && r.live[r.owner]) {
-          localRun = false;
-          announceMe(true);
+        mismatch = false;
+        if (localRun && r.owner != id) {
+          if (r.owner == 0 || ((r.owner in r.live) && r.live[r.owner])) {
+            mismatch = true;
+          }
         } else if (!localRun && r.owner == id) {
-          localRun = true;
-          announce eMRowPending;
-          send store, eAddRow, (id = id,);
-          announceMe(true);
+          mismatch = true;
+        }
+
+        if (mismatch) {
+          streak = streak + 1;
+          if (streak >= threshold) {
+            streak = 0;
+            if (localRun && r.owner != 0) {
+              localRun = false;
+              announceMe(true);
+            } else if (localRun) {
+              announce eMRowPending;
+              send store, eClaimRow, (id = id,);
+              announceMe(true);
+            } else {
+              localRun = true;
+              announce eMRowPending;
+              send store, eAddRow, (id = id,);
+              announceMe(true);
+            }
+          } else if (budget < k) {
+            /* Under observation but not yet acted on: unfinished work, keep ticking. */
+            budget = k;
+          }
+        } else {
+          streak = 0;
         }
       }
 
       if (r.amLeader) {
+        if (!wasLeader) {
+          /* tryStartLeadershipAsync: EvaluationsSinceElection = 0 */
+          evalsSinceElection = 0;
+        }
+        wasLeader = true;
+
         /* Stock: a row of any kind means placed, because the row is only ever written by a
            node that has already started.
 
@@ -437,7 +519,22 @@ machine Node {
           unplaced = r.owner == 0;
         }
 
-        if (unplaced) {
+        /* GH-4897: a bare first-time placement -- no row, nothing of mine in flight, not the
+           orphan of a departed node -- is withheld for the first `hold` evaluations after
+           election. The real hold applies only when some other node already holds
+           assignments (the predecessor's cluster); with one agent that is assumed here,
+           which is the conservative direction for the duplicate property. */
+        holding = evalsSinceElection < hold && pendingTarget == 0 && !r.orphan;
+        if (evalsSinceElection < hold) {
+          evalsSinceElection = evalsSinceElection + 1;
+        }
+
+        if (unplaced && holding) {
+          /* Held back: nothing dispatched, and the next evaluation must still come. */
+          if (budget < k) {
+            budget = k;
+          }
+        } else if (unplaced) {
           /* The pending ledger holds an in-flight start on its chosen node: re-drive the
              SAME node rather than spawning a rival copy (GH-3698). Without a live entry
              the distribution is free to pick anyone — modelled as a nondeterministic
@@ -465,6 +562,7 @@ machine Node {
         /* The ledger is leader-local. A follower holds none — and a NEW leader therefore
            starts empty, which is the handover hole this model exists to exhibit. */
         pendingTarget = 0;
+        wasLeader = false;
       }
 
       goto Ticking;
@@ -482,6 +580,8 @@ machine Node {
       owesFaultClose = true;
       /* Whatever this node was leading or waiting on is gone with its reachability. */
       pendingTarget = 0;
+      wasLeader = false;
+      streak = 0;
       announcePartitioned();
       new HealCourier(this);
     }

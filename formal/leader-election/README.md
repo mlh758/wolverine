@@ -8,7 +8,9 @@ these specs exist and how to run them in general.
 The election is a pure advisory-lock race. Every node's health-check tick 
 calls `TryAttainLeadershipLockAsync`, steps down
 when the lock is gone server-side, ejects sustained-stale peers, and resurrects its own
-row if a peer deleted it. Because everything routes through the shared database, the whole
+row if a peer deleted it — unless the node may not lead at all (GH-4569:
+`Durability.LeadershipEligible = false`, or a warm-up node), in which case it does
+everything but contend for the lock. Model last synced to the code at 6.50.2 (`origin/main` 720a6c9c1, 2026-10-15). Because everything routes through the shared database, the whole
 protocol is **CP**: a node that can reach the database participates, and a node that
 cannot stops leading and stops processing (see [Network partitions](#network-partitions)
 below). Leadership changing hands through crashes, deploys, dropped database sessions, and
@@ -16,9 +18,11 @@ partitions is exactly the kind of thing distributed systems trip on, so the two 
 worth stating are:
 
 - **Convergence.** Whenever the cluster goes quiet — no tick mid-flight, no fault still
-  taking effect — exactly one live node believes it is the leader, the advisory lock
-  belongs to that node, its row alone carries the `wolverine://leader` assignment, every
-  live node has a node row, and no stale or orphaned row survives.
+  taking effect — exactly one live *eligible* node believes it is the leader, the advisory
+  lock belongs to that node, its row alone carries the `wolverine://leader` assignment,
+  every live node has a node row, and no stale or orphaned row survives. With no live
+  eligible node left, nobody leads and the lock is free — and a dead leader's row is
+  allowed to survive, because the code genuinely cannot destroy it (see below).
 - **Quiescence.** The cluster does go quiet. The hot state is what fails if the election
   stalls (a lock wedged under a dead session) or nodes trade leadership forever.
 
@@ -61,9 +65,24 @@ Kept faithfully, because the properties turn on them:
   not the lock session — so a claim can land after the lock has already moved on, and 
   two nodes can transiently both believe they lead. The monitor tolerates the window
   (GH-2602 shrank it; nothing can remove it) and checks the outcome at quiescence.
+- The assignment table holds **one** `wolverine://leader/` row (PK = agent uri), so the
+  claim is an upsert that *moves* the row to the claimant and takes the mark off the
+  previous holder. `stepDownAsync` does not clear it: it stops a local leader agent only
+  if one is registered in `Agents`, and nothing ever registers one, so between a step-down
+  and the next claim the table still names the ex-leader (`WolverineNode.IsLeader()` reads
+  that row). An earlier revision of this model cleared the mark on step-down; the mutant
+  below that "leaves the row behind" was therefore testing the model, not the code, and
+  has been replaced.
 - Graceful `StopAsync`: release the lock only if the node believes it holds it, delete
   own row — plus the process exit closing the lock session, which is the second layer
   that frees the lock when the belief was stale.
+- The `CanLead` gate (GH-4569): after the heartbeat, the ejection pass and the local
+  sweeps, a node that may not lead returns — no ping, no attain — and if it still holds a
+  lease from before its eligibility was revoked, it steps down first. Eligibility can be
+  taken away at runtime (`RevokeCourier`), on the leader as often as not.
+- A step-down that actually frees the lock (the eligibility case, as opposed to one forced
+  by a lock already gone server-side) refills every peer's tick budget: the real loops run
+  forever, and the next tick on every peer is an election attempt.
 
 Left out: agent assignment and distribution (`EvaluateAssignmentsAsync`, the
 `AssignmentGrid`, capabilities, restrictions) — this model stops at "who leads and what
@@ -76,6 +95,23 @@ self-check); and storage write failures. One compression: the heartbeat write, t
 state read, and the `HasLock` ping are one round trip here rather than three — all three
 happen back-to-back at the top of the real tick, and the model keeps the gap that
 matters, the one between reading the state and acting on it.
+
+## When no eligible node is left
+
+`tcIneligibleNode` runs the full chaos load on a cluster where one node may not lead, so
+the crash and the stop can take both eligible nodes and leave the ineligible one alone.
+The first cut of the model reported a liveness hang there, and the hang is real behaviour:
+the survivor sees the dead leader's row go stale, but leader protection lets only the
+*lock holder* delete a leader-marked row, and an ineligible node never holds the lock. So
+the row — and the dead leader's claim on every inbox and outbox envelope it owned, which
+`DeleteAsync` is what releases — survives until an eligible node joins. The docs say "if
+every serving node goes away while green is still warming up, nothing gets reassigned";
+this is the stronger statement: nothing gets *recovered* either. The spec encodes exactly
+that: with no live eligible node, nobody may lead, the lock must be free, every live node
+must have a row, no non-leader stale row may survive — and a stale leader-marked row may.
+The model stops counting a protected stale leader row as unfinished work for a node that
+can never do the work, which is what turned the false liveness bug into a checked
+property.
 
 ## Network partitions
 
@@ -122,9 +158,16 @@ The test cases: `tcQuietCluster` (three nodes, nothing goes wrong), `tcCrash` (a
 scheduler-chosen node dies dirty — sometimes the leader, sometimes not), `tcGracefulStop`
 (the deploy case), `tcLockSessionDrop` (the GH-2602 case: the lock session dies under a
 live, healthy leader), `tcHeartbeatBlip` (the GH-3604 case: a live node goes stale in its
-peers' eyes and may be ejected), and `tcChaos` (all of the above in one run). A network
-partition is `tcLockSessionDrop` and `tcHeartbeatBlip` at once, and `tcChaos` covers that
-combination — see [Network partitions](#network-partitions).
+peers' eyes and may be ejected), `tcChaos` (all of the above in one run),
+`tcIneligibleNode` (GH-4569: chaos with one node that may not lead) and
+`tcEligibilityRevoked` (GH-4569: a scheduler-chosen node — the leader, in some schedules —
+loses its eligibility while the cluster runs, alongside a crash). A network partition is
+`tcLockSessionDrop` and `tcHeartbeatBlip` at once, and `tcChaos` covers that combination —
+see [Network partitions](#network-partitions).
+
+`../check-all.sh` runs every case of this spec and the agent-assignment spec, then the
+mutant ledger, then bounded PEx budgets, strictly one checker at a time; budget about an
+hour. `reassert` (the proposed fix for bug ledger (c)) is the last `begin` parameter.
 
 PEx explores systematically and reports `correct for any depth` when it closes the space —
 worth running here, since this state space is small enough that several cases close. The
@@ -136,24 +179,55 @@ p compile --pfiles LeaderElectionModel.p LeaderElectionSpec.p LeaderElectionTest
 p check --mode pex -tc tcChaos -s 1000000
 ```
 
+## The bug ledger — a committed counterexample
+
+**(c) `tcLockSessionDrop` / `tcChaos` — a stale claim overwrites the leader row.** Node 1
+is granted the lock; its lock session dies before its claim lands; node 2 attains the lock
+and claims, so the one `wolverine://leader/` row now names node 2; then node 1's claim
+lands — an unconditional upsert on a pooled connection — and moves the row back to node 1.
+Node 1 finds out on its next ping and steps down, but step-down does not touch the row,
+and nothing else ever writes it until the next election. Checker: `node 2 settled as
+leader but its row does not carry the leader mark`, 0.03% of random schedules on
+`tcLockSessionDrop` and 0.01% on `tcChaos`. The earlier revision of this model could not
+see it, because it cleared the mark on step-down — exactly what the code does not do.
+
+What it costs in the real system: `WolverineNode.IsLeader()` and the grid's `Node.IsLeader`
+read that row, so until the next leader change `RunOnLeader` (leader-pinned listeners, the
+main store's durability agent on a single-database store) targets the ex-claimant, and
+leader protection shields the wrong row. The window — between `TryAttainLeadershipLockAsync`
+returning and `AddAssignmentAsync` landing, with the session dying in between — is
+milliseconds, but it is the same window GH-2602 lives in.
+
+The model carries the obvious repair as the `reassert` toggle: a sitting leader re-upserts
+its row on every tick its lock is renewed (one idempotent upsert per tick), so the row
+converges on the lock holder within one tick. `tcLockSessionDropReassert` and
+`tcChaosReassert` run the same faults with it on.
+
 ## Results
 
-PEx, 2M schedules per case (except where the space closed sooner):
+Random bugfinder, 20k schedules per case, on the revision synced to 6.50.2 (`-m 1`):
 
 | Case | Result |
 | --- | --- |
-| `tcQuietCluster` | **correct for any depth** (space closed, 66k schedules) |
-| `tcLockSessionDrop` | **correct for any depth** (space closed, 1.25M schedules) |
-| `tcCrash` | no violation, 2M schedules (partial: ~90k choices remaining) |
-| `tcGracefulStop` | no violation, 2M schedules (partial: ~9k choices remaining) |
-| `tcHeartbeatBlip` | no violation, 2M schedules (partial: ~36k choices remaining) |
-| `tcChaos` | no violation, 2M schedules (partial: ~64k choices remaining) |
+| `tcQuietCluster` | no violation |
+| `tcCrash` | no violation |
+| `tcGracefulStop` | no violation |
+| `tcLockSessionDrop` | **VIOLATED (expected)** — bug ledger (c), 0.03% of schedules |
+| `tcHeartbeatBlip` | no violation |
+| `tcChaos` | **VIOLATED (expected)** — bug ledger (c), 0.01% of schedules |
+| `tcIneligibleNode` | no violation |
+| `tcEligibilityRevoked` | no violation |
+| `tcLockSessionDropReassert` | no violation |
+| `tcChaosReassert` | no violation |
 
-The first two are proofs for these configurations; the other four are deep bounded
-searches that had not exhausted the space at 2M. Under the random bugfinder, 100k
-schedules per case also found nothing — but that is the weaker statement, and it was the
-random pass that lulled: PEx found a real gap in `tcChaos` at ~2k schedules that 100k
-random schedules had missed (see the last mutant below).
+The PEx runs recorded for the earlier revision (2M schedules per case; `tcQuietCluster`
+and `tcLockSessionDrop` closed as *correct for any depth*, the rest deep bounded searches)
+predate the eligibility and step-down changes and have **not** been re-run on this
+revision: the full pass (`formal/check-all.sh`, which also runs the mutants and bounded
+PEx budgets) was cut short by host memory pressure on 2026-10-15. Treat the table above
+as the current evidence, and re-run PEx before claiming a closed space. The earlier
+history still holds its lesson: PEx found a real gap in `tcChaos` at ~2k schedules that
+100k random schedules had missed (see the last mutant below).
 
 ## What the mutants say
 
@@ -170,11 +244,12 @@ these is the committed model with one thing removed:
   quiescence — ejected and never resurrected`, via a heartbeat blip and a peer's
   ejection. Without the resurrection a live node deleted out from under itself is
   permanently invisible to the cluster.
-- **Step-down leaves the `LeaderUri` row behind** — the lock is released but the local
-  leader agent is not stopped — **violated**: `node 1's row still carries the leader
-  mark while node 2 is the leader`. Anything reading leadership off the assignment
-  table (`WolverineNode.IsLeader()`, which leader protection itself relies on) now sees
-  two leaders.
+- **The claim does not take the mark off the previous row** (a per-node mark instead of
+  the one-row upsert) — **violated**: `node 1's row still carries the leader mark while
+  node 2 is the leader`. This is the fidelity point about the schema: because step-down
+  leaves the row alone, the claim's upsert is the only thing that ever moves the mark,
+  and anything reading leadership off the table (`WolverineNode.IsLeader()`, which leader
+  protection itself relies on) depends on it.
 - **The database never frees a dead session's lock** — an environment mutant, not a code
   mutant — **violated**: `settled with 0 live nodes believing they are the leader`. This
   is what the election's liveness actually rests on: session-scoped locks dying with
@@ -184,17 +259,25 @@ these is the committed model with one thing removed:
   **liveness violation**: `detected liveness bug in hot state 'Working' at the end of
   program execution`. Included as the proof that the hot state is not decorative: a run
   that never settles is reported even when no assert ever fires.
+- **The `CanLead` gate removed** (an ineligible node contends like any other) — **violated**
+  on `tcIneligibleNode` in the first schedule: `every live node is ineligible for
+  leadership, yet 1 of them believe they lead`.
+- **An ineligible node keeps a lease it already holds** (no step-down on revocation) —
+  **violated** on `tcEligibilityRevoked`: `node 1 settled as leader but is not eligible for
+  leadership (GH-4569)`.
+- **Step-down keeps the advisory lock** — on the earlier revision this was *not falsified*,
+  because the only step-downs were forced by a lock already gone. With eligibility it is
+  load-bearing: **violated** on `tcEligibilityRevoked`: `settled with 0 live nodes
+  believing they are the leader` — the ex-leader has stopped leading but still holds the
+  lock, so nobody can be elected. That is the `ReleaseLeadershipLockAsync` call in
+  `stepDownAsync` earning its keep.
 - **Leader protection removed** — any observer may destroy the leader's row — **not
-  falsified** in 30k schedules per case. In this model the wound self-heals: the
+  falsified** in 30k schedules per case (earlier revision). In this model the wound self-heals: the
   resurrection restores the row and the mark, and the next tick reconciles. **This is
   not a licence to delete the check** — the real damage is on the assignment plane the
   model deliberately leaves out: the ejected leader's agent assignments are wiped with
   its row, and the GH-3604 report is precisely that churn livelock. The model cannot
   see that job at all.
-- **Step-down keeps the advisory lock** — **not falsified**: the ex-leader still holds
-  the lock, so the next tick re-grants it and the node re-elects itself; the cluster
-  converges on the same node. The release matters for handing leadership *away*
-  (graceful rebalance, lease backends), not for the safety this monitor states.
 - **Hysteresis removed** (eject on the first stale sighting) — **not falsified**, same
   shape: a premature eject of a live node is healed by resurrection. The threshold
   exists to avoid the eject/resurrect churn and the destroyed assignments, both outside

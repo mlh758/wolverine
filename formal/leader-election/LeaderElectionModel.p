@@ -42,6 +42,9 @@ event eMarkStale: (id: int, counted: bool);
 /* Stand-in for "the health-check loop runs forever": every fault refills the surviving
    nodes' tick budgets, so quiescence is reached only after the last fault is absorbed. */
 event eRefill;
+/* GH-4569: the operator takes a node's leadership eligibility away under a live lease
+   (Durability.LeadershipEligible = false, or the node is restarted as a warm-up node). */
+event eRevokeEligibility;
 
 /*
 The database. One machine: arrival order is commit order. The advisory lock is
@@ -96,15 +99,19 @@ machine Store {
     }
 
     on eStepDown do (m: (node: machine, id: int)) {
-      /* stepDownAsync: stop the local leader agent (which drops the LeaderUri assignment
-         row) and best-effort release the advisory lock. */
+      var refills: int;
+      /* stepDownAsync: best-effort release the advisory lock. It also tries to stop a local
+         `wolverine://leader` agent, but nothing ever registers one (the leader agent exists
+         only as the assignment row), so the LeaderUri row is NOT touched here: it keeps
+         naming the ex-leader until the next claim's upsert moves it (see eClaim). When the
+         release actually frees the lock -- a step-down for ineligibility, not one forced by
+         a lock already gone server-side -- every peer's next tick is an election attempt,
+         so they get ticks: the health-check loops run forever. */
       if (lockHolder == m.id) {
         lockHolder = 0;
+        refills = refillAll();
       }
-      if (m.id in rows) {
-        rows[m.id] = (stale = rows[m.id].stale, leaderMark = false);
-      }
-      announceStore(0, 0);
+      announceStore(0, refills);
     }
 
     on eTryAttain do (m: (node: machine, id: int)) {
@@ -121,14 +128,19 @@ machine Store {
     }
 
     on eClaim do (m: (node: machine, id: int)) {
+      var v: int;
       /* tryStartLeadershipAsync: ensureLocalNodeRegisteredAsync + AddAssignmentAsync of
-         LeaderUri. Runs on a pooled connection, not the lock session — so a claim CAN
-         land after the lock has already moved on. The claimant discovers that on its
-         next tick's ping and steps down; the monitor tolerates the window and checks
-         the outcome at quiescence. */
-      if (m.id in rows) {
-        rows[m.id] = (stale = rows[m.id].stale, leaderMark = true);
-      } else {
+         LeaderUri. The assignment table has ONE row per agent (PK = agent uri, upsert), so
+         the claim moves the `wolverine://leader` row to the claimant and thereby takes the
+         mark off whoever held it -- that upsert, not the step-down, is what clears an
+         ex-leader's mark. Runs on a pooled connection, not the lock session — so a claim
+         CAN land after the lock has already moved on. The claimant discovers that on its
+         next tick's ping and steps down; the monitor tolerates the window and checks the
+         outcome at quiescence. */
+      foreach (v in keys(rows)) {
+        rows[v] = (stale = rows[v].stale, leaderMark = v == m.id);
+      }
+      if (!(m.id in rows)) {
         rows[m.id] = (stale = false, leaderMark = true);
       }
       send m.node, eClaimAck;
@@ -219,6 +231,14 @@ machine ShutdownCourier {
   }
 }
 
+machine RevokeCourier {
+  start state Deliver {
+    entry (target: machine) {
+      send target, eRevokeEligibility;
+    }
+  }
+}
+
 /*
 One Wolverine process. A tick is DoHealthChecksInternalAsync: write own heartbeat and
 read the cluster (one round trip here), eject sustained-stale peers, step down if the
@@ -238,12 +258,22 @@ machine Node {
   /* _staleObservations: consecutive stale sightings per peer (GH-3604 hysteresis). */
   var staleCounts: map[int, int];
   var threshold: int;
+  /* DurabilitySettings.CanLead: LeadershipEligible, and never on a warm-up node (GH-4569).
+     An ineligible node heartbeats, ejects and reconciles like any other, and never
+     contends for the lock. */
+  var canLead: bool;
+  /* PROPOSED FIX, off by default (the code does not do this): a sitting leader re-upserts
+     its `wolverine://leader` row on every tick its lock is renewed, so a stale claim that
+     overwrote the row (bug ledger (c) in the README) is repaired on the next tick. */
+  var reassert: bool;
 
   start state Booting {
-    entry (cfg: (store: machine, k: int, threshold: int)) {
+    entry (cfg: (store: machine, k: int, threshold: int, canLead: bool, reassert: bool)) {
       store = cfg.store;
       k = cfg.k;
       threshold = cfg.threshold;
+      canLead = cfg.canLead;
+      reassert = cfg.reassert;
       budget = cfg.k;
       send store, eRegisterNode, this;
     }
@@ -251,6 +281,7 @@ machine Node {
     defer eStart;
     defer eCrash;
     defer eShutdown;
+    defer eRevokeEligibility;
     on eNodeNumber do (m: (id: int)) {
       id = m.id;
       goto Waiting;
@@ -263,6 +294,7 @@ machine Node {
     }
     on eStart goto Ticking;
     on eRefill do { consumeRefill(); }
+    on eRevokeEligibility do { revoke(); }
     on eCrash goto Dead;
     on eShutdown goto Stopping;
   }
@@ -280,6 +312,10 @@ machine Node {
       consumeRefill();
       goto Ticking;
     }
+    on eRevokeEligibility do {
+      revoke();
+      goto Ticking;
+    }
     on eCrash goto Dead;
     on eShutdown goto Stopping;
   }
@@ -289,6 +325,7 @@ machine Node {
       var v: int;
       var newCounts: map[int, int];
       var doEject: bool;
+      var pendingEject: bool;
 
       hasLock = m.youHoldLock;
 
@@ -312,14 +349,30 @@ machine Node {
               newCounts -= (v);
             }
           }
+          /* A stale leader row is work only for a node that could ever hold the lock. An
+             ineligible node will watch it forever (GH-4569 — see the README), so counting
+             it would keep that node ticking forever: a false liveness bug on real behaviour. */
+          if ((v in newCounts) && !(m.rows[v].leaderMark && !canLead)) {
+            pendingEject = true;
+          }
         }
       }
       staleCounts = newCounts;
 
       /* A stale peer seen but not yet ejected is unfinished work — keep ticking until the
          cluster is clean, as the real loop would. See the README (PEx found this gap). */
-      if (sizeof(newCounts) > 0 && budget < k) {
+      if (pendingEject && budget < k) {
         budget = k;
+      }
+
+      /* GH-4569: a node that may not lead does everything above -- heartbeat, ejection,
+         the local sweeps -- and nothing below. It never pings or contends for the lock,
+         and if its eligibility was taken away under a lease it holds, it lets go. */
+      if (!canLead) {
+        if (isLeader) {
+          stepDownLocally();
+        }
+        goto Ticking;
       }
 
       /* GH-2602: we thought we were the leader, but the advisory lock is gone
@@ -334,6 +387,7 @@ machine Node {
       goto AwaitLock;
     }
     on eRefill do { consumeRefill(); }
+    on eRevokeEligibility do { revoke(); }
     on eCrash goto Dead;
     on eShutdown goto Stopping;
   }
@@ -349,7 +403,11 @@ machine Node {
           goto AwaitClaim;
         }
         /* Already leader: the grant was a renewal; EvaluateAssignmentsAsync is out of
-           this model's scope. */
+           this model's scope. With the proposed fix, re-assert the leader row too. */
+        if (reassert) {
+          send store, eClaim, (node = this, id = id);
+          goto AwaitClaim;
+        }
         goto Ticking;
       }
       hasLock = false;
@@ -360,6 +418,7 @@ machine Node {
       goto Ticking;
     }
     on eRefill do { consumeRefill(); }
+    on eRevokeEligibility do { revoke(); }
     on eCrash goto Dead;
     on eShutdown goto Stopping;
   }
@@ -371,6 +430,7 @@ machine Node {
       goto Ticking;
     }
     on eRefill do { consumeRefill(); }
+    on eRevokeEligibility do { revoke(); }
     on eCrash goto Dead;
     on eShutdown goto Stopping;
   }
@@ -381,7 +441,7 @@ machine Node {
   state Stopping {
     entry {
       announce eMNodeState,
-        (id = id, alive = true, isLeader = isLeader, busy = true, newFaults = 1);
+        (id = id, alive = true, isLeader = isLeader, busy = true, newFaults = 1, eligible = canLead);
       new SessionReaper((store = store, id = id, counted = true));
       send store, eReleaseAndDelete, (node = this, id = id, hadLock = hasLock);
     }
@@ -389,6 +449,7 @@ machine Node {
     on eRefill do { announce eMRefillDone; }
     on eCrash do { }
     ignore eStart;
+    ignore eRevokeEligibility;
     ignore eSnapshot;
     ignore eLockResult;
     ignore eClaimAck;
@@ -400,6 +461,7 @@ machine Node {
     }
     on eRefill do { announce eMRefillDone; }
     ignore eStart;
+    ignore eRevokeEligibility;
     ignore eCrash;
     ignore eShutdown;
     ignore eSnapshot;
@@ -419,12 +481,23 @@ machine Node {
     }
     on eRefill do { announce eMRefillDone; }
     ignore eStart;
+    ignore eRevokeEligibility;
     ignore eCrash;
     ignore eShutdown;
     ignore eSnapshot;
     ignore eLockResult;
     ignore eClaimAck;
     ignore eStopAck;
+  }
+
+  /* The operator flipped Durability.LeadershipEligible under a running node. The next tick
+     is where the controller notices (the CanLead gate), so the node owes one more tick. */
+  fun revoke() {
+    canLead = false;
+    if (budget < k) {
+      budget = k;
+    }
+    announceMe(true);
   }
 
   fun stepDownLocally() {
@@ -447,11 +520,13 @@ machine Node {
 
   fun announceMe(midTick: bool) {
     announce eMNodeState,
-      (id = id, alive = true, isLeader = isLeader, busy = budget > 0 || midTick, newFaults = 0);
+      (id = id, alive = true, isLeader = isLeader, busy = budget > 0 || midTick, newFaults = 0,
+       eligible = canLead);
   }
 
   fun announceDead(faults: int) {
     announce eMNodeState,
-      (id = id, alive = false, isLeader = false, busy = false, newFaults = faults);
+      (id = id, alive = false, isLeader = false, busy = false, newFaults = faults,
+       eligible = canLead);
   }
 }
