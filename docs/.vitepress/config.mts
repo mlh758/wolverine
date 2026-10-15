@@ -320,6 +320,7 @@ const config: UserConfig<DefaultTheme.Config> = {
                     items: [
                         {text: 'Durable Inbox and Outbox Messaging', link: '/guide/durability/'},
                         {text: 'Troubleshooting and Leadership Election', link: '/guide/durability/leadership-and-troubleshooting'},
+                        {text: 'Leadership and Agent Distribution Internals', link: '/guide/durability/leadership-and-agent-distribution'},
                         {text: 'Connection Budgets', link: '/guide/durability/connection-budgets'},
                         {text: 'Sagas', link: '/guide/durability/sagas'},
                         {text: 'Unit Testing Aggregate Handlers', link: '/guide/durability/unit-testing-aggregate-handlers'},

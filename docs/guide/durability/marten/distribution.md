@@ -217,9 +217,10 @@ The category tells you what to do about it:
 | `ProgressionOutOfOrder` | The shard's progression row moved underneath it, which almost always means two processes are running the same shard. |
 | `Other` | A database outage, a timeout, or a bug. No single event can be blamed. |
 
-Only `Other` is treated as potentially self-healing, so it is the only category Wolverine's stall detector
-will auto-restart. The rest are left alone until you resolve the underlying problem, at which point
-restarting or rewinding the agent picks it back up.
+Whether Wolverine restarts a paused shard on its own is decided by `ShardFailure.IsTransient`, described in the
+next section, not by the category alone. `ProgressionOutOfOrder` is never restarted. Everything else that is not
+transient is left alone until you resolve the underlying problem, at which point restarting or rewinding the
+agent picks it back up.
 
 ### Shards paused on a transient failure come back on their own <Badge type="tip" text="6.51" />
 
@@ -305,6 +306,37 @@ opts.Durability.LeaderColdStartHoldEvaluations = 1;  // default; 0 turns it off
 The hold only applies while the first node is alone and only when the wave it is holding is larger than
 `AgentStartBatchSize`, so a single node that genuinely runs a handful of agents is not made to wait for peers
 that are never coming. A rollout whose pods arrive over a longer period is what `AssignmentSettlePeriod` is for.
+
+### A new leader holds back for one evaluation <Badge type="tip" text="6.48.2" />
+
+The record of which starts the leader has dispatched but not yet seen come up as assignment rows lives in the
+leader's memory, so it does not survive a leader change. A newly elected leader that inherits a cluster whose
+other nodes hold assignments therefore spends its first evaluation *not* placing agents that are running nowhere
+and have nothing in flight, so the starts its predecessor dispatched get one snapshot cycle to surface as rows
+and be kept where they are. Moves, stops, every agent already visible, and the agents of a node that died all
+proceed on that first evaluation.
+
+```csharp
+opts.Durability.LeaderTakeoverHoldEvaluations = 1;  // default; 0 turns it off
+```
+
+## Every node reconciles its own agents <Badge type="tip" text="6.36" />
+
+The leader can only see what the assignment table says. An agent whose row names a node that is not actually
+running it looks assigned, and an agent a node is running with no row looks like nothing at all. So every node,
+leader or not, compares its own assignment rows against the agents it is really running on every health check
+and heals the difference: it starts an agent its row says it owns but it is not running, stops a copy it is running
+when the row names another live node (leaving that node's row alone), and restores its own row when it is running
+an agent nobody has a row for. A divergence has to persist for a few consecutive ticks before anything is done
+about it, so a start racing its own row write, or a stop racing its row delete, clears itself first.
+
+```csharp
+opts.Durability.LocalAgentReconciliationThreshold = 3;   // consecutive ticks; 0 disables the sweep
+opts.Durability.MaxLocalAgentReconciliationsPerTick = 50;
+```
+
+How these pieces fit together, with sequence diagrams, is on
+[Leadership and Agent Distribution Internals](../leadership-and-agent-distribution).
 
 ## Keeping a Node Out of Leadership <Badge type="tip" text="6.49" />
 

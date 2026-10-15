@@ -25,6 +25,11 @@ Next, check the `wolverine_nodes` and `wolverine_node_assignments` to see where 
 agents are across the active nodes. The actual leadership agent is `wolverine://leader`, and you can spot the current
 leader by the matching row in the `wolverine_node_assignments` table that refers to the "leader" agent. 
 
+::: tip
+For how the election, the health-check tick, failover and agent assignment actually work, step by step and with
+sequence diagrams, see [Leadership and Agent Distribution Internals](leadership-and-agent-distribution).
+:::
+
 If you are frequently stopping and starting a local process -- especially if you are doing that through a debugger -- you
 may want to utilize the `Solo` durability mode explained below:
 
