@@ -23,8 +23,8 @@ thread:
 
 Everything else (`_staleObservations`, `_reconcileObservations`, `_knownNodes` and the
 settle timestamps, `EvaluationsSinceElection`, `OrphanedByStaleNodes`, `_rowsLastTick`,
-`_transientRestarts`, `_failedStarts`, `IsLeader`) is single-writer tick state that merely
-lives in the wrong place. The tick itself is the easy part.
+`_transientRestarts`, `_failedStarts`, `IsLeader`) is single-writer tick state that could be
+more cleanly encapsulated with the step that owns it. The tick itself is the easy part.
 
 ## 2. Target shape
 
@@ -400,7 +400,8 @@ exactly as now.
 - **`LastAssignments`** for diagnostics: the last `Grid`, swapped atomically. One writer.
 
 After this the four actors of §2 are two: the registry and the dispatcher. The ledger is
-stage state, the lock session is stage state, and nothing is protected by a comment.
+stage state, the lock session is stage state, and every piece of state has a single,
+explicit owner rather than a serialisation convention.
 
 ## 11. Open questions
 
