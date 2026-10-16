@@ -245,8 +245,8 @@ answerable: whether the shed rate should scale with the error.
 
 - **The takeover hold is about lost information, not rate.** The new leader cannot see its
   predecessor's in-flight starts because the ledger is in memory. No controller recovers
-  information that was never recorded; a durable, leader-written claim (the epoch design in
-  `formal/agent-assignment/`) does. Feedback would only tune the hold's length.
+  information that was never recorded; a durable, leader-written claim does. That is
+  phase 2 (§11), and it retires the hold rather than tuning it.
 - **Safety rules** (single copy, owner-scoped deletes, orphans placed immediately, pins and
   pauses outrank everything) stay rules. A controller decides *how much* of the safe plan
   to release, never *which* plan — and only the start half of it.
@@ -282,6 +282,8 @@ answerable: whether the shed rate should scale with the error.
 4. Record `StageMetrics` on every tick and publish them (the GH-3987 reporter's ask for
    per-node counts; the GH-4593 load advertisement is already one).
 5. The lane window, measured on the rig. Then the Gate's filter, measured on the rig.
+6. Phase 2: durable claims (§11), measured on the rig against the duplicate rate the
+   deploy-sim measured for GH-3987.
 
 ## 10. Eliminating the shared state: events in, messages out
 
@@ -411,7 +413,122 @@ GH-3888) publishes the rolled-back set as the next version. One writer, one read
 After this the shared-state inventory of §1 is: two actors with mailboxes, two volatile
 snapshots, and nothing protected by a serialisation convention.
 
-## 11. Open questions
+## 11. Phase 2: durable claims — the row as the arbiter
+
+Everything above keeps one property of today's design: the assignment row is written by
+the **node**, after the start, so it is a record of what happened rather than a decision.
+That property is the root of the whole class of duplicate-copy incidents (GH-3698,
+GH-3987's deploy-sim shape, GH-4407, GH-4897), of the holds, and of the ledger being a
+correctness mechanism rather than a pacing one. Phase 2 inverts it: **the leader writes the
+row, stamped, and a node may not start an agent until it has won a check-in on that row.**
+The design was explored first as the `epochMode` variant of `formal/agent-assignment/`;
+the two requirements its counterexamples forced are built in below.
+
+### 11.1 Schema
+
+`wolverine_node_assignments` gains three columns; nothing is removed.
+
+| Column | Meaning |
+| --- | --- |
+| `epoch bigint` | the leadership term that wrote the row. Bumped on every successful leader claim; a write from an older term is refused |
+| `version bigint` | the assignment attempt. Bumped on every re-stamp of this agent's row; identifies *this* placement, not the term |
+| `confirmed boolean` | the named node has checked in and is running (or starting) the agent |
+
+The `wolverine://leader/` row carries the current `epoch`; the leader claim becomes a
+compare-and-set on it. Existing rows migrate as `epoch = 0, version = 0, confirmed = true`,
+so a fleet mid-upgrade reads them as placed.
+
+### 11.2 Protocol
+
+```
+Leader (Evaluation / Gate)                     Store                                 Node X (Registry worker)
+───────────────────────────                    ─────                                 ────────────────────────
+claim:  UPDATE leader row SET node_id = me,
+        epoch = E+1 WHERE epoch = E   ───────► 1 row → leader at epoch E+1
+                                                0 rows → someone claimed first → step down   (closes election bug ledger (c))
+
+place:  UPSERT agent row (node_id = X,
+        epoch = E+1, version = v+1,
+        confirmed = false) WHERE epoch <= E+1 ► refused for a stale ex-leader's write
+
+        StartAgents([(agent, E+1, v+1)])  ─────────────────────────────────────────► check-in:
+                                                                                    UPDATE SET confirmed = true
+                                                                                    WHERE id = agent AND node_id = X
+                                                                                      AND epoch = E+1 AND version = v+1
+                                               ◄─────────────────────────────────── 1 row → StartAsync; 0 rows → start nothing,
+                                                                                    and stop any copy X runs from an older version
+                                               ◄─── AgentsStarted(confirmed) ──────
+```
+
+Rules, each the direct descendant of one of the model's findings:
+
+1. **A row whose node is not live is not a placement.** The leader re-stamps it
+   (`version + 1`) to a new node on the next evaluation. Safe precisely because of the
+   stamp: the re-write is what makes the old node's late check-in fail. Without this rule
+   the first cut of the model stranded an agent on a node that died between the write and
+   the command (`settled with 0 nodes running`).
+2. **The version fences the reply, not just the write.** A node ignores a check-in result
+   for any version other than the one it is currently on, and never adopts an older
+   version from a late command. Without this the model turned a duplicate into a stopped
+   agent: a win at version 2 followed by the late rejection of version 1.
+3. **Moves need no node-side row write.** `ReassignAgent` becomes: re-stamp the row to the
+   destination, stop at the source, start at the destination. If the source misses the
+   stop, its sweep sees a row naming another node and stops the copy; if the destination
+   misses the start, the row sits unconfirmed and the leader re-drives at the same version
+   (idempotent) or re-stamps.
+4. **Pause and retire are row deletes by the leader**, under the epoch guard. The
+   node-side `AddAssignmentAsync` / `RemoveAssignmentAsync` / `TryClaimAssignmentAsync`
+   writes are no longer called by Balanced nodes; Solo keeps its own path.
+
+### 11.3 The conditional write, per store
+
+| Store | Check-in and re-stamp |
+| --- | --- |
+| PostgreSQL, SQL Server, MySQL, Oracle, SQLite | `UPDATE … WHERE id = @id AND node_id = @node AND epoch = @e AND version = @v` and read the affected-row count; the upsert's guard is `… ON CONFLICT (id) DO UPDATE … WHERE excluded.epoch >= assignments.epoch` (or the store's `MERGE` / `ON DUPLICATE KEY` equivalent with the same predicate) |
+| RavenDb | the `AgentAssignment` document already carries a change vector; `Store` with the expected vector is the compare, `ConcurrencyException` is the lost check-in |
+| Cosmos DB | read the item, compare `epoch`/`version` in the body, `ReplaceItemAsync` with `IfMatchEtag`; 412 is the lost check-in |
+| multi-tenant wrapper | unchanged: rows live in the main store only |
+
+Every store already implements a conditional write for `TryClaimAssignmentAsync`
+(GH-4407); this generalises it.
+
+### 11.4 Rolling upgrade
+
+A node that does not know the protocol will never check in, so a new leader placing onto
+it would strand the agent. The same device GH-4569 uses for the warm-up role applies: a
+node advertises `wolverine://protocol/claimed-assignments` in its capabilities, and the
+leader uses the legacy node-written-row flow for any destination without the marker (the
+mixed-version placement pin from GH-4555 already keeps those placements stable). Once
+every node advertises it, the legacy flow is dead code and can be removed in a later
+release. A pre-upgrade leader simply ignores the new columns and keeps today's behaviour.
+
+### 11.5 What it removes from the stage table
+
+| Where | Today | After phase 2 |
+| --- | --- | --- |
+| Evaluation, row 7 | takeover and cold-start holds (GH-4897, GH-4569) | gone: a predecessor's in-flight start is a visible unconfirmed row |
+| Evaluation / Gate | the ledger as the single-copy guard | the ledger is a dedup and pacing aid only; re-dispatching at the same version is idempotent, so losing it costs duplicate *commands*, never duplicate *copies* |
+| LocalSweeps, row 5 | the claim branch (`TryClaimAssignmentAsync`), the GH-4240 `removeAssignment: false` distinction, the D2 re-upsert of own rows, the D4 re-upsert on an idempotent start | gone: nodes do not write rows. The stop side ("row names another node or version") and the start side ("row names me, unconfirmed or not running") stay |
+| Registry, §10.3 | `BeginStart` admitted by comparing against the local command sequence | admitted by the store check-in; the local sequence stays for ordering local stops against local starts |
+| Leadership, row 6 | an unconditional leader-row upsert; bug ledger (c) | a compare-and-set on the epoch; (c) closes |
+| election model mutant "re-assert" | the leader re-upserts its row each tick | unnecessary |
+
+The reconcile sweep, ejection with its hysteresis and leader protection, the settle gate,
+and the lane window are untouched: they are about liveness and churn, which the row cannot
+decide.
+
+### 11.6 Before implementing
+
+- Re-run the ownership model's epoch cases (`tcLeaderHandoverEpoch`, `tcPartitionHealEpoch`,
+  `tcChaosEpoch`) on the current revision and record them; the README's epoch table
+  predates the version-fence fix and the shipped-sweep changes.
+- Add the leader-row compare-and-set to the election model and confirm bug ledger (c)
+  closes without the re-assert toggle.
+- Decide whether `confirmed` is needed at all, or whether "the node's own heartbeat row
+  lists the agent as running" is the confirmation (it is what `AgentPresenceReport` answers
+  from today). A separate column is simpler to reason about and costs one write per start.
+
+## 12. Open questions
 
 - Whether `WolverineNode.IsLeader()` should keep reading the assignment row at all once the
   Leadership stage owns the fact (election bug ledger (c) is a consequence of that dual
@@ -421,8 +538,11 @@ snapshots, and nothing protected by a serialisation convention.
 - Which of the knobs in §8 become ceilings for the two loops and which are retired. The
   compatible answer is "ceilings"; several exist only because the previous estimate did not
   fit one fleet.
+- Phase 2's upgrade window: whether to require the marker fleet-wide before enabling the
+  new flow (one switch, simpler) or run both flows per destination (no ordering constraint
+  on the rollout, as §11.4 proposes).
 
-## 12. Review log
+## 13. Review log
 
 2026-10-16, critical review for simplicity (in the "simple, not complected" sense) of the
 first draft. Changes made in response: typed per-stage outputs instead of one context of
@@ -437,3 +557,7 @@ operator request is never dropped, with the operator's inline-failure contract k
 follower-forwarding change named as intended (§6 rule 1, §10.4); the advertisement
 versioned so the embargo rollback is expressible (§10.5); the shutdown sequence stated
 (§6 rule 7).
+
+2026-10-16, later: phase 2 (durable, leader-written claims) added as §11 at Michael's
+request, so the whole programme is in one place and the class of duplicate-copy incidents
+is removed rather than damped.
