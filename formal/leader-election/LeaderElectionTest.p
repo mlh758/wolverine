@@ -112,6 +112,33 @@ machine ChaosCasDriver {
   }
 }
 
+/* Phase 2 as proposed: the compare-and-set claim AND a per-tick renew of the leader row
+   under the claimed epoch. Bug ledger (d) needs the renew; (c) needs the compare-and-set. */
+machine DropCasRenewDriver {
+  start state Init {
+    entry {
+      begin(3, false, false, 1, 0, 0, 0, true, true);
+    }
+  }
+}
+
+machine ChaosCasRenewDriver {
+  start state Init {
+    entry {
+      begin(3, true, true, 1, 1, 0, 0, true, true);
+    }
+  }
+}
+
+/* Bug ledger (d) from a plain heartbeat blip, with the phase 2 repair. */
+machine BlipCasRenewDriver {
+  start state Init {
+    entry {
+      begin(3, false, false, 0, 2, 0, 0, true, true);
+    }
+  }
+}
+
 /* Stand up the store and the nodes, start them ticking, then loose the faults. Faults
    ride couriers so their arrival interleaves freely with the ticks — a fault can land
    before the first election, in the middle of one, or long after it settled. */
@@ -215,3 +242,17 @@ test tcLockSessionDropCas [main=DropCasDriver]:
 test tcChaosCas [main=ChaosCasDriver]:
   assert ElectionConverges in
     { ChaosCasDriver, Store, Node, SessionReaper, StaleReaper, CrashCourier, ShutdownCourier, RevokeCourier };
+
+/* ---- phase 2 as proposed: compare-and-set claim plus per-tick renew ---- */
+
+test tcLockSessionDropCasRenew [main=DropCasRenewDriver]:
+  assert ElectionConverges in
+    { DropCasRenewDriver, Store, Node, SessionReaper, StaleReaper, CrashCourier, ShutdownCourier, RevokeCourier };
+
+test tcChaosCasRenew [main=ChaosCasRenewDriver]:
+  assert ElectionConverges in
+    { ChaosCasRenewDriver, Store, Node, SessionReaper, StaleReaper, CrashCourier, ShutdownCourier, RevokeCourier };
+
+test tcHeartbeatBlipCasRenew [main=BlipCasRenewDriver]:
+  assert ElectionConverges in
+    { BlipCasRenewDriver, Store, Node, SessionReaper, StaleReaper, CrashCourier, ShutdownCourier, RevokeCourier };

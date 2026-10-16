@@ -259,6 +259,11 @@ What that buys, mechanically:
 | `tcPartitionHeal*` | **violation** (bug ledger (b)) | 0 bugs | **0 bugs** |
 | `tcChaos*` | — | 0 bugs | **0 bugs** |
 
+PEx (systematic) on the same three cases, 5M-schedule budget each, `-m 3`: no violation,
+`partially correct` with 85,697 / 100,698 / 168,892 choices remaining (handover / partition
+heal / chaos) — deep bounded searches whose frontier grew between the 300k and 5M budgets,
+so these spaces will not close at a practical budget. 190–270 s each.
+
 The epoch column went green on 2026-10-16 after three more design requirements were found
 and modelled (below). Before them the same cases read: handover 0 bugs, partition heal a
 rare strand (0.01%), chaos a strand (0.54%) — two different stranding paths and, once those

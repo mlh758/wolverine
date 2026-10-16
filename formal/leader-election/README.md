@@ -48,8 +48,13 @@ and the lock-freed and row-went-stale effects of one crash can land in either or
 Kept faithfully, because the properties turn on them:
 
 - The tick order of `DoHealthChecksInternalAsync`: heartbeat upsert (with the GH-3604/D2
-  resurrection of a row a peer deleted, leader mark included), stale-peer ejection, the
-  GH-2602 step-down when the lock is gone server-side, then always attain-or-renew.
+  resurrection of a row a peer deleted — **without** the leader mark, because the
+  resurrection re-upserts `Agents.Keys` and the leader agent is never among them; see bug
+  ledger (d)), stale-peer ejection, the GH-2602 step-down when the lock is gone
+  server-side, then always attain-or-renew.
+- The ejection delete is unconditional, as `DeleteAsync` is: a follower decides from its
+  snapshot, and a row that became the leader's between the read and the delete is deleted
+  anyway. That is how (d) is reached from a plain heartbeat blip.
 - The `HasLock` liveness ping (GH-2602): the client's lock belief is re-derived from the
   server, never trusted on its own.
 - The idempotent re-grant to the current holder — the client-side short-circuit that
@@ -169,8 +174,8 @@ see [Network partitions](#network-partitions).
 mutant ledger, then bounded PEx budgets, strictly one checker at a time; budget about an
 hour. The last two `begin` parameters are the two repairs for bug ledger (c): `reassert`
 (the leader re-upserts its row each tick) and `casClaim` (the claim is a compare-and-set
-on the leader row's epoch, phase 2 of the stage map); the stock case with both off is the
-mutant that shows either is load-bearing.
+on the leader row's epoch, phase 2 of the stage map). The stock case with both off is the
+mutant for (c) and (d) together; `casClaim` alone is the mutant for the renew.
 
 PEx explores systematically and reports `correct for any depth` when it closes the space —
 worth running here, since this state space is small enough that several cases close. The
@@ -201,43 +206,80 @@ leader protection shields the wrong row. The window — between `TryAttainLeader
 returning and `AddAssignmentAsync` landing, with the session dying in between — is
 milliseconds, but it is the same window GH-2602 lives in.
 
-The model carries two repairs as toggles. `reassert`: a sitting leader re-upserts its row
-on every tick its lock is renewed (one idempotent upsert per tick), so the row converges on
-the lock holder within one tick — a patch on today's protocol. `casClaim`: the claim is a
-compare-and-set on an epoch stamped on the leader row, the design in phase 2 of the stage
-map (`.claude/docs/cluster_control_pipeline.md` §11) — a claim carrying an epoch the row
-has moved past is refused, the stale claimant releases and stays a follower, and the row
-can never be moved back by a late write. `tcLockSessionDropCas` and `tcChaosCas` run the
-same faults with the compare-and-set and **no** re-assert; both are clean, so (c) closes on
-the claim alone, which is what makes the re-assert unnecessary once phase 2 ships.
+**(d) `tcChaos` — a resurrected leader row has no mark.** Found by PEx at 5M schedules on
+2026-10-16 (random sampling at 20k had missed it, and so had PEx at 300k). The lock holder
+ejects the stale row of a node that still believes it leads (allowed: leader protection
+only shields the leader's row from non-holders). That node's next heartbeat misses and
+resurrects its row — and the resurrection re-upserts the node's *running agents*
+(`Agents.Keys`), among which the leader agent never is, so the resurrected row carries no
+mark. The node steps down a tick later, but step-down does not touch the row either, and
+the sitting leader never claims again (its grant is a renewal). Result: nobody's row
+carries the mark; `WolverineNode.IsLeader()` is false on every node; `RunOnLeader` places
+nothing until the next election. An earlier revision of this model restored the mark on
+resurrection from the node's belief, which hid (d) and manufactured a different wrong state.
+
+(c) and (d) are one defect seen twice: the leader row is written once, at the claim, and
+nothing keeps it consistent with the lock afterwards. The model carries the repairs as
+toggles:
+
+- `reassert` — a sitting leader re-upserts its row on every tick its lock is renewed, an
+  unconditional idempotent upsert; a patch on today's protocol. Closes both.
+- `casClaim` — the claim is a compare-and-set on an epoch stamped on the leader row (phase 2
+  of the stage map, `.claude/docs/cluster_control_pipeline.md` §11): a claim carrying an
+  epoch the row has moved past is refused and the stale claimant stays a follower. Closes
+  (c) on its own (`tcLockSessionDropCas`) but **not** (d) (`tcChaosCas`): a compare-and-set
+  that is only ever run at election cannot restore a row the cascade removed.
+- both — the compare-and-set claim plus a per-tick **renew** conditional on the claimed
+  epoch, which restores a cascaded row and refuses a stale ex-leader's renew. This is the
+  phase 2 design as it should ship: the leader row is a debt the holder keeps paying, like
+  every other row in that design. `tcLockSessionDropCasRenew` and `tcChaosCasRenew`.
 
 ## Results
 
-Random bugfinder, 20k schedules per case, on the revision synced to 6.50.2 (`-m 1`):
+Random bugfinder, 20k schedules per case, `-m 1`, on the revision of 2026-10-16 (synced to
+6.50.2, with the faithful resurrection and the durable-change refill):
 
-| Case | Result |
-| --- | --- |
-| `tcQuietCluster` | no violation |
-| `tcCrash` | no violation |
-| `tcGracefulStop` | no violation |
-| `tcLockSessionDrop` | **VIOLATED (expected)** — bug ledger (c), 0.03% of schedules |
-| `tcHeartbeatBlip` | no violation |
-| `tcChaos` | **VIOLATED (expected)** — bug ledger (c), 0.01% of schedules |
-| `tcIneligibleNode` | no violation |
-| `tcEligibilityRevoked` | no violation |
-| `tcLockSessionDropReassert` | no violation |
-| `tcChaosReassert` | no violation |
-| `tcLockSessionDropCas` | no violation |
-| `tcChaosCas` | no violation |
+| Case | Repair | Result |
+| --- | --- | --- |
+| `tcQuietCluster` | — | no violation |
+| `tcCrash` | — | no violation |
+| `tcGracefulStop` | — | no violation |
+| `tcLockSessionDrop` | — | **VIOLATED (expected)** — bug ledger (c), 0.02% |
+| `tcHeartbeatBlip` | — | **VIOLATED (expected)** — bug ledger (d), 3.85% |
+| `tcChaos` | — | **VIOLATED (expected)** — (c) and (d), 0.16% |
+| `tcIneligibleNode` | — | **VIOLATED (expected)** — (d), found at schedule 90 |
+| `tcEligibilityRevoked` | — | no violation |
+| `tcLockSessionDropReassert` | re-assert | no violation |
+| `tcChaosReassert` | re-assert | no violation |
+| `tcLockSessionDropCas` | CAS claim | no violation (no ejection in this case, so (d) cannot arise) |
+| `tcChaosCas` | CAS claim | **VIOLATED (expected)** — (d), 0.20% |
+| `tcLockSessionDropCasRenew` | CAS + renew | no violation |
+| `tcHeartbeatBlipCasRenew` | CAS + renew | no violation |
+| `tcChaosCasRenew` | CAS + renew | no violation |
+
+PEx (systematic), 5M-schedule budget, `-m 3`, on the repaired cases — no violation, deep
+bounded searches (the frontier did not close):
+
+| Case | Choices remaining | Time |
+| --- | --- | --- |
+| `tcChaosReassert` | 144,075 | 214 s |
+| `tcLockSessionDropCasRenew` | 31,068 | 182 s |
+| `tcHeartbeatBlipCasRenew` | 69,486 | 188 s |
+| `tcChaosCasRenew` | 149,061 | 207 s |
+
+PEx is also what found (d): at 5M schedules on `tcChaosCas`, after 20k random schedules and
+a 300k PEx budget on the same case had both passed. It then caught a model-accounting gap
+on `tcChaosReassert` at 48k schedules (a stale renew landing after the real leader's last
+tick, with no refill to let it rewrite), fixed by waking the fleet on a leader-row write
+that changes something — and only then, since an idempotent renew that refilled the fleet
+made the leader renew forever.
 
 The PEx runs recorded for the earlier revision (2M schedules per case; `tcQuietCluster`
-and `tcLockSessionDrop` closed as *correct for any depth*, the rest deep bounded searches)
-predate the eligibility and step-down changes and have **not** been re-run on this
-revision: the full pass (`formal/check-all.sh`, which also runs the mutants and bounded
-PEx budgets) was cut short by host memory pressure on 2026-10-15. Treat the table above
-as the current evidence, and re-run PEx before claiming a closed space. The earlier
-history still holds its lesson: PEx found a real gap in `tcChaos` at ~2k schedules that
-100k random schedules had missed (see the last mutant below).
+and `tcLockSessionDrop` closed as *correct for any depth*) predate the eligibility,
+step-down and resurrection changes; on this revision the stock cases are expected
+violations and the repaired cases are bounded searches, so no space is currently claimed
+closed. The mutant ledger below was last run on the 2026-10-15 revision (before the
+faithful resurrection); the eligibility mutants are unaffected by that change.
 
 ## What the mutants say
 

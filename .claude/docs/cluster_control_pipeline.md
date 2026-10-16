@@ -446,6 +446,9 @@ Leader (Evaluation / Gate)                     Store                            
 claim:  UPDATE leader row SET node_id = me,
         epoch = E+1 WHERE epoch = E   ───────► 1 row → leader at epoch E+1
                                                 0 rows → someone claimed first → step down   (closes election bug ledger (c))
+renew:  every tick the lock is renewed:
+        UPSERT leader row SET node_id = me
+        WHERE epoch = E+1             ───────► restores the row if a cascade removed it (bug ledger (d)); 0 rows → a newer claim exists → step down
 
 place:  UPSERT agent row (node_id = X,
         epoch = E+1, version = v+1,
@@ -524,8 +527,8 @@ release. A pre-upgrade leader simply ignores the new columns and keeps today's b
 | Evaluation / Gate | the ledger as the single-copy guard | the ledger is a dedup and pacing aid only; re-dispatching at the same version is idempotent, so losing it costs duplicate *commands*, never duplicate *copies* |
 | LocalSweeps, row 5 | the claim branch (`TryClaimAssignmentAsync`), the GH-4240 `removeAssignment: false` distinction, the D2 re-upsert of own rows, the D4 re-upsert on an idempotent start | gone: nodes do not write rows. The stop side ("row names another node or version") and the start side ("row names me, unconfirmed or not running") stay |
 | Registry, §10.3 | `BeginStart` admitted by comparing against the local command sequence | admitted by the store check-in; the local sequence stays for ordering local stops against local starts |
-| Leadership, row 6 | an unconditional leader-row upsert; bug ledger (c) | a compare-and-set on the epoch; (c) closes (checked: `tcLockSessionDropCas`, `tcChaosCas`) |
-| election model toggle "re-assert" | the leader re-upserts its row each tick | unnecessary |
+| Leadership, row 6 | an unconditional leader-row upsert at election, never again; bug ledger (c) and (d) | a compare-and-set claim plus an epoch-conditional renew every renewed tick; both close (`tcLockSessionDropCasRenew`, `tcChaosCasRenew`) |
+| election model toggle "re-assert" | the leader re-upserts its row each tick, unconditionally | becomes the conditional renew above |
 
 The reconcile sweep, ejection with its hysteresis and leader protection, the settle gate,
 and the lane window are untouched: they are about liveness and churn, which the row cannot
@@ -537,11 +540,16 @@ decide.
   `tcChaosEpoch`) are green at 30k random schedules each on the 2026-10-16 revision; rules
   2, 5 and 6 above are what it took to get there, each from a counterexample recorded in
   the model's README. PEx has not been run on them.
-- The leader-row compare-and-set is in the election model as `casClaim`;
-  `tcLockSessionDropCas` and `tcChaosCas` are clean at 20k random schedules with no
-  re-assert, while the stock case still reproduces bug ledger (c). The epoch on the leader
-  row therefore replaces the re-assert, and the `wolverine://leader/` row becomes the first
-  stamped row of §11.1.
+- The leader-row compare-and-set is in the election model as `casClaim`. It closes bug
+  ledger (c) (`tcLockSessionDropCas`), but PEx at 5M schedules found that on its own it
+  leaves bug ledger (d) open: a leader row removed by the ejection cascade is never
+  rewritten, because a sitting leader renews the lock without claiming. The leader row is
+  therefore a debt like any other row in this design — the holder re-asserts it on every
+  renewed tick, conditionally on its epoch — and that combination (`tcChaosCasRenew`,
+  `tcHeartbeatBlipCasRenew`, `tcLockSessionDropCasRenew`) is what §11.2 now shows: clean
+  at 20k random and 5M PEx schedules each, while the stock cases reproduce (c) and (d) and
+  the CAS-only case reproduces (d). The `wolverine://leader/` row is the first stamped row
+  of §11.1.
 - Decide whether `confirmed` is needed at all, or whether "the node's own heartbeat row
   lists the agent as running" is the confirmation (it is what `AgentPresenceReport` answers
   from today). A separate column is simpler to reason about and costs one write per start.
@@ -580,5 +588,7 @@ versioned so the embargo rollback is expressible (§10.5); the shutdown sequence
 request, so the whole programme is in one place and the class of duplicate-copy incidents
 is removed rather than damped. Re-running the model's epoch cases then found three more
 requirements (rules 2, 5, 6 of §11.2); the cases are green with them. The leader-row
-compare-and-set was then added to the election model and closes bug ledger (c) without the
-re-assert.
+compare-and-set was then added to the election model; it closes bug ledger (c), and PEx at
+5M schedules found bug ledger (d) — a resurrected leader row has no mark — which the
+compare-and-set alone cannot close. The leader row now gets the same per-tick renew as
+every other stamped row.

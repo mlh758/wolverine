@@ -90,7 +90,13 @@ machine Store {
       if (m.id in rows) {
         rows[m.id] = (stale = false, leaderMark = rows[m.id].leaderMark);
       } else {
-        rows[m.id] = (stale = false, leaderMark = m.isLeader);
+        /* The resurrection re-upserts the node's running agents (Agents.Keys), and the
+           leader agent is never among them, so a resurrected row carries NO leader mark
+           whatever the node believes. An earlier revision restored the mark from the
+           belief; PEx (tcChaosCas, 5M schedules, 2026-10-16) showed that is unfaithful in
+           the other direction too. Bug ledger (d): a leader whose row is ejected by the
+           lock holder and resurrected leads unmarked until the next election. */
+        rows[m.id] = (stale = false, leaderMark = false);
       }
       send m.node, eSnapshot, (rows = rows, youHoldLock = lockHolder == m.id, leaderEpoch = leaderEpoch);
       announceStore(0, 0);
@@ -139,6 +145,8 @@ machine Store {
 
     on eClaim do (m: (node: machine, id: int, epoch: int, renew: bool)) {
       var v: int;
+      var refills: int;
+      var changed: bool;
       /* tryStartLeadershipAsync: ensureLocalNodeRegisteredAsync + AddAssignmentAsync of
          LeaderUri. The assignment table has ONE row per agent (PK = agent uri, upsert), so
          the claim moves the `wolverine://leader` row to the claimant and thereby takes the
@@ -149,13 +157,25 @@ machine Store {
          claim carrying an epoch the row has moved past is refused, and the stale claimant
          learns it was late from the refusal rather than from its next ping. */
       if (m.renew) {
-        /* A sitting leader re-asserting: idempotent, never bumps the epoch. */
-        if ((m.id in rows) && rows[m.id].leaderMark) {
-          send m.node, eClaimAck, (ok = true,);
-        } else {
+        /* A sitting leader re-asserting its row. Stock (`reassert`): an unconditional upsert,
+           so it moves or restores the mark. Phase 2: conditional on the epoch still being
+           the one this leader claimed under, so a stale ex-leader's renew is refused and a
+           current leader's renew restores a row the cascade took away. Never bumps. */
+        if (casClaim && m.epoch != leaderEpoch) {
           send m.node, eClaimAck, (ok = false,);
+          announceStore(0, 0);
+          return;
         }
-        announceStore(0, 0);
+        changed = writeMark(m.id);
+        send m.node, eClaimAck, (ok = true,);
+        /* A durable CHANGE wakes the fleet (the loops run forever): a stale renew that
+           overwrote the real leader's row must leave that leader the ticks to rewrite it,
+           or the model reports a rest the real system never reaches (PEx on tcChaosReassert).
+           An idempotent renew that changed nothing wakes nobody, or the leader renews forever. */
+        if (changed) {
+          refills = refillAll();
+        }
+        announceStore(0, refills);
         return;
       }
       if (casClaim && m.epoch != leaderEpoch) {
@@ -164,14 +184,12 @@ machine Store {
         return;
       }
       leaderEpoch = leaderEpoch + 1;
-      foreach (v in keys(rows)) {
-        rows[v] = (stale = rows[v].stale, leaderMark = v == m.id);
-      }
-      if (!(m.id in rows)) {
-        rows[m.id] = (stale = false, leaderMark = true);
-      }
+      changed = writeMark(m.id);
       send m.node, eClaimAck, (ok = true,);
-      announceStore(0, 0);
+      if (changed) {
+        refills = refillAll();
+      }
+      announceStore(0, refills);
     }
 
     on eReleaseAndDelete do (m: (node: machine, id: int, hadLock: bool)) {
@@ -208,6 +226,24 @@ machine Store {
       }
       announceStore(faultsDone, refillAll());
     }
+  }
+
+  /* Move the one `wolverine://leader` row to `id` (creating the row if the cascade took it
+     away). Returns whether anything actually changed. */
+  fun writeMark(id: int): bool {
+    var v: int;
+    var changed: bool;
+    foreach (v in keys(rows)) {
+      if (rows[v].leaderMark != (v == id)) {
+        changed = true;
+      }
+      rows[v] = (stale = rows[v].stale, leaderMark = v == id);
+    }
+    if (!(id in rows)) {
+      rows[id] = (stale = false, leaderMark = true);
+      changed = true;
+    }
+    return changed;
   }
 
   fun refillAll(): int {
@@ -293,8 +329,10 @@ machine Node {
      its `wolverine://leader` row on every tick its lock is renewed, so a stale claim that
      overwrote the row (bug ledger (c) in the README) is repaired on the next tick. */
   var reassert: bool;
-  /* The leader epoch read in this tick's snapshot, carried on the claim. */
+  /* The leader epoch read in this tick's snapshot, carried on the claim; and the epoch
+     this node's own claim created, carried on every renew. */
   var seenEpoch: int;
+  var myEpoch: int;
 
   start state Booting {
     entry (cfg: (store: machine, k: int, threshold: int, canLead: bool, reassert: bool)) {
@@ -435,7 +473,7 @@ machine Node {
         /* Already leader: the grant was a renewal; EvaluateAssignmentsAsync is out of
            this model's scope. With the proposed fix, re-assert the leader row too. */
         if (reassert) {
-          send store, eClaim, (node = this, id = id, epoch = seenEpoch, renew = true);
+          send store, eClaim, (node = this, id = id, epoch = myEpoch, renew = true);
           goto AwaitClaim;
         }
         goto Ticking;
@@ -456,8 +494,16 @@ machine Node {
   state AwaitClaim {
     on eClaimAck do (m: (ok: bool)) {
       if (m.ok) {
+        if (!isLeader) {
+          /* A fresh claim bumped the epoch to the one after the one this node read. */
+          myEpoch = seenEpoch + 1;
+        }
         isLeader = true;
-      } else if (!isLeader) {
+      } else if (isLeader) {
+        /* A renew refused: the epoch moved on, so another node has claimed since. This
+           lease is stale whatever the ping says; step down now. */
+        stepDownLocally();
+      } else {
         /* The claim was refused: another node claimed since this one read the epoch, so
            this grant was already stale. Let go of whatever the lock session still holds
            (tryStartLeadershipAsync releases on a failed claim) and stay a follower. */
