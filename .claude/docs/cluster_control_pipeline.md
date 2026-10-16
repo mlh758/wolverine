@@ -467,10 +467,13 @@ Rules, each the direct descendant of one of the model's findings:
    stamp: the re-write is what makes the old node's late check-in fail. Without this rule
    the first cut of the model stranded an agent on a node that died between the write and
    the command (`settled with 0 nodes running`).
-2. **The version fences the reply, not just the write.** A node ignores a check-in result
-   for any version other than the one it is currently on, and never adopts an older
-   version from a late command. Without this the model turned a duplicate into a stopped
-   agent: a win at version 2 followed by the late rejection of version 1.
+2. **The (epoch, version) pair identifies an attempt, and every message carries both.** A
+   node ignores a check-in result for any attempt other than the one it is on, never adopts
+   an older version from a late command, and stamps a re-assert with its *current*
+   attempt. The model found both halves: a version-only fence turned a duplicate into a
+   stopped agent (a win at version 2, then the late rejection of version 1), and a
+   re-assert carrying the current version under a stale epoch lost on the epoch and passed
+   the version fence, stopping a healthy agent.
 3. **Moves need no node-side row write.** `ReassignAgent` becomes: re-stamp the row to the
    destination, stop at the source, start at the destination. If the source misses the
    stop, its sweep sees a row naming another node and stops the copy; if the destination
@@ -479,6 +482,17 @@ Rules, each the direct descendant of one of the model's findings:
 4. **Pause and retire are row deletes by the leader**, under the epoch guard. The
    node-side `AddAssignmentAsync` / `RemoveAssignmentAsync` / `TryClaimAssignmentAsync`
    writes are no longer called by Balanced nodes; Solo keeps its own path.
+5. **An unconfirmed row is a debt the leader keeps paying.** A row that is placed but not
+   confirmed is re-driven at its current stamp on every evaluation until it confirms or its
+   node leaves; the re-drive is idempotent at the node. This is the job the ledger and the
+   presence polls do today, and it is the one piece of leader-side state the design keeps.
+   The model stranded an agent without it: a command lost to a node the store still counted
+   live was never sent again.
+6. **A runner with no row is an orphan.** Nodes never write rows, so the sweep's stop side
+   fires on "no row" as well as "row names another node", and every durable change (a
+   placement write, a confirmation) wakes every node's sweep. A late `ok` to a check-in is
+   not wrong, only stale by the time it arrives; the node's next look at the table is what
+   corrects it, and it must get that look.
 
 ### 11.3 The conditional write, per store
 
@@ -517,11 +531,12 @@ The reconcile sweep, ejection with its hysteresis and leader protection, the set
 and the lane window are untouched: they are about liveness and churn, which the row cannot
 decide.
 
-### 11.6 Before implementing
+### 11.6 Status and before implementing
 
-- Re-run the ownership model's epoch cases (`tcLeaderHandoverEpoch`, `tcPartitionHealEpoch`,
-  `tcChaosEpoch`) on the current revision and record them; the README's epoch table
-  predates the version-fence fix and the shipped-sweep changes.
+- The ownership model's epoch cases (`tcLeaderHandoverEpoch`, `tcPartitionHealEpoch`,
+  `tcChaosEpoch`) are green at 30k random schedules each on the 2026-10-16 revision; rules
+  2, 5 and 6 above are what it took to get there, each from a counterexample recorded in
+  the model's README. PEx has not been run on them.
 - Add the leader-row compare-and-set to the election model and confirm bug ledger (c)
   closes without the re-assert toggle.
 - Decide whether `confirmed` is needed at all, or whether "the node's own heartbeat row
@@ -560,4 +575,5 @@ versioned so the embargo rollback is expressible (§10.5); the shutdown sequence
 
 2026-10-16, later: phase 2 (durable, leader-written claims) added as §11 at Michael's
 request, so the whole programme is in one place and the class of duplicate-copy incidents
-is removed rather than damped.
+is removed rather than damped. Re-running the model's epoch cases then found three more
+requirements (rules 2, 5, 6 of §11.2); the cases are green with them.

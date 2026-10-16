@@ -251,13 +251,19 @@ What that buys, mechanically:
 - the leader can take a claim back from a node it believes is gone, and know that the node
   cannot quietly resume — taking the row back *is* what makes the old node's check-in fail.
 
-### Results (30k random schedules)
+### Results (30k random schedules, `-m 1`, revision of 2026-10-16)
 
 | Test case | Stock | Sweep | Epoch |
 | --- | --- | --- | --- |
 | `tcLeaderHandover*` | **violation** (bug ledger (a)) | 0 bugs | **0 bugs** |
-| `tcPartitionHeal*` | **violation** (bug ledger (b)) | 0 bugs | violation, rare |
-| `tcChaos*` | — | 0 bugs | violation |
+| `tcPartitionHeal*` | **violation** (bug ledger (b)) | 0 bugs | **0 bugs** |
+| `tcChaos*` | — | 0 bugs | **0 bugs** |
+
+The epoch column went green on 2026-10-16 after three more design requirements were found
+and modelled (below). Before them the same cases read: handover 0 bugs, partition heal a
+rare strand (0.01%), chaos a strand (0.54%) — two different stranding paths and, once those
+were closed, a rare duplicate (0.02%). Each is recorded because an implementation will meet
+it too.
 
 **The handover duplicate is gone.** That is bug ledger (a) — the deploy-sim shape, the leader
 dying with a start in flight and its pending ledger, the new leader re-placing the agent, the
@@ -293,11 +299,46 @@ A node that has won a check-in at epoch 2 receives the answer to an *older* atte
 treats it as "you are an orphan". The result is `settled with 0 nodes running the single
 agent` — the design trading a duplicate for a stopped agent.
 
-So the epoch is not only for the write path. **A check-in result older than the one a node
-has already won must be ignored**, or a late rejection stops a healthy agent. The same holds
-for anything else that can answer late — an explicit decline under capacity-based assignment
-most of all, since rejection makes the unconfirmed window a routine state rather than a rare
-one, and a decline that arrives after the leader has re-stamped the row back to that node
-would otherwise clear a live claim.
+So the epoch is not only for the write path. **A check-in result for any attempt other than
+the one a node is on must be ignored**, or a late rejection stops a healthy agent. The same
+holds for anything else that can answer late — an explicit decline under capacity-based
+assignment most of all, since rejection makes the unconfirmed window a routine state rather
+than a rare one, and a decline that arrives after the leader has re-stamped the row back to
+that node would otherwise clear a live claim.
 
-Modelled as `epoch >= myEpoch` in `applyConfirm`.
+### An attempt is the (epoch, version) pair, and every message carries both
+
+Found by `tcChaosEpoch` on 2026-10-16 (0.54% of schedules): a node on attempt (epoch 3,
+version 2), which it had already won, sent its post-partition re-assert stamped with the
+epoch of its *previous* win and the *current* version. The store refused it on the epoch;
+the reply passed a version-only fence because the version matched; the node read the
+refusal as "you are an orphan" and stopped a healthy agent (`settled with 0 nodes running`).
+The version does not identify an attempt on its own. Modelled: `applyRun` adopts the
+command's epoch together with its version, and `applyConfirm` ignores any reply whose
+`(epoch, version)` is not the attempt the node is on.
+
+### An unconfirmed row is a debt the leader keeps paying
+
+Found by `tcChaosEpoch` after the fence fix (0.01%): a partitioned node's last in-flight
+heartbeat lands after the cutoff, so the store counts it live; the leader re-stamps the
+agent to it; the command is lost to the unreachable node; on heal the node's re-assert at
+its old stamp loses and it stops. The row now names a live node at a version that node
+never received, unconfirmed, and nothing ever sends it again. A row that is *placed but
+unconfirmed* is not a finished placement: the leader must **re-drive the command at the
+row's current stamp** (idempotent at the node) on every evaluation until the row confirms
+or its node leaves. This is the job today's ledger and presence polls do; under epochs it
+is the one piece of leader-side state the design keeps. Modelled as `eRedrive`.
+
+### Durable changes wake the fleet, and a runner with no row is an orphan
+
+Found by `tcPartitionHealEpoch` after both fixes (0.02%, a *duplicate*): a node won its
+check-in, was cut off before the reply arrived, had its row removed by the ejection, healed,
+and then received the late `ok` — true at commit time — and started. The leader placed the
+agent elsewhere. The sweep's stop side would have stopped the orphan, but the node had no
+ticks left: under epochs the leader's row write and the confirm were not refilling the
+fleet the way `AddAssignmentAsync` does in stock, so the orphaned node never looked again.
+Two rules: every durable change (placement write, confirmation) wakes every node, exactly
+as in stock; and under epochs "running with no row" is an orphan to stop, never "my write
+in flight", because nodes do not write rows. Both are what the reconcile sweep needs to
+finish the job the check-in cannot: a late `ok` is not wrong, it is simply stale by the time
+it arrives, and the node's next look at the table corrects it.

@@ -47,6 +47,11 @@ event eRun: (run: bool, epoch: int, version: int);  // store -> node, over a cou
    dispatch after a handover -- loses the compare and never starts. */
 event eConfirmRow: (id: int, epoch: int, version: int, node: machine);
 event eConfirmReply: (ok: bool, epoch: int, version: int);
+/* The leader re-sending the start for a row that is placed but not yet confirmed, at the
+   row's CURRENT stamp (idempotent at the node). An unconfirmed row is a debt the leader
+   keeps paying until the row confirms or its node leaves; without it a command lost to an
+   unreachable node strands the agent (found by tcChaosEpoch, 2026-10-16). */
+event eRedrive: (id: int);
 
 /* Faults. */
 event eCutoff;                            // partition, node side: unreachable, keeps running
@@ -182,14 +187,18 @@ machine Store {
     }
 
     on eAssignReq do (m: (id: int)) {
+      var refills: int;
       if (epochMode) {
         /* The leader writes the assignment itself, before anything is dispatched, so the
-           durable row is the arbiter rather than a record written after the fact. */
+           durable row is the arbiter rather than a record written after the fact. A durable
+           change refills the fleet, as eAddRow does in stock: a node whose copy this row
+           orphans must get the ticks to notice (found by tcPartitionHealEpoch, 2026-10-16). */
         owner = m.id;
         orphan = false;
         rowEpoch = epoch;
         rowVersion = rowVersion + 1;
         confirmed = false;
+        refills = refillAll();
       }
       new RunCourier((target = members[m.id], run = true, epoch = epoch, version = rowVersion));
       /* kind 2: the deploy terminates the leader pod with this start still in flight.
@@ -198,7 +207,16 @@ machine Store {
         armedLeaderKills = armedLeaderKills - 1;
         new StrikeCourier((store = this, id = leader, kind = 1));
       }
-      announceStore(1, 0);
+      announceStore(1, refills);
+    }
+
+    on eRedrive do (m: (id: int)) {
+      if (epochMode && owner == m.id && !confirmed && (m.id in live) && live[m.id]) {
+        new RunCourier((target = members[m.id], run = true, epoch = rowEpoch, version = rowVersion));
+        announceStore(1, 0);
+      } else {
+        announceStore(0, 0);
+      }
     }
 
     /* The node checking in against the row it was assigned under. Wins only while the row
@@ -206,14 +224,16 @@ machine Store {
        from a leader the cluster has moved past, starts nothing. */
     on eConfirmRow do (m: (id: int, epoch: int, version: int, node: machine)) {
       var ok: bool;
+      var refills: int;
       ok = (m.id in live) && live[m.id] && owner == m.id && rowEpoch == m.epoch
            && rowVersion == m.version;
       if (ok) {
         confirmed = true;
+        refills = refillAll();
         fireOwnerFault(m.id);
       }
       new ConfirmCourier((target = m.node, ok = ok, epoch = m.epoch, version = m.version));
-      announceStore(0, 0);
+      announceStore(0, refills);
     }
 
     /* Partition: cut the owner off (it keeps running) and eject it store-side. Ejection
@@ -364,10 +384,12 @@ machine Node {
   /* EvaluationsSinceElection, capped at `hold` so the state stays finite. */
   var evalsSinceElection: int;
   var wasLeader: bool;
-  /* The epoch this node last won a confirmation under. */
+  /* The (epoch, version) pair of the attempt this node is on. Together they identify ONE
+     assignment: the version alone does not, because a healed node's re-assert can carry
+     the current version under the epoch of an older win, lose on the epoch, and then pass
+     a version-only fence -- which stopped a healthy agent (found by tcChaosEpoch, 2026-10-16).
+     Every check-in carries both, and a reply is matched on both. */
   var myEpoch: int;
-  /* The assignment version this node's outstanding check-in is for. A reply for anything
-     else belongs to an attempt this node has already moved past. */
   var myVersion: int;
   var budget: int;
   var localRun: bool;
@@ -468,7 +490,9 @@ machine Node {
           if (r.owner == 0 || ((r.owner in r.live) && r.live[r.owner])) {
             mismatch = true;
           }
-        } else if (!localRun && r.owner == id) {
+        } else if (!localRun && r.owner == id && !epochMode) {
+          /* Under epochs a node never starts on the strength of a row alone; the leader's
+             re-drive brings the stamped command, and the check-in decides. */
           mismatch = true;
         }
 
@@ -476,7 +500,9 @@ machine Node {
           streak = streak + 1;
           if (streak >= threshold) {
             streak = 0;
-            if (localRun && r.owner != 0) {
+            if (localRun && (r.owner != 0 || epochMode)) {
+              /* Under epochs a node never writes its own row, so "running with no row" is
+                 an orphan, not a write in flight: stop, and let the leader re-place. */
               localRun = false;
               announceMe(true);
             } else if (localRun) {
@@ -549,8 +575,14 @@ machine Node {
             pendingTarget = target;
             work = true;
           }
+        } else if (epochMode && !r.confirmed) {
+          /* Placed but unconfirmed: re-drive at the same stamp until the node checks in
+             or leaves. This is the ledger's job today (dispatch hold + presence polls). */
+          send store, eRedrive, (id = r.owner,);
+          pendingTarget = r.owner;
+          work = true;
         } else {
-          /* The row landed: the ledger entry is retired (reconcilePendingAssignments). */
+          /* The row landed (stock) or confirmed (epochs): the ledger entry is retired. */
           pendingTarget = 0;
         }
 
@@ -639,6 +671,7 @@ machine Node {
         return;
       }
       myVersion = version;
+      myEpoch = epoch;
       /* Nothing starts on the strength of the command alone. Check in against the row
          first; only winning that makes this node the owner. */
       announce eMRowPending;
@@ -665,14 +698,14 @@ machine Node {
   /* The outcome of a check-in. Winning it starts the agent; losing it means the command
      outlived its assignment, and anything already running here is an orphan. */
   fun applyConfirm(ok: bool, epoch: int, version: int) {
-    if (version != myVersion) {
-      /* The answer to an attempt this node has already moved past. */
+    if (version != myVersion || epoch != myEpoch) {
+      /* The answer to an attempt this node has already moved past -- or one stamped with a
+         stale epoch, which cannot have been this attempt. */
       announce eMRowDone;
       return;
     }
     if (ok) {
       localRun = true;
-      myEpoch = epoch;
     } else {
       /* Losing the check-in means this node is an orphan. Reached only for the attempt this
          node is actually on -- see the version guard above, and the monotonicity guard in
