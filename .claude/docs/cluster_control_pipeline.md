@@ -133,8 +133,9 @@ Concurrency rules, all of which hold today and must survive:
 1. One tick at a time; a tick that arrives mid-tick is dropped.
 2. The heartbeat ticker touches only the Heartbeat stage and the embargo set.
 3. Each actor has one consumer. Stages read actor **snapshots**, never actor fields.
-4. The ledger is armed by the Governor for released commands and confirmed by the lanes;
-   both are messages to the ledger actor, so the `_pendingLock` disappears.
+4. The ledger is armed by the Governor for released commands and updated from the
+   dispatcher's events drained at the top of the next tick (§10.1); it then has one writer
+   and the `_pendingLock` disappears.
 5. The AgentRegistry is the only writer of `Agents` and the in-flight sets; the sweep sends
    it `Start(uri, asOfSequence)` / `Stop(uri, removeAssignment)` / `Claim(uri)` and the
    remote handlers send it batches. The GH-3748 stop-revocation ordering is then enforced in
@@ -276,7 +277,132 @@ gate that combines them. Everything else stays open-loop until a measurement say
    for per-node counts, and the GH-4593 load advertisement is already one of them).
 5. Only then the Governor, one loop at a time, each with a rig measurement.
 
-## 10. Open questions
+## 10. Eliminating the shared state: events in, messages out
+
+§2 keeps four actors because their state has two writers today. Most of that is avoidable.
+The rule that removes it: **every cross-cutting input is an event folded at the top of the
+tick; every cross-cutting output is a message to a single-consumer actor; the only shared
+things left are immutable snapshots swapped atomically.** No stage writes anything another
+thread reads.
+
+### 10.1 Confirmations flow through the pipeline
+
+Today a lane thread writes the ledger (`ConfirmDispatched` re-stamps `SentAt`) and the
+evaluation probes the dispatcher's live maps (`TryFindPendingDestination`). Instead the
+lanes emit events and the tick drains them:
+
+```csharp
+abstract record DispatchEvent(long At);
+record Queued(IAgentCommand Command, Guid Lane, long At)                : DispatchEvent(At);
+record HandedOver(Uri[] Agents, Guid Node, long At)                     : DispatchEvent(At);   // the lane took the start up; no longer withdrawable (GH-4901)
+record Confirmed(Uri[] Agents, Guid Node, long At)                      : DispatchEvent(At);   // AgentsStarted / presence poll said running (GH-3750)
+record Finished(IAgentCommand Command, Guid Lane, bool Faulted, long At) : DispatchEvent(At);  // the lane is done with it, however it ended
+record Abandoned(Guid Lane, IAgentCommand[] Dropped, long At)           : DispatchEvent(At);   // AbandonLane
+```
+
+The Snapshot stage drains the channel into `TickContext.DispatchEvents` and the Evaluation
+stage folds them into the ledger it now owns alone:
+
+| Event | Fold |
+| --- | --- |
+| `Queued` / `HandedOver` | entry is **outstanding** on that node (today: `_inFlight` / `_starting`) |
+| `Confirmed` | entry's `SentAt := At` (today: `ConfirmDispatched`) |
+| `Finished` | entry is no longer outstanding; the TTL backstop starts (today: the probe answering false) |
+| `Abandoned` | entries aimed at that lane are dropped, the agents are free to be placed |
+| a row for the agent on the pending node | entry retired (unchanged) |
+
+Latency is the only difference: a confirmation or a finish reaches the leader's picture up
+to one tick late. That is the safe direction. The leader believes a dispatch is outstanding
+for slightly longer, which can only delay a re-drive; it can never produce the bare second
+start the ledger prevents, because "not outstanding" is learned no earlier than today. The
+`_pendingLock` goes. A dropped (coalesced) tick loses nothing: the fold happens at the start
+of each executed tick and the channel keeps what accumulated.
+
+The Governor's sensors (lane depth, age of the executing command, confirmed-per-poll) are
+the same stream, so §8 gets its measurements without a second mechanism.
+
+### 10.2 The dispatcher's own bookkeeping
+
+`_queued`, `_inFlight`, `_moving`, `_starting`, `_withdrawn`, `_handedOver` have two
+writers: `Enqueue` on the tick thread and the lanes on completion. Make `Enqueue` a message
+too: one consumer owns every map and the lanes only execute and report. That is the
+`atomic` variant of `formal/agent-dispatch/`, and its finding carries over unchanged —
+single-writer bookkeeping removes the claim-held-by-the-wrong-dispatch class the GH-4537
+review kept finding (m1/m3/m4), but the **admission check stays in the lane**, because the
+one step no owner can cover is the command running after its node left the roster
+(`tcAtomicStale`).
+
+### 10.3 The agent registry, in both directions
+
+Remote `StartAgents` / `StopAgents` are slow and run in parallel, so the starts themselves
+cannot live inside the tick; the bookkeeping can. A registry actor owns `Agents`, the
+starting and stopping sets and the revocation sequence. Everything else talks to it:
+
+```csharp
+// in: from DeferredAgentCommandRunner's workers, the sweep, and operators
+abstract record RegistryCommand;
+record BeginStart(Uri Agent, long AsOfSequence)                      : RegistryCommand;   // skipped if a stop is newer (GH-3748)
+record EndStart(Uri Agent, bool Running, Exception? Failure)         : RegistryCommand;
+record BeginStop(Uri Agent, bool RemoveAssignment)                   : RegistryCommand;   // stamps the revocation sequence first (GH-3748, GH-4240)
+record EndStop(Uri Agent);
+record Reconcile(IReadOnlyList<ReconcileDecision> Decisions, long AsOfVersion) : RegistryCommand;  // from LocalSweeps
+
+record ReconcileDecision(Uri Agent, ReconcileAction Action);          // Start | StopKeepingRow | Claim
+
+// out: published as an immutable snapshot, and as events for the tick
+record RegistrySnapshot(long Version, ImmutableHashSet<Uri> Running, ImmutableHashSet<Uri> Starting,
+                        ImmutableHashSet<Uri> Stopping, ImmutableDictionary<Uri, AgentStatus> Status);
+abstract record AgentEvent(long Version);
+record AgentStarted(Uri Agent, long Version)                         : AgentEvent(Version);
+record AgentStopped(Uri Agent, long Version)                         : AgentEvent(Version);
+record AgentFailed(Uri Agent, ShardFailure? Failure, long Version)   : AgentEvent(Version);
+record AgentStartFailed(Uri Agent, Exception Failure, long Version)  : AgentEvent(Version);
+```
+
+The sweep becomes a pure function: `(my rows from the snapshot, RegistrySnapshot, streaks)
+-> decisions`, sent as one `Reconcile(…, AsOfVersion)`. The actor applies each decision
+under the rule the code already has — a stop stamped after your version wins, a start
+already in flight is not started again, a claim is insert-if-absent — so the GH-4407 guards
+that are four sets and a counter across the controller today become one version compare in
+one place. Presence queries (`QueryAgentPresence`) and the heartbeat's `buildLocalNode`
+read the published snapshot. The agent-side `AddAssignmentAsync` / `RemoveAssignmentAsync`
+/ `TryClaimAssignmentAsync` writes stay with the actor's workers, after the start or stop,
+exactly as now.
+
+### 10.4 The two writers that are easy to miss
+
+- **`ApplyRestrictionsAsync`** runs a full evaluation inline on the operator's thread, and
+  the **`CheckAgentHealth`** handler calls the tick concurrently with the loop. Both are why
+  `_healthCheckGuard` exists. Both become tick *requests*:
+
+  ```csharp
+  record TickRequest(TickReason Reason, TaskCompletionSource<TickContext>? Completion);
+  enum TickReason { Scheduled, HealthKick, RestrictionsChanged, Shutdown }
+  ```
+
+  The operator path persists the restriction change first (GH-3666), posts a
+  `RestrictionsChanged` tick, awaits its completion, and reads `Commands` and the released
+  set off the returned context for its "did the agent actually start" check (GH-4871). The
+  pipeline runs one tick at a time by construction, so the guard goes.
+- **The embargo set** (`_releasedAgents`) is written by the sweep and read by the heartbeat
+  loop. LocalSweeps publishes an immutable `NodeAdvertisement(Capabilities, LoadFactor,
+  Version)`; the Heartbeat stage reads the latest one. Forward only; the
+  `ConcurrentDictionary` goes.
+
+### 10.5 What stays shared, and why that is acceptable
+
+- **The lock connection.** Ping, attain and release all happen inside the Leadership stage;
+  the one outside caller is shutdown. With shutdown as pipeline completion — the Leadership
+  stage's `Complete` releases the lock after the last tick — the GH-4261 interleaving
+  cannot occur by ordering, and the `SemaphoreSlim` gate becomes belt-and-braces.
+- **`IsLeader` for `WolverineRuntime.IsLeader()`**: a `volatile` read of the last
+  `LeadershipState` the stage published. One writer.
+- **`LastAssignments`** for diagnostics: the last `Grid`, swapped atomically. One writer.
+
+After this the four actors of §2 are two: the registry and the dispatcher. The ledger is
+stage state, the lock session is stage state, and nothing is protected by a comment.
+
+## 11. Open questions
 
 - Whether `WolverineNode.IsLeader()` should keep reading the assignment row at all once
   the Leadership stage owns the fact (election bug ledger (c) is a consequence of that
