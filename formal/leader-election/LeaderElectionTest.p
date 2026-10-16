@@ -10,7 +10,7 @@ every fault refunds them, so quiescence is always reachable after the last fault
 machine QuietDriver {
   start state Init {
     entry {
-      begin(3, false, false, 0, 0, 0, 0, false);
+      begin(3, false, false, 0, 0, 0, 0, false, false);
     }
   }
 }
@@ -18,7 +18,7 @@ machine QuietDriver {
 machine CrashDriver {
   start state Init {
     entry {
-      begin(3, true, false, 0, 0, 0, 0, false);
+      begin(3, true, false, 0, 0, 0, 0, false, false);
     }
   }
 }
@@ -26,7 +26,7 @@ machine CrashDriver {
 machine StopDriver {
   start state Init {
     entry {
-      begin(3, false, true, 0, 0, 0, 0, false);
+      begin(3, false, true, 0, 0, 0, 0, false, false);
     }
   }
 }
@@ -34,7 +34,7 @@ machine StopDriver {
 machine DropDriver {
   start state Init {
     entry {
-      begin(3, false, false, 1, 0, 0, 0, false);
+      begin(3, false, false, 1, 0, 0, 0, false, false);
     }
   }
 }
@@ -42,7 +42,7 @@ machine DropDriver {
 machine BlipDriver {
   start state Init {
     entry {
-      begin(3, false, false, 0, 2, 0, 0, false);
+      begin(3, false, false, 0, 2, 0, 0, false, false);
     }
   }
 }
@@ -50,7 +50,7 @@ machine BlipDriver {
 machine ChaosDriver {
   start state Init {
     entry {
-      begin(3, true, true, 1, 1, 0, 0, false);
+      begin(3, true, true, 1, 1, 0, 0, false, false);
     }
   }
 }
@@ -61,7 +61,7 @@ machine ChaosDriver {
 machine IneligibleDriver {
   start state Init {
     entry {
-      begin(3, true, true, 1, 1, 1, 0, false);
+      begin(3, true, true, 1, 1, 1, 0, false, false);
     }
   }
 }
@@ -72,7 +72,7 @@ machine IneligibleDriver {
 machine RevokeDriver {
   start state Init {
     entry {
-      begin(3, true, false, 0, 0, 0, 1, false);
+      begin(3, true, false, 0, 0, 0, 1, false, false);
     }
   }
 }
@@ -81,7 +81,7 @@ machine RevokeDriver {
 machine DropReassertDriver {
   start state Init {
     entry {
-      begin(3, false, false, 1, 0, 0, 0, true);
+      begin(3, false, false, 1, 0, 0, 0, true, false);
     }
   }
 }
@@ -89,7 +89,25 @@ machine DropReassertDriver {
 machine ChaosReassertDriver {
   start state Init {
     entry {
-      begin(3, true, true, 1, 1, 0, 0, true);
+      begin(3, true, true, 1, 1, 0, 0, true, false);
+    }
+  }
+}
+
+/* Phase 2 of the stage map: the leader claim as a compare-and-set on the leader row's
+   epoch, with no re-assert. Bug ledger (c) should close on the claim alone. */
+machine DropCasDriver {
+  start state Init {
+    entry {
+      begin(3, false, false, 1, 0, 0, 0, false, true);
+    }
+  }
+}
+
+machine ChaosCasDriver {
+  start state Init {
+    entry {
+      begin(3, true, true, 1, 1, 0, 0, false, true);
     }
   }
 }
@@ -97,7 +115,7 @@ machine ChaosReassertDriver {
 /* Stand up the store and the nodes, start them ticking, then loose the faults. Faults
    ride couriers so their arrival interleaves freely with the ticks — a fault can land
    before the first election, in the middle of one, or long after it settled. */
-fun begin(n: int, crashOne: bool, stopOne: bool, drops: int, blips: int, ineligible: int, revokes: int, reassert: bool) {
+fun begin(n: int, crashOne: bool, stopOne: bool, drops: int, blips: int, ineligible: int, revokes: int, reassert: bool, casClaim: bool) {
   var store: machine;
   var nodes: seq[machine];
   var i: int;
@@ -111,7 +129,7 @@ fun begin(n: int, crashOne: bool, stopOne: bool, drops: int, blips: int, ineligi
     barred = choose(n);
   }
 
-  store = new Store();
+  store = new Store(casClaim);
   i = 0;
   while (i < n) {
     nodes += (i, new Node((store = store, k = 3, threshold = 2, canLead = i != barred, reassert = reassert)));
@@ -187,3 +205,13 @@ test tcLockSessionDropReassert [main=DropReassertDriver]:
 test tcChaosReassert [main=ChaosReassertDriver]:
   assert ElectionConverges in
     { ChaosReassertDriver, Store, Node, SessionReaper, StaleReaper, CrashCourier, ShutdownCourier, RevokeCourier };
+
+/* ---- phase 2: the compare-and-set claim, no re-assert ---- */
+
+test tcLockSessionDropCas [main=DropCasDriver]:
+  assert ElectionConverges in
+    { DropCasDriver, Store, Node, SessionReaper, StaleReaper, CrashCourier, ShutdownCourier, RevokeCourier };
+
+test tcChaosCas [main=ChaosCasDriver]:
+  assert ElectionConverges in
+    { ChaosCasDriver, Store, Node, SessionReaper, StaleReaper, CrashCourier, ShutdownCourier, RevokeCourier };

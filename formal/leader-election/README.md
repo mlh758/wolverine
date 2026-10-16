@@ -167,7 +167,10 @@ see [Network partitions](#network-partitions).
 
 `../check-all.sh` runs every case of this spec and the agent-assignment spec, then the
 mutant ledger, then bounded PEx budgets, strictly one checker at a time; budget about an
-hour. `reassert` (the proposed fix for bug ledger (c)) is the last `begin` parameter.
+hour. The last two `begin` parameters are the two repairs for bug ledger (c): `reassert`
+(the leader re-upserts its row each tick) and `casClaim` (the claim is a compare-and-set
+on the leader row's epoch, phase 2 of the stage map); the stock case with both off is the
+mutant that shows either is load-bearing.
 
 PEx explores systematically and reports `correct for any depth` when it closes the space —
 worth running here, since this state space is small enough that several cases close. The
@@ -198,10 +201,15 @@ leader protection shields the wrong row. The window — between `TryAttainLeader
 returning and `AddAssignmentAsync` landing, with the session dying in between — is
 milliseconds, but it is the same window GH-2602 lives in.
 
-The model carries the obvious repair as the `reassert` toggle: a sitting leader re-upserts
-its row on every tick its lock is renewed (one idempotent upsert per tick), so the row
-converges on the lock holder within one tick. `tcLockSessionDropReassert` and
-`tcChaosReassert` run the same faults with it on.
+The model carries two repairs as toggles. `reassert`: a sitting leader re-upserts its row
+on every tick its lock is renewed (one idempotent upsert per tick), so the row converges on
+the lock holder within one tick — a patch on today's protocol. `casClaim`: the claim is a
+compare-and-set on an epoch stamped on the leader row, the design in phase 2 of the stage
+map (`.claude/docs/cluster_control_pipeline.md` §11) — a claim carrying an epoch the row
+has moved past is refused, the stale claimant releases and stays a follower, and the row
+can never be moved back by a late write. `tcLockSessionDropCas` and `tcChaosCas` run the
+same faults with the compare-and-set and **no** re-assert; both are clean, so (c) closes on
+the claim alone, which is what makes the re-assert unnecessary once phase 2 ships.
 
 ## Results
 
@@ -219,6 +227,8 @@ Random bugfinder, 20k schedules per case, on the revision synced to 6.50.2 (`-m 
 | `tcEligibilityRevoked` | no violation |
 | `tcLockSessionDropReassert` | no violation |
 | `tcChaosReassert` | no violation |
+| `tcLockSessionDropCas` | no violation |
+| `tcChaosCas` | no violation |
 
 The PEx runs recorded for the earlier revision (2M schedules per case; `tcQuietCluster`
 and `tcLockSessionDrop` closed as *correct for any depth*, the rest deep bounded searches)

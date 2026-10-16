@@ -524,8 +524,8 @@ release. A pre-upgrade leader simply ignores the new columns and keeps today's b
 | Evaluation / Gate | the ledger as the single-copy guard | the ledger is a dedup and pacing aid only; re-dispatching at the same version is idempotent, so losing it costs duplicate *commands*, never duplicate *copies* |
 | LocalSweeps, row 5 | the claim branch (`TryClaimAssignmentAsync`), the GH-4240 `removeAssignment: false` distinction, the D2 re-upsert of own rows, the D4 re-upsert on an idempotent start | gone: nodes do not write rows. The stop side ("row names another node or version") and the start side ("row names me, unconfirmed or not running") stay |
 | Registry, §10.3 | `BeginStart` admitted by comparing against the local command sequence | admitted by the store check-in; the local sequence stays for ordering local stops against local starts |
-| Leadership, row 6 | an unconditional leader-row upsert; bug ledger (c) | a compare-and-set on the epoch; (c) closes |
-| election model mutant "re-assert" | the leader re-upserts its row each tick | unnecessary |
+| Leadership, row 6 | an unconditional leader-row upsert; bug ledger (c) | a compare-and-set on the epoch; (c) closes (checked: `tcLockSessionDropCas`, `tcChaosCas`) |
+| election model toggle "re-assert" | the leader re-upserts its row each tick | unnecessary |
 
 The reconcile sweep, ejection with its hysteresis and leader protection, the settle gate,
 and the lane window are untouched: they are about liveness and churn, which the row cannot
@@ -537,8 +537,11 @@ decide.
   `tcChaosEpoch`) are green at 30k random schedules each on the 2026-10-16 revision; rules
   2, 5 and 6 above are what it took to get there, each from a counterexample recorded in
   the model's README. PEx has not been run on them.
-- Add the leader-row compare-and-set to the election model and confirm bug ledger (c)
-  closes without the re-assert toggle.
+- The leader-row compare-and-set is in the election model as `casClaim`;
+  `tcLockSessionDropCas` and `tcChaosCas` are clean at 20k random schedules with no
+  re-assert, while the stock case still reproduces bug ledger (c). The epoch on the leader
+  row therefore replaces the re-assert, and the `wolverine://leader/` row becomes the first
+  stamped row of §11.1.
 - Decide whether `confirmed` is needed at all, or whether "the node's own heartbeat row
   lists the agent as running" is the confirmation (it is what `AgentPresenceReport` answers
   from today). A separate column is simpler to reason about and costs one write per start.
@@ -576,4 +579,6 @@ versioned so the embargo rollback is expressible (§10.5); the shutdown sequence
 2026-10-16, later: phase 2 (durable, leader-written claims) added as §11 at Michael's
 request, so the whole programme is in one place and the class of duplicate-copy incidents
 is removed rather than damped. Re-running the model's epoch cases then found three more
-requirements (rules 2, 5, 6 of §11.2); the cases are green with them.
+requirements (rules 2, 5, 6 of §11.2); the cases are green with them. The leader-row
+compare-and-set was then added to the election model and closes bug ledger (c) without the
+re-assert.
